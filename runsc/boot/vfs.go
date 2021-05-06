@@ -50,7 +50,7 @@ import (
 	"gvisor.dev/gvisor/runsc/specutils"
 )
 
-func registerFilesystems(k *kernel.Kernel) error {
+func registerFilesystems(k *kernel.Kernel, productName string) error {
 	ctx := k.SupervisorContext()
 	creds := auth.NewRootCredentials(k.RootUserNamespace())
 	vfsObj := k.VFS()
@@ -84,7 +84,7 @@ func registerFilesystems(k *kernel.Kernel) error {
 		AllowUserMount: true,
 		AllowUserList:  true,
 	})
-	vfsObj.MustRegisterFilesystemType(sys.Name, &sys.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
+	vfsObj.MustRegisterFilesystemType(sys.Name, &sys.FilesystemType{ProductName: productName}, &vfs.RegisterFilesystemTypeOptions{
 		AllowUserMount: true,
 		AllowUserList:  true,
 	})

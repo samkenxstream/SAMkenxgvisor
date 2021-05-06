@@ -219,6 +219,9 @@ type Args struct {
 	// TraceFD is the file descriptor to write a Go execution trace to.
 	// Valid if >=0.
 	TraceFD int
+	// ProductName is the value to show in
+	// /sys/devices/virtual/dmi/id/product_name.
+	ProductName string
 }
 
 // make sure stdioFDs are always the same on initial start and on restore
@@ -364,7 +367,7 @@ func New(args Args) (*Loader, error) {
 	}
 
 	if kernel.VFS2Enabled {
-		if err := registerFilesystems(k); err != nil {
+		if err := registerFilesystems(k, args.ProductName); err != nil {
 			return nil, fmt.Errorf("registering filesystems: %w", err)
 		}
 	}

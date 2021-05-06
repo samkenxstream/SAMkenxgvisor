@@ -469,12 +469,6 @@ func TestTmpMount(t *testing.T) {
 // Test that it is allowed to mount a file on top of /dev files, e.g.
 // /dev/random.
 func TestMountOverDev(t *testing.T) {
-	if vfs2, err := dockerutil.UsingVFS2(); err != nil {
-		t.Fatalf("Failed to read config for runtime %s: %v", dockerutil.Runtime(), err)
-	} else if !vfs2 {
-		t.Skip("VFS1 doesn't allow /dev/random to be mounted.")
-	}
-
 	random, err := ioutil.TempFile(testutil.TmpDir(), "random")
 	if err != nil {
 		t.Fatal("ioutil.TempFile() failed:", err)
@@ -603,22 +597,10 @@ func TestPing6Loopback(t *testing.T) {
 // can always delete its file when the file is inside a sticky directory owned
 // by another user.
 func TestStickyDir(t *testing.T) {
-	if vfs2Used, err := dockerutil.UsingVFS2(); err != nil {
-		t.Fatalf("failed to read config for runtime %s: %v", dockerutil.Runtime(), err)
-	} else if !vfs2Used {
-		t.Skip("sticky bit test fails on VFS1.")
-	}
-
 	runIntegrationTest(t, nil, "./test_sticky")
 }
 
 func TestHostFD(t *testing.T) {
-	if vfs2Used, err := dockerutil.UsingVFS2(); err != nil {
-		t.Fatalf("failed to read config for runtime %s: %v", dockerutil.Runtime(), err)
-	} else if !vfs2Used {
-		t.Skip("test fails on VFS1.")
-	}
-
 	runIntegrationTest(t, nil, "./host_fd")
 }
 
@@ -664,12 +646,6 @@ func TestBindOverlay(t *testing.T) {
 }
 
 func TestStdios(t *testing.T) {
-	if vfs2, err := dockerutil.UsingVFS2(); err != nil {
-		t.Fatalf("Failed to read config for runtime %s: %v", dockerutil.Runtime(), err)
-	} else if !vfs2 {
-		t.Skip("VFS1 doesn't adjust stdios user")
-	}
-
 	ctx := context.Background()
 	d := dockerutil.MakeContainer(ctx, t)
 	defer d.CleanUp(ctx)
@@ -685,12 +661,6 @@ func TestStdios(t *testing.T) {
 }
 
 func TestStdiosExec(t *testing.T) {
-	if vfs2, err := dockerutil.UsingVFS2(); err != nil {
-		t.Fatalf("Failed to read config for runtime %s: %v", dockerutil.Runtime(), err)
-	} else if !vfs2 {
-		t.Skip("VFS1 doesn't adjust stdios user")
-	}
-
 	ctx := context.Background()
 	d := dockerutil.MakeContainer(ctx, t)
 	defer d.CleanUp(ctx)
@@ -748,12 +718,6 @@ func testStdios(t *testing.T, run func(string, ...string) (string, error)) {
 }
 
 func TestStdiosChown(t *testing.T) {
-	if vfs2, err := dockerutil.UsingVFS2(); err != nil {
-		t.Fatalf("Failed to read config for runtime %s: %v", dockerutil.Runtime(), err)
-	} else if !vfs2 {
-		t.Skip("VFS1 doesn't adjust stdios user")
-	}
-
 	ctx := context.Background()
 	d := dockerutil.MakeContainer(ctx, t)
 	defer d.CleanUp(ctx)
@@ -832,5 +796,25 @@ func TestDeleteInterface(t *testing.T) {
 	}
 	if !strings.Contains(output, "lo") {
 		t.Fatalf("loopback interface is removed")
+	}
+}
+
+func TestProductName(t *testing.T) {
+	want, err := ioutil.ReadFile("/sys/devices/virtual/dmi/id/product_name")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	d := dockerutil.MakeContainer(ctx, t)
+	defer d.CleanUp(ctx)
+
+	opts := dockerutil.RunOpts{Image: "basic/alpine"}
+	got, err := d.Run(ctx, opts, "cat", "/sys/devices/virtual/dmi/id/product_name")
+	if err != nil {
+		t.Fatalf("docker run failed: %v", err)
+	}
+	if string(want) != got {
+		t.Errorf("invalid product name, want: %q, got: %q", want, got)
 	}
 }

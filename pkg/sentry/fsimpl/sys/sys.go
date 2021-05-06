@@ -34,6 +34,7 @@ import (
 const (
 	// Name is the default filesystem name.
 	Name                     = "sysfs"
+	defaultSysMode           = linux.FileMode(0444)
 	defaultSysDirMode        = linux.FileMode(0755)
 	defaultMaxCachedDentries = uint64(1000)
 )
@@ -41,7 +42,10 @@ const (
 // FilesystemType implements vfs.FilesystemType.
 //
 // +stateify savable
-type FilesystemType struct{}
+type FilesystemType struct {
+	// ProductName is the value to be set to devices/virtual/dmi/id/product_name.
+	ProductName string
+}
 
 // filesystem implements vfs.FilesystemImpl.
 //
@@ -96,18 +100,32 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		fsDirChildren["cgroup"] = fs.newDir(ctx, creds, defaultSysDirMode, nil)
 	}
 
-	root := fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-		"block": fs.newDir(ctx, creds, defaultSysDirMode, nil),
-		"bus":   fs.newDir(ctx, creds, defaultSysDirMode, nil),
-		"class": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-			"power_supply": fs.newDir(ctx, creds, defaultSysDirMode, nil),
+	classSub := map[string]kernfs.Inode{
+		"power_supply": fs.newDir(ctx, creds, defaultSysDirMode, nil),
+	}
+	devicesSub := map[string]kernfs.Inode{
+		"system": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+			"cpu": cpuDir(ctx, fs, creds),
 		}),
-		"dev": fs.newDir(ctx, creds, defaultSysDirMode, nil),
-		"devices": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-			"system": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-				"cpu": cpuDir(ctx, fs, creds),
+	}
+	if len(fsType.ProductName) > 0 {
+		classSub["dmi"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+			"id": kernfs.NewStaticSymlink(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), "../../devices/virtual/dmi/id"),
+		})
+		devicesSub["virtual"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+			"dmi": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+				"id": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+					"product_name": fs.newStaticFile(ctx, creds, defaultSysMode, fsType.ProductName+"\n"),
+				}),
 			}),
-		}),
+		})
+	}
+	root := fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+		"block":    fs.newDir(ctx, creds, defaultSysDirMode, nil),
+		"bus":      fs.newDir(ctx, creds, defaultSysDirMode, nil),
+		"class":    fs.newDir(ctx, creds, defaultSysDirMode, classSub),
+		"dev":      fs.newDir(ctx, creds, defaultSysDirMode, nil),
+		"devices":  fs.newDir(ctx, creds, defaultSysDirMode, devicesSub),
 		"firmware": fs.newDir(ctx, creds, defaultSysDirMode, nil),
 		"fs":       fs.newDir(ctx, creds, defaultSysDirMode, fsDirChildren),
 		"kernel":   kernelDir(ctx, fs, creds),
@@ -238,4 +256,16 @@ type implStatFS struct{}
 // StatFS implements kernfs.Inode.StatFS.
 func (*implStatFS) StatFS(context.Context, *vfs.Filesystem) (linux.Statfs, error) {
 	return vfs.GenericStatFS(linux.SYSFS_MAGIC), nil
+}
+
+// +stateify savable
+type staticFile struct {
+	kernfs.DynamicBytesFile
+	vfs.StaticData
+}
+
+func (fs *filesystem) newStaticFile(ctx context.Context, creds *auth.Credentials, mode linux.FileMode, data string) kernfs.Inode {
+	s := &staticFile{StaticData: vfs.StaticData{Data: data}}
+	s.Init(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), s, mode)
+	return s
 }
