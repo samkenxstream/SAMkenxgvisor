@@ -674,6 +674,9 @@ type Endpoint interface {
 	// SocketOptions returns the structure which contains all the socket
 	// level options.
 	SocketOptions() *SocketOptions
+
+	// Release reclaims all reference counted objects held by the endpoint
+	Release()
 }
 
 // LinkPacketInfo holds Link layer information for a received packet.

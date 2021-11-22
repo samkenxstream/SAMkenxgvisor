@@ -15,6 +15,7 @@
 package tcp
 
 import (
+	"container/heap"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -973,6 +974,14 @@ func (e *endpoint) notifyProtocolGoroutine(n uint32) {
 	}
 }
 
+func (e *endpoint) Release() {
+	e.purgeReadQueues()
+	e.purgeWriteQueues()
+	for s := e.segmentQueue.dequeue(); s != nil; s = e.segmentQueue.dequeue() {
+		s.DecRef()
+	}
+}
+
 // Abort implements stack.TransportEndpoint.Abort.
 func (e *endpoint) Abort() {
 	// The abort notification is not processed synchronously, so no
@@ -1003,11 +1012,11 @@ func (e *endpoint) Abort() {
 		return
 	}
 	e.Close()
+	e.Release()
 }
 
-// Close puts the endpoint in a closed state and frees all resources associated
-// with it. It must be called only once and with no other concurrent calls to
-// the endpoint.
+// Close puts the endpoint in a closed state. It must be called only once and
+// with no other concurrent calls to the endpoint.
 func (e *endpoint) Close() {
 	e.LockUser()
 	defer e.UnlockUser()
@@ -1015,6 +1024,13 @@ func (e *endpoint) Close() {
 		return
 	}
 
+	// We need to flush the rcv buffs. Ww do this only on the descriptor close,
+	// not protocol-sourced closes, because the reader process may not have
+	// drained the data yet!
+	for s := e.rcvQueueInfo.rcvQueue.Front(); s != nil; s = e.rcvQueueInfo.rcvQueue.Front() {
+		e.rcvQueueInfo.rcvQueue.Remove(s)
+		s.DecRef()
+	}
 	linger := e.SocketOptions().GetLinger()
 	if linger.Enabled && linger.Timeout == 0 {
 		s := e.EndpointState()
@@ -1040,6 +1056,9 @@ func (e *endpoint) Close() {
 	// if we're connected, or stop accepting if we're listening.
 	e.shutdownLocked(tcpip.ShutdownWrite | tcpip.ShutdownRead)
 	e.closeNoShutdownLocked()
+	if e.EndpointState() == StateClose {
+		e.Release()
+	}
 }
 
 // closeNoShutdown closes the endpoint without doing a full shutdown.
@@ -1158,6 +1177,8 @@ func (e *endpoint) cleanupLocked() {
 		e.route.Release()
 		e.route = nil
 	}
+
+	e.purgeWriteQueues()
 
 	e.stack.CompleteTransportEndpointCleanup(e)
 	tcpip.DeleteDanglingEndpoint(e)
@@ -1441,7 +1462,7 @@ func (e *endpoint) commitRead(done int) *segment {
 		// Memory is only considered released when the whole segment has been
 		// read.
 		memDelta += s.segMemSize()
-		s.decRef()
+		s.DecRef()
 		s = e.rcvQueueInfo.rcvQueue.Front()
 	}
 	e.rcvQueueInfo.RcvBufUsed -= done
@@ -1569,6 +1590,7 @@ func (e *endpoint) queueSegment(p tcpip.Payloader, opts tcpip.WriteOptions) (*se
 	// Add data to the send queue.
 	s := newOutgoingSegment(e.TransportEndpointInfo.ID, e.stack.Clock(), v)
 	e.sndQueueInfo.SndBufUsed += len(v)
+	s.IncRef()
 	e.snd.writeList.PushBack(s)
 
 	return s, len(v), nil
@@ -1586,6 +1608,9 @@ func (e *endpoint) Write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, tcp
 	// Return if either we didn't queue anything or if an error occurred while
 	// attempting to queue data.
 	nextSeg, n, err := e.queueSegment(p, opts)
+	if nextSeg != nil {
+		defer nextSeg.DecRef()
+	}
 	if n == 0 || err != nil {
 		return 0, err
 	}
@@ -2117,6 +2142,38 @@ func (*endpoint) Disconnect() tcpip.Error {
 	return &tcpip.ErrNotSupported{}
 }
 
+func (e *endpoint) purgeReadQueues() {
+	if e.rcv != nil {
+		for e.rcv.pendingRcvdSegments.Len() > 0 {
+			s := e.rcv.pendingRcvdSegments[0]
+			s.DecRef()
+			heap.Pop(&e.rcv.pendingRcvdSegments)
+		}
+		e.rcvQueueInfo.rcvQueueMu.Lock()
+		for s := e.rcvQueueInfo.rcvQueue.Front(); s != nil; s = e.rcvQueueInfo.rcvQueue.Front() {
+			e.rcvQueueInfo.rcvQueue.Remove(s)
+			s.DecRef()
+		}
+		e.rcvQueueInfo.rcvQueueMu.Unlock()
+	}
+}
+
+func (e *endpoint) purgeWriteQueues() {
+	if e.snd != nil {
+		e.sndQueueInfo.sndQueueMu.Lock()
+		defer e.sndQueueInfo.sndQueueMu.Unlock()
+		if e.snd.writeNext != nil {
+			e.snd.writeNext.DecRef()
+			e.snd.writeNext = nil
+		}
+
+		for s := e.snd.writeList.Front(); s != nil; s = e.snd.writeList.Front() {
+			e.snd.writeList.Remove(s)
+			s.DecRef()
+		}
+	}
+}
+
 // Connect connects the endpoint to its peer.
 func (e *endpoint) Connect(addr tcpip.FullAddress) tcpip.Error {
 	err := e.connect(addr, true, true)
@@ -2460,6 +2517,8 @@ func (e *endpoint) shutdownLocked(flags tcpip.ShutdownFlags) tcpip.Error {
 
 			// Queue fin segment.
 			s := newOutgoingSegment(e.TransportEndpointInfo.ID, e.stack.Clock(), nil)
+			defer s.DecRef()
+			s.IncRef()
 			e.snd.writeList.PushBack(s)
 			// Mark endpoint as closed.
 			e.sndQueueInfo.SndClosed = true
@@ -2855,7 +2914,7 @@ func (e *endpoint) readyToRead(s *segment) {
 	e.rcvQueueInfo.rcvQueueMu.Lock()
 	if s != nil {
 		e.rcvQueueInfo.RcvBufUsed += s.payloadSize()
-		s.incRef()
+		s.IncRef()
 		e.rcvQueueInfo.rcvQueue.PushBack(s)
 	} else {
 		e.rcvQueueInfo.RcvClosed = true

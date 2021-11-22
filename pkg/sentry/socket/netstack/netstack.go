@@ -340,8 +340,6 @@ type commonEndpoint interface {
 	SocketOptions() *tcpip.SocketOptions
 }
 
-// LINT.IfChange
-
 // SocketOperations encapsulates all the state needed to represent a network stack
 // endpoint in the kernel context.
 //
@@ -3574,5 +3572,3 @@ func (s *socketOpsCommon) EventRegister(e *waiter.Entry) error {
 	s.Queue.EventRegister(e)
 	return nil
 }
-
-// LINT.ThenChange(./netstack_vfs2.go)
