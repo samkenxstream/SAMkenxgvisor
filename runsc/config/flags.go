@@ -71,6 +71,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Bool("oci-seccomp", false, "Enables loading OCI seccomp filters inside the sandbox.")
 	flagSet.Var(defaultControlConfig(), "controls", "Sentry control endpoints.")
 	flagSet.Bool("enable-core-tags", false, "enables core tagging. Requires host linux kernel >= 5.14.")
+	flagSet.String("event-hook", "", "TODO: path to script. Used as UDS path for convenience for now.")
 
 	// Flags that control sandbox runtime behavior: FS related.
 	flagSet.Var(fileAccessTypePtr(FileAccessExclusive), "file-access", "specifies which filesystem validation to use for the root mount: exclusive (default), shared.")
