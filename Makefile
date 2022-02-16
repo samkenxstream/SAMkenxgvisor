@@ -233,11 +233,11 @@ packetimpact-tests:
 
 %-runtime-tests: load-runtimes_% $(RUNTIME_BIN)
 	@$(call install_runtime,$(RUNTIME),) # Ensure flags are cleared.
-	@$(call test_runtime,$(RUNTIME),--test_timeout=10800 //test/runtimes:$*)
+	@$(call test_runtime,$(RUNTIME),--test_timeout=10800 --test_arg=-test.v --test_arg=--soft-timeout=900s //test/runtimes:$*)
 
 %-runtime-tests_vfs2: load-runtimes_% $(RUNTIME_BIN)
 	@$(call install_runtime,$(RUNTIME),--vfs2)
-	@$(call test_runtime,$(RUNTIME),--test_timeout=10800 //test/runtimes:$*)
+	@$(call test_runtime,$(RUNTIME),--test_timeout=10800 --test_arg=-test.v --test_arg=--soft-timeout=900s //test/runtimes:$*)
 
 do-tests: $(RUNTIME_BIN)
 	@$(RUNTIME_BIN) --rootless do true
