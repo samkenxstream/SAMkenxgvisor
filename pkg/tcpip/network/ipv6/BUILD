@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "go_library", "go_test")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "ipv6",
@@ -15,7 +18,7 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/atomicbitops",
-        "//pkg/buffer",
+        "//pkg/bufferv2",
         "//pkg/sync",
         "//pkg/tcpip",
         "//pkg/tcpip/header",
@@ -39,11 +42,12 @@ go_test(
     ],
     library = ":ipv6",
     deps = [
-        "//pkg/buffer",
+        "//pkg/bufferv2",
         "//pkg/refs",
-        "//pkg/refsvfs2",
+        "//pkg/sync",
         "//pkg/tcpip",
         "//pkg/tcpip/checker",
+        "//pkg/tcpip/checksum",
         "//pkg/tcpip/faketime",
         "//pkg/tcpip/header",
         "//pkg/tcpip/link/channel",
@@ -67,14 +71,14 @@ go_test(
     srcs = ["mld_test.go"],
     deps = [
         ":ipv6",
-        "//pkg/buffer",
+        "//pkg/bufferv2",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/tcpip",
         "//pkg/tcpip/checker",
         "//pkg/tcpip/faketime",
         "//pkg/tcpip/header",
         "//pkg/tcpip/link/channel",
+        "//pkg/tcpip/network/internal/testutil",
         "//pkg/tcpip/stack",
         "//pkg/tcpip/testutil",
     ],

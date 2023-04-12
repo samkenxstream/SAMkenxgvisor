@@ -16,6 +16,7 @@ package container
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -32,6 +33,7 @@ import (
 // into and out of the sandbox.
 func TestSharedVolume(t *testing.T) {
 	conf := testutil.TestConfig(t)
+	conf.Overlay2 = config.Overlay2{RootMount: false, SubMounts: false, Medium: ""}
 	conf.FileAccess = config.FileAccessShared
 
 	// Main process just sleeps. We will use "exec" to probe the state of
@@ -144,11 +146,6 @@ func TestSharedVolume(t *testing.T) {
 		t.Errorf("stat %q got error %v, wanted nil", filename, err)
 	}
 
-	// File should exist outside the sandbox.
-	if _, err := os.Stat(filename); err != nil {
-		t.Errorf("stat %q got error %v, wanted nil", filename, err)
-	}
-
 	// Delete the file from within the sandbox.
 	argsRemove := &control.ExecArgs{
 		Filename: "/bin/rm",
@@ -185,6 +182,7 @@ func checkFile(conf *config.Config, c *Container, filename string, want []byte) 
 // is reflected inside.
 func TestSharedVolumeFile(t *testing.T) {
 	conf := testutil.TestConfig(t)
+	conf.Overlay2 = config.Overlay2{RootMount: false, SubMounts: false, Medium: ""}
 	conf.FileAccess = config.FileAccessShared
 
 	// Main process just sleeps. We will use "exec" to probe the state of
@@ -261,5 +259,55 @@ func TestSharedVolumeFile(t *testing.T) {
 	want = want[:5]
 	if err := checkFile(conf, c, filename, want); err != nil {
 		t.Fatal(err.Error())
+	}
+}
+
+// TestSharedVolumeOverlay tests that changes to a shared volume that is
+// wrapped in an overlay are not visible externally.
+func TestSharedVolumeOverlay(t *testing.T) {
+	conf := testutil.TestConfig(t)
+	conf.Overlay2 = config.Overlay2{
+		RootMount: true,
+		SubMounts: true,
+		Medium:    "dir=/tmp",
+	}
+
+	// File that will be used to check consistency inside/outside sandbox.
+	// Note that TmpDir() is set up as a shared volume by NewSpecWithArgs(). So
+	// changes inside TmpDir() should not be visible to the host.
+	filename := filepath.Join(testutil.TmpDir(), "file")
+
+	// Create a file in TmpDir() inside the container.
+	spec := testutil.NewSpecWithArgs("/bin/bash", "-c", "echo Hello > "+filename+"; test -f "+filename)
+	_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+	if err != nil {
+		t.Fatalf("error setting up container: %v", err)
+	}
+	defer cleanup()
+
+	// Create and start the container.
+	args := Args{
+		ID:        testutil.RandomContainerID(),
+		Spec:      spec,
+		BundleDir: bundleDir,
+	}
+	c, err := New(conf, args)
+	if err != nil {
+		t.Fatalf("error creating container: %v", err)
+	}
+	defer c.Destroy()
+	if err := c.Start(conf); err != nil {
+		t.Fatalf("error starting container: %v", err)
+	}
+
+	if ws, err := c.Wait(); err != nil {
+		t.Errorf("failed to wait for container: %v", err)
+	} else if es := ws.ExitStatus(); es != 0 {
+		t.Errorf("subcontainer exited with non-zero status %d", es)
+	}
+
+	// Ensure that the file does not exist on the host.
+	if _, err := os.Stat(filename); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("file exists on host, stat %q got error %v, wanted ErrNotExist", filename, err)
 	}
 }

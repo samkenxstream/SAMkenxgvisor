@@ -1,6 +1,7 @@
 load("//test/packetimpact/runner:defs.bzl", "ALL_TESTS", "packetimpact_go_test", "packetimpact_testbench", "validate_all_tests")
 
 package(
+    default_applicable_licenses = ["//:license"],
     default_visibility = ["//test/packetimpact:__subpackages__"],
     licenses = ["notice"],
 )
@@ -280,6 +281,7 @@ packetimpact_testbench(
     name = "ipv4_fragment_reassembly",
     srcs = ["ipv4_fragment_reassembly_test.go"],
     deps = [
+        "//pkg/tcpip/checksum",
         "//pkg/tcpip/header",
         "//test/packetimpact/testbench",
         "@com_github_google_go_cmp//cmp:go_default_library",
@@ -292,6 +294,7 @@ packetimpact_testbench(
     srcs = ["ipv6_fragment_reassembly_test.go"],
     deps = [
         "//pkg/tcpip",
+        "//pkg/tcpip/checksum",
         "//pkg/tcpip/header",
         "//test/packetimpact/testbench",
         "@com_github_google_go_cmp//cmp:go_default_library",
@@ -304,6 +307,7 @@ packetimpact_testbench(
     srcs = ["ipv6_fragment_icmp_error_test.go"],
     deps = [
         "//pkg/tcpip",
+        "//pkg/tcpip/checksum",
         "//pkg/tcpip/header",
         "//pkg/tcpip/network/ipv6",
         "//test/packetimpact/testbench",

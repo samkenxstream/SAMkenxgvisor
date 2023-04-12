@@ -105,6 +105,15 @@ std::vector<Callback> dispatchers = {
     unpackSyscall<::gvisor::syscall::Clone>,
     unpackSyscall<::gvisor::syscall::Bind>,
     unpackSyscall<::gvisor::syscall::Accept>,
+    unpackSyscall<::gvisor::syscall::TimerfdCreate>,
+    unpackSyscall<::gvisor::syscall::TimerfdSetTime>,
+    unpackSyscall<::gvisor::syscall::TimerfdGetTime>,
+    unpackSyscall<::gvisor::syscall::Fork>,
+    unpackSyscall<::gvisor::syscall::InotifyInit>,
+    unpackSyscall<::gvisor::syscall::InotifyAddWatch>,
+    unpackSyscall<::gvisor::syscall::InotifyRmWatch>,
+    unpackSyscall<::gvisor::syscall::SocketPair>,
+    unpackSyscall<::gvisor::syscall::Write>,
 };
 
 void unpack(absl::string_view buf) {
@@ -195,7 +204,7 @@ bool handshake(int client_fd) {
   if (bytes < 0) {
     printf("Error receiving handshake message: %d\n", errno);
     return false;
-  } else if (bytes == buf.size()) {
+  } else if (bytes == (int)buf.size()) {
     // Protect against the handshake becoming larger than the buffer allocated
     // for it.
     printf("handshake message too big\n");

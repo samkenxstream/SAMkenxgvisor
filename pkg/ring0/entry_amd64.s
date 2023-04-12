@@ -16,76 +16,75 @@
 #include "textflag.h"
 
 // CPU offsets.
-#define CPU_REGISTERS    {{ .CPU.registers.Offset }}
-#define CPU_FPU_STATE    {{ .CPU.floatingPointState.Offset }}
-#define CPU_ERROR_CODE   ({{ .CPU.CPUArchState.Offset }}+{{ .CPUArchState.errorCode.Offset }})
-#define CPU_ERROR_TYPE   ({{ .CPU.CPUArchState.Offset }}+{{ .CPUArchState.errorType.Offset }})
-#define CPU_ENTRY        ({{ .CPU.CPUArchState.Offset }}+{{ .CPUArchState.kernelEntry.Offset }})
-#define CPU_HAS_XSAVE    ({{ .CPU.CPUArchState.Offset }}+{{ .CPUArchState.hasXSAVE.Offset }})
-#define CPU_HAS_XSAVEOPT ({{ .CPU.CPUArchState.Offset }}+{{ .CPUArchState.hasXSAVEOPT.Offset }})
+#define CPU_REGISTERS    64  // +checkoffset . CPU.registers
+#define CPU_FPU_STATE    280 // +checkoffset . CPU.floatingPointState
+#define CPU_ARCH_STATE   16  // +checkoffset . CPU.CPUArchState
+#define CPU_ERROR_CODE   CPU_ARCH_STATE+0  // +checkoffset . CPUArchState.errorCode
+#define CPU_ERROR_TYPE   CPU_ARCH_STATE+8  // +checkoffset . CPUArchState.errorType
+#define CPU_VECTOR       CPU_ARCH_STATE+16 // +checkoffset . CPUArchState.vector
+#define CPU_FAULT_ADDR   CPU_ARCH_STATE+24 // +checkoffset . CPUArchState.faultAddr
+#define CPU_ENTRY        CPU_ARCH_STATE+32 // +checkoffset . CPUArchState.kernelEntry
+#define CPU_HAS_XSAVE    CPU_ARCH_STATE+40 // +checkoffset . CPUArchState.hasXSAVE
+#define CPU_HAS_XSAVEOPT CPU_ARCH_STATE+41 // +checkoffset . CPUArchState.hasXSAVEOPT
 
-{{ with .kernelEntry }}
-#define ENTRY_SCRATCH0   {{ .scratch0.Offset }}
-#define ENTRY_STACK_TOP  {{ .stackTop.Offset }}
-#define ENTRY_CPU_SELF   {{ .cpuSelf.Offset }}
-#define ENTRY_KERNEL_CR3 {{ .kernelCR3.Offset }}
-{{ end }}
+#define ENTRY_SCRATCH0   256 // +checkoffset . kernelEntry.scratch0
+#define ENTRY_STACK_TOP  264 // +checkoffset . kernelEntry.stackTop
+#define ENTRY_CPU_SELF   272 // +checkoffset . kernelEntry.cpuSelf
+#define ENTRY_KERNEL_CR3 280 // +checkoffset . kernelEntry.kernelCR3
 
 // Bits.
-#define _RFLAGS_IF    {{ ._RFLAGS_IF.Value }}
-#define _RFLAGS_IOPL0 {{ ._RFLAGS_IOPL0.Value }}
-#define _KERNEL_FLAGS {{ .KernelFlagsSet.Value }}
+#define _RFLAGS_IF    512  // +checkconst . _RFLAGS_IF
+#define _RFLAGS_IOPL0 4096 // +checkconst . _RFLAGS_IOPL0
+#define _KERNEL_FLAGS 2    // +checkconst . KernelFlagsSet
 
 // Vectors.
-#define DivideByZero               {{ .DivideByZero.Value }}
-#define Debug                      {{ .Debug.Value }}
-#define NMI                        {{ .NMI.Value }}
-#define Breakpoint                 {{ .Breakpoint.Value }}
-#define Overflow                   {{ .Overflow.Value }}
-#define BoundRangeExceeded         {{ .BoundRangeExceeded.Value }}
-#define InvalidOpcode              {{ .InvalidOpcode.Value }}
-#define DeviceNotAvailable         {{ .DeviceNotAvailable.Value }}
-#define DoubleFault                {{ .DoubleFault.Value }}
-#define CoprocessorSegmentOverrun  {{ .CoprocessorSegmentOverrun.Value }}
-#define InvalidTSS                 {{ .InvalidTSS.Value }}
-#define SegmentNotPresent          {{ .SegmentNotPresent.Value }}
-#define StackSegmentFault          {{ .StackSegmentFault.Value }}
-#define GeneralProtectionFault     {{ .GeneralProtectionFault.Value }}
-#define PageFault                  {{ .PageFault.Value }}
-#define X87FloatingPointException  {{ .X87FloatingPointException.Value }}
-#define AlignmentCheck             {{ .AlignmentCheck.Value }}
-#define MachineCheck               {{ .MachineCheck.Value }}
-#define SIMDFloatingPointException {{ .SIMDFloatingPointException.Value }}
-#define VirtualizationException    {{ .VirtualizationException.Value }}
-#define SecurityException          {{ .SecurityException.Value }}
-#define SyscallInt80               {{ .SyscallInt80.Value }}
-#define Syscall                    {{ .Syscall.Value }}
+#define DivideByZero               0 // +checkconst . DivideByZero
+#define Debug                      1 // +checkconst . Debug
+#define NMI                        2 // +checkconst . NMI
+#define Breakpoint                 3 // +checkconst . Breakpoint
+#define Overflow                   4 // +checkconst . Overflow
+#define BoundRangeExceeded         5 // +checkconst . BoundRangeExceeded
+#define InvalidOpcode              6 // +checkconst . InvalidOpcode
+#define DeviceNotAvailable         7 // +checkconst . DeviceNotAvailable
+#define DoubleFault                8 // +checkconst . DoubleFault
+#define CoprocessorSegmentOverrun  9 // +checkconst . CoprocessorSegmentOverrun
+#define InvalidTSS                 10 // +checkconst . InvalidTSS
+#define SegmentNotPresent          11 // +checkconst . SegmentNotPresent
+#define StackSegmentFault          12 // +checkconst . StackSegmentFault
+#define GeneralProtectionFault     13 // +checkconst . GeneralProtectionFault
+#define PageFault                  14 // +checkconst . PageFault
+#define X87FloatingPointException  16 // +checkconst . X87FloatingPointException
+#define AlignmentCheck             17 // +checkconst . AlignmentCheck
+#define MachineCheck               18 // +checkconst . MachineCheck
+#define SIMDFloatingPointException 19 // +checkconst . SIMDFloatingPointException
+#define VirtualizationException    20 // +checkconst . VirtualizationException
+#define SecurityException          30 // +checkconst . SecurityException
+#define SyscallInt80               128 // +checkconst . SyscallInt80
+#define Syscall                    256 // +checkconst . Syscall
 
-{{ with .import.linux.PtraceRegs }}
-#define PTRACE_R15      {{ .R15.Offset }}
-#define PTRACE_R14      {{ .R14.Offset }}
-#define PTRACE_R13      {{ .R13.Offset }}
-#define PTRACE_R12      {{ .R12.Offset }}
-#define PTRACE_RBP      {{ .Rbp.Offset }}
-#define PTRACE_RBX      {{ .Rbx.Offset }}
-#define PTRACE_R11      {{ .R11.Offset }}
-#define PTRACE_R10      {{ .R10.Offset }}
-#define PTRACE_R9       {{ .R9.Offset }}
-#define PTRACE_R8       {{ .R8.Offset }}
-#define PTRACE_RAX      {{ .Rax.Offset }}
-#define PTRACE_RCX      {{ .Rcx.Offset }}
-#define PTRACE_RDX      {{ .Rdx.Offset }}
-#define PTRACE_RSI      {{ .Rsi.Offset }}
-#define PTRACE_RDI      {{ .Rdi.Offset }}
-#define PTRACE_ORIGRAX  {{ .Orig_rax.Offset }}
-#define PTRACE_RIP      {{ .Rip.Offset }}
-#define PTRACE_CS       {{ .Cs.Offset }}
-#define PTRACE_FLAGS    {{ .Eflags.Offset }}
-#define PTRACE_RSP      {{ .Rsp.Offset }}
-#define PTRACE_SS       {{ .Ss.Offset }}
-#define PTRACE_FS_BASE  {{ .Fs_base.Offset }}
-#define PTRACE_GS_BASE  {{ .Gs_base.Offset }}
-{{ end }}
+#define PTRACE_R15      0   // +checkoffset linux PtraceRegs.R15
+#define PTRACE_R14      8   // +checkoffset linux PtraceRegs.R14
+#define PTRACE_R13      16  // +checkoffset linux PtraceRegs.R13
+#define PTRACE_R12      24  // +checkoffset linux PtraceRegs.R12
+#define PTRACE_RBP      32  // +checkoffset linux PtraceRegs.Rbp
+#define PTRACE_RBX      40  // +checkoffset linux PtraceRegs.Rbx
+#define PTRACE_R11      48  // +checkoffset linux PtraceRegs.R11
+#define PTRACE_R10      56  // +checkoffset linux PtraceRegs.R10
+#define PTRACE_R9       64  // +checkoffset linux PtraceRegs.R9
+#define PTRACE_R8       72  // +checkoffset linux PtraceRegs.R8
+#define PTRACE_RAX      80  // +checkoffset linux PtraceRegs.Rax
+#define PTRACE_RCX      88  // +checkoffset linux PtraceRegs.Rcx
+#define PTRACE_RDX      96  // +checkoffset linux PtraceRegs.Rdx
+#define PTRACE_RSI      104 // +checkoffset linux PtraceRegs.Rsi
+#define PTRACE_RDI      112 // +checkoffset linux PtraceRegs.Rdi
+#define PTRACE_ORIGRAX  120 // +checkoffset linux PtraceRegs.Orig_rax
+#define PTRACE_RIP      128 // +checkoffset linux PtraceRegs.Rip
+#define PTRACE_CS       136 // +checkoffset linux PtraceRegs.Cs
+#define PTRACE_FLAGS    144 // +checkoffset linux PtraceRegs.Eflags
+#define PTRACE_RSP      152 // +checkoffset linux PtraceRegs.Rsp
+#define PTRACE_SS       160 // +checkoffset linux PtraceRegs.Ss
+#define PTRACE_FS_BASE  168 // +checkoffset linux PtraceRegs.Fs_base
+#define PTRACE_GS_BASE  176 // +checkoffset linux PtraceRegs.Gs_base
 
 // Saves a register set.
 //
@@ -165,7 +164,7 @@ TEXT name,$0-8; \
 	RET
 
 // See kernel.go.
-TEXT ·Halt(SB),NOSPLIT,$0
+TEXT ·Halt(SB),NOSPLIT|NOFRAME,$0
 	HLT
 	RET
 
@@ -183,15 +182,10 @@ TEXT ·HaltAndWriteFSBase(SB),NOSPLIT,$8-8
 
 	RET
 
-// See entry_amd64.go.
-TEXT ·swapgs(SB),NOSPLIT,$0
-	SWAP_GS()
-	RET
-
 // jumpToKernel changes execution to the kernel address space.
 //
 // This works by changing the return value to the kernel version.
-TEXT ·jumpToKernel(SB),NOSPLIT,$0
+TEXT ·jumpToKernel(SB),NOSPLIT|NOFRAME,$0
 	MOVQ 0(SP), AX
 	ORQ ·KernelStartAddress(SB), AX // Future return value.
 	MOVQ AX, 0(SP)
@@ -200,7 +194,7 @@ TEXT ·jumpToKernel(SB),NOSPLIT,$0
 // jumpToUser changes execution to the user address space.
 //
 // This works by changing the return value to the user version.
-TEXT ·jumpToUser(SB),NOSPLIT,$0
+TEXT ·jumpToUser(SB),NOSPLIT|NOFRAME,$0
 	// N.B. we can't access KernelStartAddress from the upper half (data
 	// pages not available), so just naively clear all the upper bits.
 	// We are assuming a 47-bit virtual address space.
@@ -266,7 +260,7 @@ do_iret:
 done_sysret_or_iret:
 	MOVQ 24(SP), AX // vector
 	ADDQ $32, SP
-	MOVQ AX, vector+40(FP)
+	MOVQ AX, ret+40(FP)
 
 	// Save application floating point state.
 	MOVQ fpState+16(FP), DI
@@ -306,7 +300,7 @@ fpsave_done:
 	RET
 
 // See entry_amd64.go.
-TEXT ·sysret(SB),NOSPLIT,$0-32
+TEXT ·sysret(SB),NOSPLIT|NOFRAME,$0-32
 	// Set application FS. We can't do this in Go because Go code needs FS.
 	MOVQ regs+8(FP), AX
 	MOVQ PTRACE_FS_BASE(AX), AX
@@ -349,7 +343,7 @@ TEXT ·sysret(SB),NOSPLIT,$0-32
 	// caller.
 
 // See entry_amd64.go.
-TEXT ·iret(SB),NOSPLIT,$0-32
+TEXT ·iret(SB),NOSPLIT|NOFRAME,$0-32
 	// Set application FS. We can't do this in Go because Go code needs FS.
 	MOVQ regs+8(FP), AX
 	MOVQ PTRACE_FS_BASE(AX), AX
@@ -389,7 +383,7 @@ TEXT ·iret(SB),NOSPLIT,$0-32
 	// caller.
 
 // See entry_amd64.go.
-TEXT ·resume(SB),NOSPLIT,$0
+TEXT ·resume(SB),NOSPLIT|NOFRAME,$0
 	// See iret, above.
 	MOVQ ENTRY_CPU_SELF(GS), AX                 // Load vCPU.
 	PUSHQ CPU_REGISTERS+PTRACE_SS(AX)
@@ -402,7 +396,7 @@ TEXT ·resume(SB),NOSPLIT,$0
 	IRET()
 
 // See entry_amd64.go.
-TEXT ·start(SB),NOSPLIT,$0
+TEXT ·start(SB),NOSPLIT|NOFRAME,$0
 	// N.B. This is the vCPU entrypoint. It is not called from Go code and
 	// thus pushes and pops values on the stack until calling into Go
 	// (startGo) because we aren't usually a typical Go assembly frame.
@@ -424,7 +418,7 @@ TEXT ·start(SB),NOSPLIT,$0
 ADDR_OF_FUNC(·AddrOfStart(SB), ·start(SB));
 
 // See entry_amd64.go.
-TEXT ·sysenter(SB),NOSPLIT,$0
+TEXT ·sysenter(SB),NOSPLIT|NOFRAME,$0
 	// _RFLAGS_IOPL0 is always set in the user mode and it is never set in
 	// the kernel mode. See the comment of UserFlagsSet for more details.
 	TESTL $_RFLAGS_IOPL0, R11
@@ -488,6 +482,7 @@ kernel:
 	MOVQ BX,  CPU_REGISTERS+PTRACE_RAX(AX)
 	MOVQ $0,  CPU_ERROR_CODE(AX)                // Clear error code.
 	MOVQ $0,  CPU_ERROR_TYPE(AX)                // Set error type to kernel.
+	MOVQ $0xffffffffffffffff,  CPU_VECTOR(AX)                // Set error type to kernel.
 
 	// Save floating point state. CPU.floatingPointState is a slice, so the
 	// first word of CPU.floatingPointState is a pointer to the destination
@@ -537,7 +532,7 @@ ADDR_OF_FUNC(·addrOfSysenter(SB), ·sysenter(SB));
 // the vector & error codes are pushed as return values.
 //
 // See below for the stubs that call exception.
-TEXT ·exception(SB),NOSPLIT,$0
+TEXT ·exception(SB),NOSPLIT|NOFRAME,$0
 	// Determine whether the exception occurred in kernel mode or user
 	// mode, based on the flags. We expect the following stack:
 	//
@@ -608,6 +603,10 @@ kernel:
 	// Set the error code and adjust the stack.
 	MOVQ 8(SP), BX              // Load the error code.
 	MOVQ BX, CPU_ERROR_CODE(AX) // Copy out to the CPU.
+	MOVQ 0(SP), BX              // Load the error code.
+	MOVQ BX, CPU_VECTOR(AX) // Copy out to the CPU.
+	BYTE $0x0f; BYTE $0x20; BYTE $0xd3; // MOV CR2, RBX
+	MOVQ BX, CPU_FAULT_ADDR(AX)
 	MOVQ $0, CPU_ERROR_TYPE(AX) // Set error type to kernel.
 
 	// Save floating point state. CPU.floatingPointState is a slice, so the
@@ -650,13 +649,13 @@ fpsave_done:
 
 #define EXCEPTION_WITH_ERROR(value, symbol, addr) \
 ADDR_OF_FUNC(addr, symbol); \
-TEXT symbol,NOSPLIT,$0; \
+TEXT symbol,NOSPLIT|NOFRAME,$0; \
 	PUSHQ $value; \
 	JMP ·exception(SB);
 
 #define EXCEPTION_WITHOUT_ERROR(value, symbol, addr) \
 ADDR_OF_FUNC(addr, symbol); \
-TEXT symbol,NOSPLIT,$0; \
+TEXT symbol,NOSPLIT|NOFRAME,$0; \
 	PUSHQ $0x0; \
 	PUSHQ $value; \
 	JMP ·exception(SB);

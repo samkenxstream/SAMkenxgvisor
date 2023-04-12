@@ -21,8 +21,8 @@ import (
 	"testing"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/bufferv2"
 	"gvisor.dev/gvisor/pkg/refs"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/seqnum"
@@ -332,8 +332,10 @@ func TestNoTLPRecoveryOnDSACK(t *testing.T) {
 	if err := c.EP.GetSockOpt(&info); err != nil {
 		t.Fatalf("GetSockOpt failed: %v", err)
 	}
-	if p := c.GetPacketWithTimeout(info.RTO); p != nil {
+	var p *bufferv2.View
+	if p = c.GetPacketWithTimeout(info.RTO); p != nil {
 		t.Errorf("received an unexpected packet: %v", p)
+		p.Release()
 	}
 
 	metricPollFn := func() error {
@@ -1071,6 +1073,6 @@ func TestMain(m *testing.M) {
 	// Allow TCP async work to complete to avoid false reports of leaks.
 	// TODO(gvisor.dev/issue/5940): Use fake clock in tests.
 	time.Sleep(1 * time.Second)
-	refsvfs2.DoLeakCheck()
+	refs.DoLeakCheck()
 	os.Exit(code)
 }

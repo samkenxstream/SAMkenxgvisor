@@ -23,7 +23,6 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"gvisor.dev/gvisor/pkg/refs"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/checker"
 	"gvisor.dev/gvisor/pkg/tcpip/faketime"
@@ -165,10 +164,12 @@ func getEndpointAddr(protocol tcpip.NetworkProtocolNumber, addrType endpointAddr
 	}
 }
 
-func checkEchoRequest(t *testing.T, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer, srcAddr, dstAddr tcpip.Address, ttl uint8) {
+func checkEchoRequest(t *testing.T, protocol tcpip.NetworkProtocolNumber, pkt stack.PacketBufferPtr, srcAddr, dstAddr tcpip.Address, ttl uint8) {
+	payload := stack.PayloadSince(pkt.NetworkHeader())
+	defer payload.Release()
 	switch protocol {
 	case ipv4.ProtocolNumber:
-		checker.IPv4(t, stack.PayloadSince(pkt.NetworkHeader()),
+		checker.IPv4(t, payload,
 			checker.SrcAddr(srcAddr),
 			checker.DstAddr(dstAddr),
 			checker.TTL(ttl),
@@ -177,7 +178,7 @@ func checkEchoRequest(t *testing.T, protocol tcpip.NetworkProtocolNumber, pkt *s
 			),
 		)
 	case ipv6.ProtocolNumber:
-		checker.IPv6(t, stack.PayloadSince(pkt.NetworkHeader()),
+		checker.IPv6(t, payload,
 			checker.SrcAddr(srcAddr),
 			checker.DstAddr(dstAddr),
 			checker.TTL(ttl),
@@ -190,10 +191,12 @@ func checkEchoRequest(t *testing.T, protocol tcpip.NetworkProtocolNumber, pkt *s
 	}
 }
 
-func checkEchoReply(t *testing.T, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer, srcAddr, dstAddr tcpip.Address) {
+func checkEchoReply(t *testing.T, protocol tcpip.NetworkProtocolNumber, pkt stack.PacketBufferPtr, srcAddr, dstAddr tcpip.Address) {
+	payload := stack.PayloadSince(pkt.NetworkHeader())
+	defer payload.Release()
 	switch protocol {
 	case ipv4.ProtocolNumber:
-		checker.IPv4(t, stack.PayloadSince(pkt.NetworkHeader()),
+		checker.IPv4(t, payload,
 			checker.SrcAddr(srcAddr),
 			checker.DstAddr(dstAddr),
 			checker.ICMPv4(
@@ -201,7 +204,7 @@ func checkEchoReply(t *testing.T, protocol tcpip.NetworkProtocolNumber, pkt *sta
 			),
 		)
 	case ipv6.ProtocolNumber:
-		checker.IPv6(t, stack.PayloadSince(pkt.NetworkHeader()),
+		checker.IPv6(t, payload,
 			checker.SrcAddr(srcAddr),
 			checker.DstAddr(dstAddr),
 			checker.ICMPv6(
@@ -417,7 +420,7 @@ func TestAddMulticastRoute(t *testing.T) {
 				s := stack.New(stack.Options{
 					NetworkProtocols: []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 				})
-				defer s.Close()
+				defer s.Destroy()
 
 				endpoints := make(map[tcpip.NICID]*channel.Endpoint)
 				for nicID, addrType := range endpointConfigs {
@@ -459,7 +462,7 @@ func TestAddMulticastRoute(t *testing.T) {
 						injectPacket(incomingEp, protocol, srcAddr, dstAddr, packetTTL)
 						p := incomingEp.Read()
 
-						if p != nil {
+						if !p.IsNil() {
 							// An ICMP error should never be sent in response to a multicast packet.
 							t.Fatalf("got incomingEp.Read() = %#v, want = nil", p)
 						}
@@ -498,7 +501,7 @@ func TestAddMulticastRoute(t *testing.T) {
 
 				p := outgoingEp.Read()
 
-				if (p != nil) != test.expectForward {
+				if (!p.IsNil()) != test.expectForward {
 					t.Fatalf("got outgoingEp.Read() = %#v, want = (_ == nil) = %t", p, test.expectForward)
 				}
 
@@ -547,7 +550,7 @@ func TestEnableMulticastForwardingE(t *testing.T) {
 					NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 					TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
 				})
-				defer s.Close()
+				defer s.Destroy()
 
 				for _, wantResult := range test.wantResult {
 					alreadyEnabled, err := s.EnableMulticastForwardingForProtocol(protocol, test.eventDispatcher)
@@ -583,7 +586,7 @@ func TestMulticastRouteLastUsedTime(t *testing.T) {
 			name:    "no matching route",
 			srcAddr: remoteUnicastAddr,
 			dstAddr: otherMulticastAddr,
-			wantErr: &tcpip.ErrNoRoute{},
+			wantErr: &tcpip.ErrHostUnreachable{},
 		},
 		{
 			name:    "multicast source",
@@ -638,7 +641,7 @@ func TestMulticastRouteLastUsedTime(t *testing.T) {
 					TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
 					Clock:              clock,
 				})
-				defer s.Close()
+				defer s.Destroy()
 
 				if _, err := s.EnableMulticastForwardingForProtocol(protocol, &fakeMulticastEventDispatcher{}); err != nil {
 					t.Fatalf("s.EnableMulticastForwardingForProtocol(%d, _): (_, %s)", protocol, err)
@@ -694,7 +697,7 @@ func TestMulticastRouteLastUsedTime(t *testing.T) {
 				injectPacket(incomingEp, protocol, srcAddr, dstAddr, packetTTL)
 				p := incomingEp.Read()
 
-				if p != nil {
+				if !p.IsNil() {
 					t.Fatalf("Expected no ICMP packet through incoming NIC, instead found: %#v", p)
 				}
 
@@ -741,7 +744,7 @@ func TestRemoveMulticastRoute(t *testing.T) {
 			name:    "no matching route",
 			srcAddr: remoteUnicastAddr,
 			dstAddr: otherMulticastAddr,
-			wantErr: &tcpip.ErrNoRoute{},
+			wantErr: &tcpip.ErrHostUnreachable{},
 		},
 		{
 			name:    "multicast source",
@@ -794,7 +797,7 @@ func TestRemoveMulticastRoute(t *testing.T) {
 					NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 					TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
 				})
-				defer s.Close()
+				defer s.Destroy()
 
 				if _, err := s.EnableMulticastForwardingForProtocol(protocol, &fakeMulticastEventDispatcher{}); err != nil {
 					t.Fatalf("s.EnableMulticastForwardingForProtocol(%d, _): (_, %s)", protocol, err)
@@ -858,7 +861,7 @@ func TestRemoveMulticastRoute(t *testing.T) {
 				injectPacket(incomingEp, protocol, srcAddr, dstAddr, packetTTL)
 				p := incomingEp.Read()
 
-				if p != nil {
+				if !p.IsNil() {
 					// An ICMP error should never be sent in response to a multicast
 					// packet.
 					t.Errorf("expected no ICMP packet through incoming NIC, instead found: %#v", p)
@@ -874,7 +877,7 @@ func TestRemoveMulticastRoute(t *testing.T) {
 				// If the route was successfully removed, then the packet should not be
 				// forwarded.
 				expectForward := test.wantErr != nil
-				if (p != nil) != expectForward {
+				if (!p.IsNil()) != expectForward {
 					t.Fatalf("got outgoingEp.Read() = %#v, want = (_ == nil) = %t", p, expectForward)
 				}
 
@@ -1036,7 +1039,7 @@ func TestMulticastForwarding(t *testing.T) {
 					NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 					TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
 				})
-				defer s.Close()
+				defer s.Destroy()
 
 				eventDispatcher, ok := eventDispatchers[protocol]
 				if !ok {
@@ -1135,7 +1138,7 @@ func TestMulticastForwarding(t *testing.T) {
 				injectPacket(incomingEp, protocol, srcAddr, dstAddr, test.ttl)
 				p := incomingEp.Read()
 
-				if p != nil {
+				if !p.IsNil() {
 					// An ICMP error should never be sent in response to a multicast packet.
 					t.Fatalf("expected no ICMP packet through incoming NIC, instead found: %#v", p)
 				}
@@ -1150,7 +1153,7 @@ func TestMulticastForwarding(t *testing.T) {
 
 					expectForward := contains(nicID, test.expectedForwardingInterfaces)
 
-					if (p != nil) != expectForward {
+					if (!p.IsNil()) != expectForward {
 						t.Fatalf("got outgoingEp.Read() = %#v, want = (_ == nil) = %t", p, expectForward)
 					}
 
@@ -1167,7 +1170,7 @@ func TestMulticastForwarding(t *testing.T) {
 
 				p = otherEp.Read()
 
-				if (p != nil) != test.joinMulticastGroup {
+				if (!p.IsNil()) != test.joinMulticastGroup {
 					t.Fatalf("got otherEp.Read() = %#v, want = (_ == nil) = %t", p, test.joinMulticastGroup)
 				}
 
@@ -1210,6 +1213,6 @@ func TestMulticastForwarding(t *testing.T) {
 func TestMain(m *testing.M) {
 	refs.SetLeakMode(refs.LeaksPanic)
 	code := m.Run()
-	refsvfs2.DoLeakCheck()
+	refs.DoLeakCheck()
 	os.Exit(code)
 }

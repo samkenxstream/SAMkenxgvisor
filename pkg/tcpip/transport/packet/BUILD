@@ -1,7 +1,10 @@
 load("//tools:defs.bzl", "go_library")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_template_instance(
     name = "packet_list",
@@ -24,7 +27,7 @@ go_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
-        "//pkg/buffer",
+        "//pkg/bufferv2",
         "//pkg/log",
         "//pkg/sleep",
         "//pkg/sync",

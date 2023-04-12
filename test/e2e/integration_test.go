@@ -22,6 +22,7 @@
 package integration
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
@@ -55,20 +56,6 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// httpRequestSucceeds sends a request to a given url and checks that the status is OK.
-func httpRequestSucceeds(client http.Client, server string, port int) error {
-	url := fmt.Sprintf("http://%s:%d", server, port)
-	// Ensure that content is being served.
-	resp, err := client.Get(url)
-	if err != nil {
-		return fmt.Errorf("error reaching http server: %v", err)
-	}
-	if want := http.StatusOK; resp.StatusCode != want {
-		return fmt.Errorf("wrong response code, got: %d, want: %d", resp.StatusCode, want)
-	}
-	return nil
-}
-
 // TestLifeCycle tests a basic Create/Start/Stop docker container life cycle.
 func TestLifeCycle(t *testing.T) {
 	ctx := context.Background()
@@ -95,7 +82,7 @@ func TestLifeCycle(t *testing.T) {
 		t.Fatalf("WaitForHTTP() timeout: %v", err)
 	}
 	client := http.Client{Timeout: defaultWait}
-	if err := httpRequestSucceeds(client, ip.String(), port); err != nil {
+	if err := testutil.HTTPRequestSucceeds(client, ip.String(), port); err != nil {
 		t.Errorf("http request failed: %v", err)
 	}
 
@@ -138,7 +125,7 @@ func TestPauseResume(t *testing.T) {
 
 	// Check that container is working.
 	client := http.Client{Timeout: defaultWait}
-	if err := httpRequestSucceeds(client, ip.String(), port); err != nil {
+	if err := testutil.HTTPRequestSucceeds(client, ip.String(), port); err != nil {
 		t.Error("http request failed:", err)
 	}
 
@@ -170,57 +157,7 @@ func TestPauseResume(t *testing.T) {
 
 	// Check if container is working again.
 	client = http.Client{Timeout: defaultWait}
-	if err := httpRequestSucceeds(client, ip.String(), port); err != nil {
-		t.Error("http request failed:", err)
-	}
-}
-
-func TestCheckpointRestore(t *testing.T) {
-	if !testutil.IsCheckpointSupported() {
-		t.Skip("Pause/resume is not supported.")
-	}
-	dockerutil.EnsureDockerExperimentalEnabled()
-
-	ctx := context.Background()
-	d := dockerutil.MakeContainer(ctx, t)
-	defer d.CleanUp(ctx)
-
-	// Start the container.
-	port := 8080
-	if err := d.Spawn(ctx, dockerutil.RunOpts{
-		Image: "basic/python",
-		Ports: []int{port}, // See Dockerfile.
-	}); err != nil {
-		t.Fatalf("docker run failed: %v", err)
-	}
-
-	// Create a snapshot.
-	if err := d.Checkpoint(ctx, "test"); err != nil {
-		t.Fatalf("docker checkpoint failed: %v", err)
-	}
-	if err := d.WaitTimeout(ctx, defaultWait); err != nil {
-		t.Fatalf("wait failed: %v", err)
-	}
-
-	// TODO(b/143498576): Remove Poll after github.com/moby/moby/issues/38963 is fixed.
-	if err := testutil.Poll(func() error { return d.Restore(ctx, "test") }, defaultWait); err != nil {
-		t.Fatalf("docker restore failed: %v", err)
-	}
-
-	// Find container IP address.
-	ip, err := d.FindIP(ctx, false)
-	if err != nil {
-		t.Fatalf("docker.FindIP failed: %v", err)
-	}
-
-	// Wait until it's up and running.
-	if err := testutil.WaitForHTTP(ip.String(), port, defaultWait); err != nil {
-		t.Fatalf("WaitForHTTP() timeout: %v", err)
-	}
-
-	// Check if container is working again.
-	client := http.Client{Timeout: defaultWait}
-	if err := httpRequestSucceeds(client, ip.String(), port); err != nil {
+	if err := testutil.HTTPRequestSucceeds(client, ip.String(), port); err != nil {
 		t.Error("http request failed:", err)
 	}
 }
@@ -567,12 +504,6 @@ func TestLink(t *testing.T) {
 
 // This test ensures we can run ping without errors.
 func TestPing4Loopback(t *testing.T) {
-	if testutil.IsRunningWithHostNet() {
-		// TODO(gvisor.dev/issue/5011): support ICMP sockets in hostnet and enable
-		// this test.
-		t.Skip("hostnet only supports TCP/UDP sockets, so ping is not supported.")
-	}
-
 	runIntegrationTest(t, nil, "./ping4.sh")
 }
 
@@ -755,10 +686,6 @@ func TestUnmount(t *testing.T) {
 }
 
 func TestDeleteInterface(t *testing.T) {
-	if testutil.IsRunningWithHostNet() {
-		t.Skip("not able to remove interfaces on hostnet")
-	}
-
 	ctx := context.Background()
 	d := dockerutil.MakeContainer(ctx, t)
 	defer d.CleanUp(ctx)
@@ -995,5 +922,53 @@ func TestNonSearchableWorkingDirectory(t *testing.T) {
 	}
 	if wantErrorMsg := "Permission denied"; !strings.Contains(got, wantErrorMsg) {
 		t.Errorf("ls error message not found, want: %q, got: %q", wantErrorMsg, got)
+	}
+}
+
+func TestCharDevice(t *testing.T) {
+	if testutil.IsRunningWithOverlay() {
+		t.Skip("files are not available outside the sandbox with overlay.")
+	}
+
+	ctx := context.Background()
+	d := dockerutil.MakeContainer(ctx, t)
+	defer d.CleanUp(ctx)
+
+	dir, err := os.MkdirTemp(testutil.TmpDir(), "tmp-mount")
+	if err != nil {
+		t.Fatalf("MkdirTemp() failed: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	opts := dockerutil.RunOpts{
+		Image: "basic/alpine",
+		Mounts: []mount.Mount{
+			{
+				Type:   mount.TypeBind,
+				Source: "/dev/zero",
+				Target: "/test/zero",
+			},
+			{
+				Type:   mount.TypeBind,
+				Source: dir,
+				Target: "/out",
+			},
+		},
+	}
+
+	const size = 1024 * 1024
+
+	// `docker logs` encodes the string, making it hard to compare. Write the
+	// result to a file that is available to the test.
+	cmd := fmt.Sprintf("head -c %d /test/zero > /out/result", size)
+	if _, err := d.Run(ctx, opts, "sh", "-c", cmd); err != nil {
+		t.Fatalf("docker run failed: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "result"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := [size]byte{}; !bytes.Equal(want[:], got) {
+		t.Errorf("Wrong bytes, want: [all zeros], got: %v", got)
 	}
 }

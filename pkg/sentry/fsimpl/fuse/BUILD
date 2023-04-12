@@ -1,6 +1,8 @@
 load("//tools:defs.bzl", "go_library", "go_test")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
 
+package(default_applicable_licenses = ["//:license"])
+
 licenses(["notice"])
 
 go_template_instance(
@@ -20,7 +22,7 @@ go_template_instance(
     out = "inode_refs.go",
     package = "fuse",
     prefix = "inode",
-    template = "//pkg/refsvfs2:refs_template",
+    template = "//pkg/refs:refs_template",
     types = {
         "T": "inode",
     },
@@ -36,6 +38,7 @@ go_library(
         "directory.go",
         "file.go",
         "fusefs.go",
+        "inode.go",
         "inode_refs.go",
         "read_write.go",
         "register.go",
@@ -55,12 +58,15 @@ go_library(
         "//pkg/marshal",
         "//pkg/marshal/primitive",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/safemem",
         "//pkg/sentry/fsimpl/devtmpfs",
         "//pkg/sentry/fsimpl/kernfs",
+        "//pkg/sentry/fsutil",
         "//pkg/sentry/kernel",
         "//pkg/sentry/kernel/auth",
+        "//pkg/sentry/kernel/pipe",
+        "//pkg/sentry/kernel/time",
+        "//pkg/sentry/memmap",
         "//pkg/sentry/vfs",
         "//pkg/sync",
         "//pkg/usermem",

@@ -33,6 +33,7 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
+	"gvisor.dev/gvisor/runsc/console"
 	"gvisor.dev/gvisor/runsc/container"
 	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/specutils"
@@ -48,6 +49,8 @@ type Do struct {
 	ip      string
 	quiet   bool
 	overlay bool
+	uidMap  idMapSlice
+	gidMap  idMapSlice
 }
 
 // Name implements subcommands.Command.Name.
@@ -72,6 +75,44 @@ used for testing only.
 `
 }
 
+type idMapSlice []specs.LinuxIDMapping
+
+// String implements flag.Value.String.
+func (is *idMapSlice) String() string {
+	return fmt.Sprintf("%#v", is)
+}
+
+// Get implements flag.Value.Get.
+func (is *idMapSlice) Get() any {
+	return is
+}
+
+// Set implements flag.Value.Set.
+func (is *idMapSlice) Set(s string) error {
+	fs := strings.Fields(s)
+	if len(fs) != 3 {
+		return fmt.Errorf("invalid mapping: %s", s)
+	}
+	var cid, hid, size int
+	var err error
+	if cid, err = strconv.Atoi(fs[0]); err != nil {
+		return fmt.Errorf("invalid mapping: %s", s)
+	}
+	if hid, err = strconv.Atoi(fs[1]); err != nil {
+		return fmt.Errorf("invalid mapping: %s", s)
+	}
+	if size, err = strconv.Atoi(fs[2]); err != nil {
+		return fmt.Errorf("invalid mapping: %s", s)
+	}
+	m := specs.LinuxIDMapping{
+		ContainerID: uint32(cid),
+		HostID:      uint32(hid),
+		Size:        uint32(size),
+	}
+	*is = append(*is, m)
+	return nil
+}
+
 // SetFlags implements subcommands.Command.SetFlags.
 func (c *Do) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&c.root, "root", "/", `path to the root directory, defaults to "/"`)
@@ -79,10 +120,12 @@ func (c *Do) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&c.ip, "ip", "192.168.10.2", "IPv4 address for the sandbox")
 	f.BoolVar(&c.quiet, "quiet", false, "suppress runsc messages to stdout. Application output is still sent to stdout and stderr")
 	f.BoolVar(&c.overlay, "force-overlay", true, "use an overlay. WARNING: disabling gives the command write access to the host")
+	f.Var(&c.uidMap, "uid-map", "Add a user id mapping [ContainerID, HostID, Size]")
+	f.Var(&c.gidMap, "gid-map", "Add a group id mapping [ContainerID, HostID, Size]")
 }
 
 // Execute implements subcommands.Command.Execute.
-func (c *Do) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
+func (c *Do) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	if len(f.Args()) == 0 {
 		f.Usage()
 		return subcommands.ExitUsageError
@@ -103,8 +146,13 @@ func (c *Do) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) su
 		return util.Errorf("Error to retrieve hostname: %v", err)
 	}
 
-	// Map the entire host file system, optionally using an overlay.
-	conf.Overlay = c.overlay
+	// If c.overlay is set, then enable overlay.
+	conf.Overlay = false // conf.Overlay is deprecated.
+	if c.overlay {
+		conf.Overlay2 = config.Overlay2{RootMount: true, SubMounts: true, Medium: "memory"}
+	} else {
+		conf.Overlay2 = config.Overlay2{RootMount: false, SubMounts: false, Medium: ""}
+	}
 	absRoot, err := resolvePath(c.root)
 	if err != nil {
 		return util.Errorf("Error resolving root: %v", err)
@@ -123,11 +171,18 @@ func (c *Do) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) su
 			Args:         f.Args(),
 			Env:          os.Environ(),
 			Capabilities: specutils.AllCapabilities(),
+			Terminal:     console.IsPty(os.Stdin.Fd()),
 		},
 		Hostname: hostname,
 	}
 
 	cid := fmt.Sprintf("runsc-%06d", rand.Int31n(1000000))
+
+	if c.uidMap != nil || c.gidMap != nil {
+		addNamespace(spec, specs.LinuxNamespace{Type: specs.UserNamespace})
+		spec.Linux.UIDMappings = c.uidMap
+		spec.Linux.GIDMappings = c.gidMap
+	}
 
 	if conf.Network == config.NetworkNone {
 		addNamespace(spec, specs.LinuxNamespace{Type: specs.NetworkNamespace})
@@ -163,7 +218,7 @@ func addNamespace(spec *specs.Spec, ns specs.LinuxNamespace) {
 	spec.Linux.Namespaces = append(spec.Linux.Namespaces, ns)
 }
 
-func (c *Do) notifyUser(format string, v ...interface{}) {
+func (c *Do) notifyUser(format string, v ...any) {
 	if !c.quiet {
 		fmt.Printf(format+"\n", v...)
 	}
@@ -353,7 +408,7 @@ func calculatePeerIP(ip string) (string, error) {
 }
 
 func startContainerAndWait(spec *specs.Spec, conf *config.Config, cid string, waitStatus *unix.WaitStatus) subcommands.ExitStatus {
-	specutils.LogSpec(spec)
+	specutils.LogSpecDebug(spec, conf.OCISeccomp)
 
 	out, err := json.Marshal(spec)
 	if err != nil {
@@ -395,7 +450,7 @@ func startContainerAndWait(spec *specs.Spec, conf *config.Config, cid string, wa
 	//
 	// N.B. There is a still a window before this where a signal may kill
 	// this process, skipping cleanup.
-	stopForwarding := ct.ForwardSignals(0 /* pid */, false /* fgProcess */)
+	stopForwarding := ct.ForwardSignals(0 /* pid */, spec.Process.Terminal /* fgProcess */)
 	defer stopForwarding()
 
 	ws, err := ct.Wait()

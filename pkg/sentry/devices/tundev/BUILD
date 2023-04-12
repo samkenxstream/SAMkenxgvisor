@@ -1,5 +1,7 @@
 load("//tools:defs.bzl", "go_library")
 
+package(default_applicable_licenses = ["//:license"])
+
 licenses(["notice"])
 
 go_library(
@@ -8,6 +10,7 @@ go_library(
     visibility = ["//pkg/sentry:internal"],
     deps = [
         "//pkg/abi/linux",
+        "//pkg/bufferv2",
         "//pkg/context",
         "//pkg/errors/linuxerr",
         "//pkg/hostarch",

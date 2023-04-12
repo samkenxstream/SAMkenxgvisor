@@ -114,7 +114,7 @@ const (
 
 // SignalSetup implements Context.SignalSetup. (Compare to Linux's
 // arch/x86/kernel/signal.c:__setup_rt_frame().)
-func (c *context64) SignalSetup(st *Stack, act *linux.SigAction, info *linux.SignalInfo, alt *linux.SignalStack, sigset linux.SignalSet, featureSet cpuid.FeatureSet) error {
+func (c *Context64) SignalSetup(st *Stack, act *linux.SigAction, info *linux.SignalInfo, alt *linux.SignalStack, sigset linux.SignalSet, featureSet cpuid.FeatureSet) error {
 	// "The 128-byte area beyond the location pointed to by %rsp is considered
 	// to be reserved and shall not be modified by signal or interrupt
 	// handlers. ... leaf functions may use this area for their entire stack
@@ -265,7 +265,7 @@ func (c *context64) SignalSetup(st *Stack, act *linux.SigAction, info *linux.Sig
 
 // SignalRestore implements Context.SignalRestore. (Compare to Linux's
 // arch/x86/kernel/signal.c:sys_rt_sigreturn().)
-func (c *context64) SignalRestore(st *Stack, rt bool, featureSet cpuid.FeatureSet) (linux.SignalSet, linux.SignalStack, error) {
+func (c *Context64) SignalRestore(st *Stack, rt bool, featureSet cpuid.FeatureSet) (linux.SignalSet, linux.SignalStack, error) {
 	// Copy out the stack frame.
 	var uc UContext64
 	if _, err := uc.CopyIn(st, StackBottomMagic); err != nil {
@@ -304,12 +304,10 @@ func (c *context64) SignalRestore(st *Stack, rt bool, featureSet cpuid.FeatureSe
 	if uc.MContext.Fpstate == 0 {
 		c.fpState.Reset()
 	} else {
-		fpSize, _ := featureSet.ExtendedStateSize()
-		f := make([]byte, fpSize)
-		if _, err := st.IO.CopyIn(context.Background(), hostarch.Addr(uc.MContext.Fpstate), f, usermem.IOOpts{}); err != nil {
+		if _, err := st.IO.CopyIn(context.Background(), hostarch.Addr(uc.MContext.Fpstate), c.fpState, usermem.IOOpts{}); err != nil {
+			c.fpState.Reset()
 			return 0, linux.SignalStack{}, err
 		}
-		copy(c.fpState, f)
 		c.fpState.SanitizeUser(featureSet)
 	}
 

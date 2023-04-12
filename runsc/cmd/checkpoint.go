@@ -65,8 +65,7 @@ func (c *Checkpoint) SetFlags(f *flag.FlagSet) {
 }
 
 // Execute implements subcommands.Command.Execute.
-func (c *Checkpoint) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
-
+func (c *Checkpoint) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	if f.NArg() != 1 {
 		f.Usage()
 		return subcommands.ExitUsageError
@@ -124,7 +123,7 @@ func (c *Checkpoint) Execute(_ context.Context, f *flag.FlagSet, args ...interfa
 		util.Fatalf("reading spec: %v", err)
 	}
 
-	specutils.LogSpec(spec)
+	specutils.LogSpecDebug(spec, conf.OCISeccomp)
 
 	if cont.ConsoleSocket != "" {
 		log.Warningf("ignoring console socket since it cannot be restored")

@@ -24,8 +24,9 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"go.uber.org/multierr"
-	"gvisor.dev/gvisor/pkg/buffer"
+	"gvisor.dev/gvisor/pkg/bufferv2"
 	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/checksum"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 )
 
@@ -101,8 +102,8 @@ func equalLayer(x, y Layer) bool {
 		return true
 	}
 	// opt ignores comparison pairs where either of the inputs is a nil.
-	opt := cmp.FilterValues(func(x, y interface{}) bool {
-		for _, l := range []interface{}{x, y} {
+	opt := cmp.FilterValues(func(x, y any) bool {
+		for _, l := range []any{x, y} {
 			v := reflect.ValueOf(l)
 			if (v.Kind() == reflect.Ptr || v.Kind() == reflect.Slice) && v.IsNil() {
 				return true
@@ -882,7 +883,7 @@ func (l *ICMPv6) ToBytes() ([]byte, error) {
 					Header:      h[:header.ICMPv6PayloadOffset],
 					Src:         *ipv6.SrcAddr,
 					Dst:         *ipv6.DstAddr,
-					PayloadCsum: header.Checksum(l.Payload, 0 /* initial */),
+					PayloadCsum: checksum.Checksum(l.Payload, 0 /* initial */),
 					PayloadLen:  len(l.Payload),
 				}))
 				break
@@ -998,7 +999,7 @@ func (l *ICMPv4) ToBytes() ([]byte, error) {
 	if l.Checksum != nil {
 		h.SetChecksum(*l.Checksum)
 	} else {
-		h.SetChecksum(^header.Checksum(h, 0))
+		h.SetChecksum(^checksum.Checksum(h, 0))
 	}
 
 	return h, nil
@@ -1113,15 +1114,15 @@ func totalLength(l Layer) int {
 	return totalLength
 }
 
-// payload returns a buffer.VectorisedView of l's payload.
-func payload(l Layer) (buffer.Buffer, error) {
-	var payloadBytes buffer.Buffer
+// payload returns a bufferv2.Buffer of l's payload.
+func payload(l Layer) (bufferv2.Buffer, error) {
+	var payloadBytes bufferv2.Buffer
 	for current := l.next(); current != nil; current = current.next() {
 		payload, err := current.ToBytes()
 		if err != nil {
-			return buffer.Buffer{}, fmt.Errorf("can't get bytes for next header: %s", payload)
+			return bufferv2.Buffer{}, fmt.Errorf("can't get bytes for next header: %s", payload)
 		}
-		payloadBytes.AppendOwned(payload)
+		payloadBytes.Append(bufferv2.NewViewWithData(payload))
 	}
 	return payloadBytes, nil
 }
@@ -1144,7 +1145,7 @@ func layerChecksum(l Layer, protoNumber tcpip.TransportProtocolNumber) (uint16, 
 	if err != nil {
 		return 0, err
 	}
-	xsum = header.ChecksumBuffer(payloadBytes, xsum)
+	xsum = checksum.Checksum(payloadBytes.Flatten(), xsum)
 	return xsum, nil
 }
 

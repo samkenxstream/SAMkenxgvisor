@@ -49,14 +49,31 @@ import (
 )
 
 var (
-	checkpoint           = flag.Bool("checkpoint", boolFromEnv("CHECKPOINT", true), "control checkpoint/restore support")
-	partition            = flag.Int("partition", intFromEnv("PARTITION", 1), "partition number, this is 1-indexed")
-	totalPartitions      = flag.Int("total_partitions", intFromEnv("TOTAL_PARTITIONS", 1), "total number of partitions")
-	isRunningWithHostNet = flag.Bool("hostnet", boolFromEnv("HOSTNET", false), "whether test is running with hostnet")
-	runscPath            = flag.String("runsc", os.Getenv("RUNTIME"), "path to runsc binary")
+	partition       = flag.Int("partition", IntFromEnv("PARTITION", 1), "partition number, this is 1-indexed")
+	totalPartitions = flag.Int("total_partitions", IntFromEnv("TOTAL_PARTITIONS", 1), "total number of partitions")
+	runscPath       = flag.String("runsc", os.Getenv("RUNTIME"), "path to runsc binary")
+
+	// Flags controlling features for sandbox under test, prefixed with
+	// "test-" to avoid potential conflicts with runsc flags.
+	checkpointSupported  = flag.Bool("test-checkpoint", BoolFromEnv("TEST_CHECKPOINT", true), "control checkpoint/restore support")
+	isRunningWithOverlay = flag.Bool("test-overlay", BoolFromEnv("TEST_OVERLAY", false), "whether test is running with --overlay2")
+	isRunningWithNetRaw  = flag.Bool("test-net-raw", BoolFromEnv("TEST_NET_RAW", false), "whether test is running with raw socket support")
+	isRunningWithHostNet = flag.Bool("test-hostnet", BoolFromEnv("TEST_HOSTNET", false), "whether test is running with hostnet")
 )
 
-func intFromEnv(name string, def int) int {
+// StringFromEnv returns the value of the named environment variable, or `def` if unset/empty.
+// It is useful for defining flags where the default value can be specified through the environment.
+func StringFromEnv(name, def string) string {
+	str := os.Getenv(name)
+	if str == "" {
+		return def
+	}
+	return str
+}
+
+// IntFromEnv returns the integer value of the named environment variable, or `def` if unset/empty.
+// It is useful for defining flags where the default value can be specified through the environment.
+func IntFromEnv(name string, def int) int {
 	str := os.Getenv(name)
 	if str == "" {
 		return def
@@ -69,7 +86,9 @@ func intFromEnv(name string, def int) int {
 	return int(v)
 }
 
-func boolFromEnv(name string, def bool) bool {
+// BoolFromEnv returns the boolean value of the named environment variable, or `def` if unset/empty.
+// It is useful for defining flags where the default value can be specified through the environment.
+func BoolFromEnv(name string, def bool) bool {
 	str := strings.ToLower(os.Getenv(name))
 	if str == "" {
 		return def
@@ -81,14 +100,38 @@ func boolFromEnv(name string, def bool) bool {
 	return v
 }
 
+// DurationFromEnv returns the duration of the named environment variable, or `def` if unset/empty.
+// It is useful for defining flags where the default value can be specified through the environment.
+func DurationFromEnv(name string, def time.Duration) time.Duration {
+	str := strings.ToLower(os.Getenv(name))
+	if str == "" {
+		return def
+	}
+	d, err := time.ParseDuration(str)
+	if err != nil {
+		panic(fmt.Errorf("invalid environment variable %q; got %q expected duration: %w", name, str, err))
+	}
+	return d
+}
+
 // IsCheckpointSupported returns the relevant command line flag.
 func IsCheckpointSupported() bool {
-	return *checkpoint
+	return *checkpointSupported
 }
 
 // IsRunningWithHostNet returns the relevant command line flag.
 func IsRunningWithHostNet() bool {
 	return *isRunningWithHostNet
+}
+
+// IsRunningWithNetRaw returns the relevant command line flag.
+func IsRunningWithNetRaw() bool {
+	return *isRunningWithNetRaw
+}
+
+// IsRunningWithOverlay returns the relevant command line flag.
+func IsRunningWithOverlay() bool {
+	return *isRunningWithOverlay
 }
 
 // ImageByName mangles the image name used locally. This depends on the image
@@ -124,7 +167,7 @@ func TmpDir() string {
 // This is designed to be implemented by *testing.T.
 type Logger interface {
 	Name() string
-	Logf(fmt string, args ...interface{})
+	Logf(fmt string, args ...any)
 }
 
 // DefaultLogger logs using the log package.
@@ -136,7 +179,7 @@ func (d DefaultLogger) Name() string {
 }
 
 // Logf implements Logger.Logf.
-func (d DefaultLogger) Logf(fmt string, args ...interface{}) {
+func (d DefaultLogger) Logf(fmt string, args ...any) {
 	log.Printf(fmt, args...)
 }
 
@@ -153,7 +196,7 @@ func (m multiLogger) Name() string {
 }
 
 // Logf implements Logger.Logf.
-func (m multiLogger) Logf(fmt string, args ...interface{}) {
+func (m multiLogger) Logf(fmt string, args ...any) {
 	for _, l := range m {
 		l.Logf(fmt, args...)
 	}
@@ -207,7 +250,7 @@ func TestConfig(t *testing.T) *config.Config {
 	}
 	// Change test defaults.
 	conf.Debug = true
-	conf.DebugLog = path.Join(logDir, "runsc.log."+t.Name()+".%TIMESTAMP%.%COMMAND%")
+	conf.DebugLog = path.Join(logDir, "runsc.log."+t.Name()+".%TIMESTAMP%.%COMMAND%.txt")
 	conf.LogPackets = true
 	conf.Network = config.NetworkNone
 	conf.Strace = true
@@ -418,6 +461,20 @@ func WaitForHTTP(ip string, port int, timeout time.Duration) error {
 		return nil
 	}
 	return Poll(cb, timeout)
+}
+
+// HTTPRequestSucceeds sends a request to a given url and checks that the status is OK.
+func HTTPRequestSucceeds(client http.Client, server string, port int) error {
+	url := fmt.Sprintf("http://%s:%d", server, port)
+	// Ensure that content is being served.
+	resp, err := client.Get(url)
+	if err != nil {
+		return fmt.Errorf("error reaching http server: %v", err)
+	}
+	if want := http.StatusOK; resp.StatusCode != want {
+		return fmt.Errorf("wrong response code, got: %d, want: %d", resp.StatusCode, want)
+	}
+	return nil
 }
 
 // Reaper reaps child processes.

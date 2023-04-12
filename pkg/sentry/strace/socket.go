@@ -101,6 +101,7 @@ var SocketFlagSet = abi.FlagSet{
 var ipProtocol = abi.ValueSet{
 	linux.IPPROTO_IP:      "IPPROTO_IP",
 	linux.IPPROTO_ICMP:    "IPPROTO_ICMP",
+	linux.IPPROTO_ICMPV6:  "IPPROTO_ICMPV6",
 	linux.IPPROTO_IGMP:    "IPPROTO_IGMP",
 	linux.IPPROTO_IPIP:    "IPPROTO_IPIP",
 	linux.IPPROTO_TCP:     "IPPROTO_TCP",
@@ -544,6 +545,7 @@ var sockOptNames = map[uint64]abi.ValueSet{
 		linux.SO_RCVTIMEO:     "SO_RCVTIMEO",
 		linux.SO_OOBINLINE:    "SO_OOBINLINE",
 		linux.SO_TIMESTAMP:    "SO_TIMESTAMP",
+		linux.SO_ACCEPTCONN:   "SO_ACCEPTCONN",
 	},
 	linux.SOL_TCP: {
 		linux.TCP_NODELAY:              "TCP_NODELAY",

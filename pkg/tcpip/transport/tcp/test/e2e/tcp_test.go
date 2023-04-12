@@ -25,10 +25,9 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
-	"gvisor.dev/gvisor/pkg/buffer"
+	"gvisor.dev/gvisor/pkg/bufferv2"
 	"gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/refs"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/checker"
@@ -177,6 +176,7 @@ func TestConnectICMPError(t *testing.T) {
 	}
 
 	syn := c.GetPacket()
+	defer syn.Release()
 	checker.IPv4(t, syn, checker.TCP(checker.TCPFlags(header.TCPFlagSyn)))
 
 	wep := ep.(interface {
@@ -187,7 +187,7 @@ func TestConnectICMPError(t *testing.T) {
 
 	for {
 		if err := wep.LastErrorLocked(); err != nil {
-			if d := cmp.Diff(&tcpip.ErrNoRoute{}, err); d != "" {
+			if d := cmp.Diff(&tcpip.ErrHostUnreachable{}, err); d != "" {
 				t.Errorf("ep.LastErrorLocked() mismatch (-want +got):\n%s", d)
 			}
 			break
@@ -207,7 +207,9 @@ func TestConnectICMPError(t *testing.T) {
 		AckNum:  c.IRS + 1,
 	})
 
-	checker.IPv4(t, c.GetPacket(), checker.TCP(
+	b := c.GetPacket()
+	defer b.Release()
+	checker.IPv4(t, b, checker.TCP(
 		checker.SrcPort(context.StackPort),
 		checker.DstPort(context.TestPort),
 		checker.TCPSeqNum(uint32(c.IRS+1)),
@@ -258,7 +260,7 @@ func TestActiveFailedConnectionAttemptIncrement(t *testing.T) {
 
 	{
 		err := c.EP.Connect(tcpip.FullAddress{NIC: 2, Addr: context.TestAddr, Port: context.TestPort})
-		if d := cmp.Diff(&tcpip.ErrNoRoute{}, err); d != "" {
+		if d := cmp.Diff(&tcpip.ErrHostUnreachable{}, err); d != "" {
 			t.Errorf("c.EP.Connect(...) mismatch (-want +got):\n%s", d)
 		}
 	}
@@ -283,9 +285,49 @@ func TestCloseWithoutConnect(t *testing.T) {
 	}
 
 	c.EP.Close()
+	c.EP = nil
 
 	if got := c.Stack().Stats().TCP.CurrentConnected.Value(); got != 0 {
 		t.Errorf("got stats.TCP.CurrentConnected.Value() = %d, want = 0", got)
+	}
+}
+
+func TestHandshakeTimeoutConnectedCount(t *testing.T) {
+	clock := faketime.NewManualClock()
+	c := context.NewWithOpts(t, context.Options{
+		EnableV4: true,
+		EnableV6: true,
+		MTU:      e2e.DefaultMTU,
+		Clock:    clock,
+	})
+	defer c.Cleanup()
+
+	ep, err := c.Stack().NewEndpoint(tcp.ProtocolNumber, ipv4.ProtocolNumber, &c.WQ)
+	if err != nil {
+		t.Fatalf("NewEndpoint failed: %s", err)
+	}
+	c.EP = ep
+
+	we, ch := waiter.NewChannelEntry(waiter.WritableEvents)
+	c.WQ.EventRegister(&we)
+	defer c.WQ.EventUnregister(&we)
+
+	switch err := c.EP.Connect(tcpip.FullAddress{Addr: context.TestAddr, Port: context.TestPort}).(type) {
+	case *tcpip.ErrConnectStarted:
+	default:
+		t.Fatalf("Connect did not start: %v", err)
+	}
+
+	clock.Advance(tcp.DefaultKeepaliveInterval)
+	clock.Advance(tcp.DefaultKeepaliveInterval)
+	<-ch
+	switch err := c.EP.LastError().(type) {
+	case *tcpip.ErrTimeout:
+	default:
+		t.Fatalf("Connect didn't timeout: %v", err)
+	}
+	if got, want := c.Stack().Stats().TCP.CurrentConnected.Value(), uint64(0); got != want {
+		t.Fatalf("got stats.TCP.CurrentConnected.Value() = %d, want = %d", got, want)
 	}
 }
 
@@ -335,8 +377,9 @@ func TestTCPResetsSentIncrement(t *testing.T) {
 	})
 
 	// Receive the SYN-ACK reply.
-	b := c.GetPacket()
-	tcpHdr := header.TCP(header.IPv4(b).Payload())
+	v := c.GetPacket()
+	defer v.Release()
+	tcpHdr := header.TCP(header.IPv4(v.AsSlice()).Payload())
 	c.IRS = seqnum.Value(tcpHdr.SequenceNumber())
 
 	ackHeaders := &context.Headers{
@@ -352,7 +395,8 @@ func TestTCPResetsSentIncrement(t *testing.T) {
 	// Send ACK.
 	c.SendPacket(nil, ackHeaders)
 
-	c.GetPacket()
+	v = c.GetPacket()
+	defer v.Release()
 
 	metricPollFn := func() error {
 		if got := stats.TCP.ResetsSent.Value(); got != want {
@@ -383,8 +427,9 @@ func TestTCPResetsSentNoICMP(t *testing.T) {
 	})
 
 	// Receive whatever comes back.
-	b := c.GetPacket()
-	ipHdr := header.IPv4(b)
+	v := c.GetPacket()
+	defer v.Release()
+	ipHdr := header.IPv4(v.AsSlice())
 	if got, want := ipHdr.Protocol(), uint8(header.TCPProtocolNumber); got != want {
 		t.Errorf("unexpected protocol, got = %d, want = %d", got, want)
 	}
@@ -427,8 +472,9 @@ func TestTCPResetSentForACKWhenNotUsingSynCookies(t *testing.T) {
 	})
 
 	// Receive the SYN-ACK reply.
-	b := c.GetPacket()
-	tcpHdr := header.TCP(header.IPv4(b).Payload())
+	v := c.GetPacket()
+	defer v.Release()
+	tcpHdr := header.TCP(header.IPv4(v.AsSlice()).Payload())
 	c.IRS = seqnum.Value(tcpHdr.SequenceNumber())
 
 	ackHeaders := &context.Headers{
@@ -470,7 +516,9 @@ func TestTCPResetSentForACKWhenNotUsingSynCookies(t *testing.T) {
 	}
 
 	c.EP.Close()
-	checker.IPv4(t, c.GetPacket(), checker.TCP(
+	b := c.GetPacket()
+	defer b.Release()
+	checker.IPv4(t, b, checker.TCP(
 		checker.SrcPort(context.StackPort),
 		checker.DstPort(context.TestPort),
 		checker.TCPSeqNum(uint32(c.IRS+1)),
@@ -487,7 +535,8 @@ func TestTCPResetSentForACKWhenNotUsingSynCookies(t *testing.T) {
 	c.SendPacket(nil, finHeaders)
 
 	// Get the ACK to the FIN we just sent.
-	c.GetPacket()
+	b = c.GetPacket()
+	defer b.Release()
 
 	// Since an active close was done we need to wait for a little more than
 	// tcpLingerTimeout for the port reservations to be released and the
@@ -501,7 +550,9 @@ func TestTCPResetSentForACKWhenNotUsingSynCookies(t *testing.T) {
 	// rejected.
 	c.SendPacket(nil, ackHeaders)
 
-	checker.IPv4(t, c.GetPacket(), checker.TCP(
+	b = c.GetPacket()
+	defer b.Release()
+	checker.IPv4(t, b, checker.TCP(
 		checker.SrcPort(context.StackPort),
 		checker.DstPort(context.TestPort),
 		checker.TCPSeqNum(uint32(c.IRS+1)),
@@ -601,7 +652,9 @@ func TestConnectResetAfterClose(t *testing.T) {
 	// to complete closure of sender, but don't send our own FIN.
 	ep.Close()
 	iss := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
-	checker.IPv4(t, c.GetPacket(),
+	b := c.GetPacket()
+	defer b.Release()
+	checker.IPv4(t, b,
 		checker.TCP(
 			checker.DstPort(context.TestPort),
 			checker.TCPSeqNum(uint32(c.IRS)+1),
@@ -633,14 +686,15 @@ func TestConnectResetAfterClose(t *testing.T) {
 	})
 
 	for {
-		b := c.GetPacket()
-		tcpHdr := header.TCP(header.IPv4(b).Payload())
+		v := c.GetPacket()
+		defer v.Release()
+		tcpHdr := header.TCP(header.IPv4(v.AsSlice()).Payload())
 		if tcpHdr.Flags() == header.TCPFlagAck|header.TCPFlagFin {
 			// This is a retransmit of the FIN, ignore it.
 			continue
 		}
 
-		checker.IPv4(t, b,
+		checker.IPv4(t, v,
 			checker.TCP(
 				checker.DstPort(context.TestPort),
 				// RST is always generated with sndNxt which if the FIN
@@ -683,7 +737,9 @@ func TestCurrentConnectedIncrement(t *testing.T) {
 
 	ep.Close()
 	iss := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
-	checker.IPv4(t, c.GetPacket(),
+	b := c.GetPacket()
+	defer b.Release()
+	checker.IPv4(t, b,
 		checker.TCP(
 			checker.DstPort(context.TestPort),
 			checker.TCPSeqNum(uint32(c.IRS)+1),
@@ -718,7 +774,9 @@ func TestCurrentConnectedIncrement(t *testing.T) {
 	})
 
 	// Check that the stack acks the FIN.
-	checker.IPv4(t, c.GetPacket(),
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v,
 		checker.PayloadLen(header.TCPMinimumSize),
 		checker.TCP(
 			checker.DstPort(context.TestPort),
@@ -767,7 +825,9 @@ func TestClosingWithEnqueuedSegments(t *testing.T) {
 	})
 
 	// Get the ACK for the FIN we sent.
-	checker.IPv4(t, c.GetPacket(),
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v,
 		checker.TCP(
 			checker.DstPort(context.TestPort),
 			checker.TCPSeqNum(uint32(c.IRS)+1),
@@ -788,7 +848,9 @@ func TestClosingWithEnqueuedSegments(t *testing.T) {
 	ep.Close()
 
 	// Get the FIN
-	checker.IPv4(t, c.GetPacket(),
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v,
 		checker.TCP(
 			checker.DstPort(context.TestPort),
 			checker.TCPSeqNum(uint32(c.IRS)+1),
@@ -848,7 +910,9 @@ func TestClosingWithEnqueuedSegments(t *testing.T) {
 
 	// Check if the endpoint was moved to CLOSED and netstack sent a reset in
 	// response to the ACK packet that we sent after last-ACK.
-	checker.IPv4(t, c.GetPacket(),
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v,
 		checker.TCP(
 			checker.DstPort(context.TestPort),
 			checker.TCPSeqNum(uint32(c.IRS)+2),
@@ -895,7 +959,9 @@ func TestSimpleReceive(t *testing.T) {
 	}
 
 	// Check that ACK is received.
-	checker.IPv4(t, c.GetPacket(),
+	b := c.GetPacket()
+	defer b.Release()
+	checker.IPv4(t, b,
 		checker.TCP(
 			checker.DstPort(context.TestPort),
 			checker.TCPSeqNum(uint32(c.IRS)+1),
@@ -925,7 +991,9 @@ func TestUserSuppliedMSSOnConnect(t *testing.T) {
 			},
 			connectAddr: context.TestAddr,
 			checker: func(t *testing.T, c *context.Context, mss uint16, ws int) {
-				checker.IPv4(t, c.GetPacket(), checker.TCP(
+				v := c.GetPacket()
+				defer v.Release()
+				checker.IPv4(t, v, checker.TCP(
 					checker.DstPort(context.TestPort),
 					checker.TCPFlags(header.TCPFlagSyn),
 					checker.TCPSynOptions(header.TCPSynOptions{MSS: mss, WS: ws})))
@@ -939,7 +1007,9 @@ func TestUserSuppliedMSSOnConnect(t *testing.T) {
 			},
 			connectAddr: context.TestV6Addr,
 			checker: func(t *testing.T, c *context.Context, mss uint16, ws int) {
-				checker.IPv6(t, c.GetV6Packet(), checker.TCP(
+				v := c.GetV6Packet()
+				defer v.Release()
+				checker.IPv6(t, v, checker.TCP(
 					checker.DstPort(context.TestPort),
 					checker.TCPFlags(header.TCPFlagSyn),
 					checker.TCPSynOptions(header.TCPSynOptions{MSS: mss, WS: ws})))
@@ -1026,7 +1096,9 @@ func TestUserSuppliedMSSOnListenAccept(t *testing.T) {
 				c.SendPacket(nil, h)
 			},
 			checker: func(t *testing.T, c *context.Context, srcPort, mss uint16) {
-				checker.IPv4(t, c.GetPacket(), checker.TCP(
+				v := c.GetPacket()
+				defer v.Release()
+				checker.IPv4(t, v, checker.TCP(
 					checker.DstPort(srcPort),
 					checker.TCPFlags(header.TCPFlagSyn|header.TCPFlagAck),
 					checker.TCPSynOptions(header.TCPSynOptions{MSS: mss, WS: -1})))
@@ -1042,7 +1114,9 @@ func TestUserSuppliedMSSOnListenAccept(t *testing.T) {
 				c.SendV6Packet(nil, h)
 			},
 			checker: func(t *testing.T, c *context.Context, srcPort, mss uint16) {
-				checker.IPv6(t, c.GetV6Packet(), checker.TCP(
+				v := c.GetV6Packet()
+				defer v.Release()
+				checker.IPv6(t, v, checker.TCP(
 					checker.DstPort(srcPort),
 					checker.TCPFlags(header.TCPFlagSyn|header.TCPFlagAck),
 					checker.TCPSynOptions(header.TCPSynOptions{MSS: mss, WS: -1})))
@@ -1142,7 +1216,9 @@ func TestSendRstOnListenerRxSynAckV4(t *testing.T) {
 		AckNum:  200,
 	})
 
-	checker.IPv4(t, c.GetPacket(), checker.TCP(
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
 		checker.DstPort(context.TestPort),
 		checker.TCPFlags(header.TCPFlagRst),
 		checker.TCPSeqNum(200)))
@@ -1170,7 +1246,9 @@ func TestSendRstOnListenerRxSynAckV6(t *testing.T) {
 		AckNum:  200,
 	})
 
-	checker.IPv6(t, c.GetV6Packet(), checker.TCP(
+	v := c.GetV6Packet()
+	defer v.Release()
+	checker.IPv6(t, v, checker.TCP(
 		checker.DstPort(context.TestPort),
 		checker.TCPFlags(header.TCPFlagRst),
 		checker.TCPSeqNum(200)))
@@ -1267,8 +1345,9 @@ func TestNoSynCookieOnFailedHandshakes(t *testing.T) {
 		})
 
 		// Receive the SYN-ACK reply.
-		b := c.GetPacket()
-		tcpHdr := header.TCP(header.IPv4(b).Payload())
+		v := c.GetPacket()
+		defer v.Release()
+		tcpHdr := header.TCP(header.IPv4(v.AsSlice()).Payload())
 		iss := seqnum.Value(tcpHdr.SequenceNumber())
 		tcpCheckers := []checker.TransportChecker{
 			checker.SrcPort(context.StackPort),
@@ -1281,7 +1360,7 @@ func TestNoSynCookieOnFailedHandshakes(t *testing.T) {
 			}),
 		}
 
-		checker.IPv4(t, b, checker.TCP(tcpCheckers...))
+		checker.IPv4(t, v, checker.TCP(tcpCheckers...))
 
 		// Send a RST to abort the handshake.
 		c.SendPacket(nil, &context.Headers{
@@ -1337,7 +1416,9 @@ func TestTCPAckBeforeAcceptV4(t *testing.T) {
 			})
 
 			// Receive ACK for the data we sent.
-			checker.IPv4(t, c.GetPacket(), checker.TCP(
+			v := c.GetPacket()
+			defer v.Release()
+			checker.IPv4(t, v, checker.TCP(
 				checker.DstPort(context.TestPort),
 				checker.TCPFlags(header.TCPFlagAck),
 				checker.TCPSeqNum(uint32(iss+1)),
@@ -1382,7 +1463,9 @@ func TestTCPAckBeforeAcceptV6(t *testing.T) {
 			})
 
 			// Receive ACK for the data we sent.
-			checker.IPv6(t, c.GetV6Packet(), checker.TCP(
+			v := c.GetV6Packet()
+			defer v.Release()
+			checker.IPv6(t, v, checker.TCP(
 				checker.DstPort(context.TestPort),
 				checker.TCPFlags(header.TCPFlagAck),
 				checker.TCPSeqNum(uint32(iss+1)),
@@ -1413,7 +1496,9 @@ func TestSendRstOnListenerRxAckV4(t *testing.T) {
 		AckNum:  200,
 	})
 
-	checker.IPv4(t, c.GetPacket(), checker.TCP(
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
 		checker.DstPort(context.TestPort),
 		checker.TCPFlags(header.TCPFlagRst),
 		checker.TCPSeqNum(200)))
@@ -1441,7 +1526,9 @@ func TestSendRstOnListenerRxAckV6(t *testing.T) {
 		AckNum:  200,
 	})
 
-	checker.IPv6(t, c.GetV6Packet(), checker.TCP(
+	v := c.GetV6Packet()
+	defer v.Release()
+	checker.IPv6(t, v, checker.TCP(
 		checker.DstPort(context.TestPort),
 		checker.TCPFlags(header.TCPFlagRst),
 		checker.TCPSeqNum(200)))
@@ -1476,11 +1563,13 @@ func TestListenShutdown(t *testing.T) {
 	})
 
 	// Expect the listening endpoint to reset the connection.
-	checker.IPv4(t, c.GetPacket(),
-		checker.TCP(
-			checker.DstPort(context.TestPort),
-			checker.TCPFlags(header.TCPFlagAck|header.TCPFlagRst),
-		))
+
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
+		checker.DstPort(context.TestPort),
+		checker.TCPFlags(header.TCPFlagAck|header.TCPFlagRst),
+	))
 }
 
 func TestListenerReadinessOnEvent(t *testing.T) {
@@ -1488,6 +1577,7 @@ func TestListenerReadinessOnEvent(t *testing.T) {
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
 	})
+	defer s.Destroy()
 	{
 		ep := loopback.New()
 		if testing.Verbose() {
@@ -1601,11 +1691,12 @@ func TestListenCloseWhileConnect(t *testing.T) {
 	c.EP.Close()
 
 	// Expect the listening endpoint to reset the connection.
-	checker.IPv4(t, c.GetPacket(),
-		checker.TCP(
-			checker.DstPort(context.TestPort),
-			checker.TCPFlags(header.TCPFlagAck|header.TCPFlagRst),
-		))
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
+		checker.DstPort(context.TestPort),
+		checker.TCPFlags(header.TCPFlagAck|header.TCPFlagRst),
+	))
 }
 
 func TestTOSV4(t *testing.T) {
@@ -1642,9 +1733,10 @@ func TestTOSV4(t *testing.T) {
 	}
 
 	// Check that data is received.
-	b := c.GetPacket()
+	p := c.GetPacket()
+	defer p.Release()
 	iss := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
-	checker.IPv4(t, b,
+	checker.IPv4(t, p,
 		checker.PayloadLen(len(data)+header.TCPMinimumSize),
 		checker.TCP(
 			checker.DstPort(context.TestPort),
@@ -1655,8 +1747,8 @@ func TestTOSV4(t *testing.T) {
 		checker.TOS(tos, 0),
 	)
 
-	if p := b[header.IPv4MinimumSize+header.TCPMinimumSize:]; !bytes.Equal(data, p) {
-		t.Errorf("got data = %x, want = %x", p, data)
+	if b := p.AsSlice()[header.IPv4MinimumSize+header.TCPMinimumSize:]; !bytes.Equal(data, b) {
+		t.Errorf("got data = %x, want = %x", p.AsSlice(), data)
 	}
 }
 
@@ -1692,6 +1784,7 @@ func TestTrafficClassV6(t *testing.T) {
 
 	// Check that data is received.
 	b := c.GetV6Packet()
+	defer b.Release()
 	iss := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
 	checker.IPv6(t, b,
 		checker.PayloadLen(len(data)+header.TCPMinimumSize),
@@ -1704,7 +1797,7 @@ func TestTrafficClassV6(t *testing.T) {
 		checker.TOS(tos, 0),
 	)
 
-	if p := b[header.IPv6MinimumSize+header.TCPMinimumSize:]; !bytes.Equal(data, p) {
+	if p := b.AsSlice()[header.IPv6MinimumSize+header.TCPMinimumSize:]; !bytes.Equal(data, p) {
 		t.Errorf("got data = %x, want = %x", p, data)
 	}
 }
@@ -1738,8 +1831,9 @@ func TestConnectBindToDevice(t *testing.T) {
 			}
 
 			// Receive SYN packet.
-			b := c.GetPacket()
-			checker.IPv4(t, b,
+			v := c.GetPacket()
+			defer v.Release()
+			checker.IPv4(t, v,
 				checker.TCP(
 					checker.DstPort(context.TestPort),
 					checker.TCPFlags(header.TCPFlagSyn),
@@ -1748,7 +1842,7 @@ func TestConnectBindToDevice(t *testing.T) {
 			if got, want := tcp.EndpointState(c.EP.State()), tcp.StateSynSent; got != want {
 				t.Fatalf("unexpected endpoint state: want %s, got %s", want, got)
 			}
-			tcpHdr := header.TCP(header.IPv4(b).Payload())
+			tcpHdr := header.TCP(header.IPv4(v.AsSlice()).Payload())
 			c.IRS = seqnum.Value(tcpHdr.SequenceNumber())
 
 			iss := seqnum.Value(context.TestInitialSequenceNumber)
@@ -1763,7 +1857,8 @@ func TestConnectBindToDevice(t *testing.T) {
 				TCPOpts: nil,
 			})
 
-			c.GetPacket()
+			v = c.GetPacket()
+			defer v.Release()
 			if got, want := tcp.EndpointState(c.EP.State()), test.want; got != want {
 				t.Fatalf("unexpected endpoint state: want %s, got %s", want, got)
 			}
@@ -1799,8 +1894,9 @@ func TestShutdownConnectingSocket(t *testing.T) {
 			}
 
 			// Check the SYN packet.
-			b := c.GetPacket()
-			checker.IPv4(t, b,
+			v := c.GetPacket()
+			defer v.Release()
+			checker.IPv4(t, v,
 				checker.TCP(
 					checker.DstPort(context.TestPort),
 					checker.TCPFlags(header.TCPFlagSyn),
@@ -1864,8 +1960,9 @@ func TestSynSent(t *testing.T) {
 			}
 
 			// Receive SYN packet.
-			b := c.GetPacket()
-			checker.IPv4(t, b,
+			v := c.GetPacket()
+			defer v.Release()
+			checker.IPv4(t, v,
 				checker.TCP(
 					checker.DstPort(context.TestPort),
 					checker.TCPFlags(header.TCPFlagSyn),
@@ -1875,7 +1972,7 @@ func TestSynSent(t *testing.T) {
 			if got, want := tcp.EndpointState(c.EP.State()), tcp.StateSynSent; got != want {
 				t.Fatalf("got State() = %s, want %s", got, want)
 			}
-			tcpHdr := header.TCP(header.IPv4(b).Payload())
+			tcpHdr := header.TCP(header.IPv4(v.AsSlice()).Payload())
 			c.IRS = seqnum.Value(tcpHdr.SequenceNumber())
 
 			if test.reset {
@@ -1948,13 +2045,14 @@ func TestOutOfOrderReceive(t *testing.T) {
 	})
 
 	// Check that we get an ACK specifying which seqnum is expected.
-	checker.IPv4(t, c.GetPacket(),
-		checker.TCP(
-			checker.DstPort(context.TestPort),
-			checker.TCPSeqNum(uint32(c.IRS)+1),
-			checker.TCPAckNum(uint32(iss)),
-			checker.TCPFlags(header.TCPFlagAck),
-		),
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
+		checker.DstPort(context.TestPort),
+		checker.TCPSeqNum(uint32(c.IRS)+1),
+		checker.TCPAckNum(uint32(iss)),
+		checker.TCPFlags(header.TCPFlagAck),
+	),
 	)
 
 	// Wait 200ms and check that no data has been received.
@@ -1980,13 +2078,14 @@ func TestOutOfOrderReceive(t *testing.T) {
 	}
 
 	// Check that the whole data is acknowledged.
-	checker.IPv4(t, c.GetPacket(),
-		checker.TCP(
-			checker.DstPort(context.TestPort),
-			checker.TCPSeqNum(uint32(c.IRS)+1),
-			checker.TCPAckNum(uint32(iss)+uint32(len(data))),
-			checker.TCPFlags(header.TCPFlagAck),
-		),
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
+		checker.DstPort(context.TestPort),
+		checker.TCPSeqNum(uint32(c.IRS)+1),
+		checker.TCPAckNum(uint32(iss)+uint32(len(data))),
+		checker.TCPFlags(header.TCPFlagAck),
+	),
 	)
 }
 
@@ -2013,13 +2112,14 @@ func TestOutOfOrderFlood(t *testing.T) {
 			RcvWnd:  30000,
 		})
 
-		checker.IPv4(t, c.GetPacket(),
-			checker.TCP(
-				checker.DstPort(context.TestPort),
-				checker.TCPSeqNum(uint32(c.IRS)+1),
-				checker.TCPAckNum(uint32(iss)),
-				checker.TCPFlags(header.TCPFlagAck),
-			),
+		v := c.GetPacket()
+		defer v.Release()
+		checker.IPv4(t, v, checker.TCP(
+			checker.DstPort(context.TestPort),
+			checker.TCPSeqNum(uint32(c.IRS)+1),
+			checker.TCPAckNum(uint32(iss)),
+			checker.TCPFlags(header.TCPFlagAck),
+		),
 		)
 	}
 
@@ -2034,13 +2134,14 @@ func TestOutOfOrderFlood(t *testing.T) {
 		RcvWnd:  30000,
 	})
 
-	checker.IPv4(t, c.GetPacket(),
-		checker.TCP(
-			checker.DstPort(context.TestPort),
-			checker.TCPSeqNum(uint32(c.IRS)+1),
-			checker.TCPAckNum(uint32(iss)),
-			checker.TCPFlags(header.TCPFlagAck),
-		),
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
+		checker.DstPort(context.TestPort),
+		checker.TCPSeqNum(uint32(c.IRS)+1),
+		checker.TCPAckNum(uint32(iss)),
+		checker.TCPFlags(header.TCPFlagAck),
+	),
 	)
 
 	// Now send the expected packet with initial sequence number.
@@ -2054,13 +2155,14 @@ func TestOutOfOrderFlood(t *testing.T) {
 	})
 
 	// Check that only packet with initial sequence number is acknowledged.
-	checker.IPv4(t, c.GetPacket(),
-		checker.TCP(
-			checker.DstPort(context.TestPort),
-			checker.TCPSeqNum(uint32(c.IRS)+1),
-			checker.TCPAckNum(uint32(iss)+3),
-			checker.TCPFlags(header.TCPFlagAck),
-		),
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
+		checker.DstPort(context.TestPort),
+		checker.TCPSeqNum(uint32(c.IRS)+1),
+		checker.TCPAckNum(uint32(iss)+3),
+		checker.TCPFlags(header.TCPFlagAck),
+	),
 	)
 }
 
@@ -2096,26 +2198,28 @@ func TestRstOnCloseWithUnreadData(t *testing.T) {
 	}
 
 	// Check that ACK is received, this happens regardless of the read.
-	checker.IPv4(t, c.GetPacket(),
-		checker.TCP(
-			checker.DstPort(context.TestPort),
-			checker.TCPSeqNum(uint32(c.IRS)+1),
-			checker.TCPAckNum(uint32(iss)+uint32(len(data))),
-			checker.TCPFlags(header.TCPFlagAck),
-		),
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
+		checker.DstPort(context.TestPort),
+		checker.TCPSeqNum(uint32(c.IRS)+1),
+		checker.TCPAckNum(uint32(iss)+uint32(len(data))),
+		checker.TCPFlags(header.TCPFlagAck),
+	),
 	)
 
 	// Now that we know we have unread data, let's just close the connection
 	// and verify that netstack sends an RST rather than a FIN.
 	c.EP.Close()
 
-	checker.IPv4(t, c.GetPacket(),
-		checker.TCP(
-			checker.DstPort(context.TestPort),
-			checker.TCPFlags(header.TCPFlagAck|header.TCPFlagRst),
-			// We shouldn't consume a sequence number on RST.
-			checker.TCPSeqNum(uint32(c.IRS)+1),
-		))
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
+		checker.DstPort(context.TestPort),
+		checker.TCPFlags(header.TCPFlagAck|header.TCPFlagRst),
+		// We shouldn't consume a sequence number on RST.
+		checker.TCPSeqNum(uint32(c.IRS)+1),
+	))
 	// The RST puts the endpoint into an error state.
 	if got, want := tcp.EndpointState(c.EP.State()), tcp.StateError; got != want {
 		t.Errorf("unexpected endpoint state: want %s, got %s", want, got)
@@ -2165,13 +2269,14 @@ func TestRstOnCloseWithUnreadDataFinConvertRst(t *testing.T) {
 	}
 
 	// Check that ACK is received, this happens regardless of the read.
-	checker.IPv4(t, c.GetPacket(),
-		checker.TCP(
-			checker.DstPort(context.TestPort),
-			checker.TCPSeqNum(uint32(c.IRS)+1),
-			checker.TCPAckNum(uint32(iss)+uint32(len(data))),
-			checker.TCPFlags(header.TCPFlagAck),
-		),
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
+		checker.DstPort(context.TestPort),
+		checker.TCPSeqNum(uint32(c.IRS)+1),
+		checker.TCPAckNum(uint32(iss)+uint32(len(data))),
+		checker.TCPFlags(header.TCPFlagAck),
+	),
 	)
 
 	// Cause a FIN to be generated.
@@ -2180,12 +2285,13 @@ func TestRstOnCloseWithUnreadDataFinConvertRst(t *testing.T) {
 	}
 
 	// Make sure we get the FIN but DON't ACK IT.
-	checker.IPv4(t, c.GetPacket(),
-		checker.TCP(
-			checker.DstPort(context.TestPort),
-			checker.TCPFlags(header.TCPFlagAck|header.TCPFlagFin),
-			checker.TCPSeqNum(uint32(c.IRS)+1),
-		))
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
+		checker.DstPort(context.TestPort),
+		checker.TCPFlags(header.TCPFlagAck|header.TCPFlagFin),
+		checker.TCPSeqNum(uint32(c.IRS)+1),
+	))
 
 	if got, want := tcp.EndpointState(c.EP.State()), tcp.StateFinWait1; got != want {
 		t.Errorf("unexpected endpoint state: want %s, got %s", want, got)
@@ -2198,15 +2304,16 @@ func TestRstOnCloseWithUnreadDataFinConvertRst(t *testing.T) {
 	}
 
 	// Make sure we get the RST
-	checker.IPv4(t, c.GetPacket(),
-		checker.TCP(
-			checker.DstPort(context.TestPort),
-			checker.TCPFlags(header.TCPFlagAck|header.TCPFlagRst),
-			// RST is always generated with sndNxt which if the FIN
-			// has been sent will be 1 higher than the sequence
-			// number of the FIN itself.
-			checker.TCPSeqNum(uint32(c.IRS)+2),
-		))
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
+		checker.DstPort(context.TestPort),
+		checker.TCPFlags(header.TCPFlagAck|header.TCPFlagRst),
+		// RST is always generated with sndNxt which if the FIN
+		// has been sent will be 1 higher than the sequence
+		// number of the FIN itself.
+		checker.TCPSeqNum(uint32(c.IRS)+2),
+	))
 	// The RST puts the endpoint into an error state.
 	if got, want := tcp.EndpointState(c.EP.State()), tcp.StateError; got != want {
 		t.Errorf("unexpected endpoint state: want %s, got %s", want, got)
@@ -2283,14 +2390,15 @@ func TestFullWindowReceive(t *testing.T) {
 	}
 
 	// Check that data is acknowledged, and window goes to zero.
-	checker.IPv4(t, c.GetPacket(),
-		checker.TCP(
-			checker.DstPort(context.TestPort),
-			checker.TCPSeqNum(uint32(c.IRS)+1),
-			checker.TCPAckNum(uint32(iss)+uint32(len(data))),
-			checker.TCPFlags(header.TCPFlagAck),
-			checker.TCPWindow(0),
-		),
+	b := c.GetPacket()
+	defer b.Release()
+	checker.IPv4(t, b, checker.TCP(
+		checker.DstPort(context.TestPort),
+		checker.TCPSeqNum(uint32(c.IRS)+1),
+		checker.TCPAckNum(uint32(iss)+uint32(len(data))),
+		checker.TCPFlags(header.TCPFlagAck),
+		checker.TCPWindow(0),
+	),
 	)
 
 	// Receive data and check it.
@@ -2305,14 +2413,15 @@ func TestFullWindowReceive(t *testing.T) {
 	}
 
 	// Check that we get an ACK for the newly non-zero window.
-	checker.IPv4(t, c.GetPacket(),
-		checker.TCP(
-			checker.DstPort(context.TestPort),
-			checker.TCPSeqNum(uint32(c.IRS)+1),
-			checker.TCPAckNum(uint32(iss)+uint32(len(data))),
-			checker.TCPFlags(header.TCPFlagAck),
-			checker.TCPWindow(10),
-		),
+	b = c.GetPacket()
+	defer b.Release()
+	checker.IPv4(t, b, checker.TCP(
+		checker.DstPort(context.TestPort),
+		checker.TCPSeqNum(uint32(c.IRS)+1),
+		checker.TCPAckNum(uint32(iss)+uint32(len(data))),
+		checker.TCPFlags(header.TCPFlagAck),
+		checker.TCPWindow(10),
+	),
 	)
 }
 
@@ -2321,6 +2430,7 @@ func TestSmallReceiveBufferReadiness(t *testing.T) {
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
 	})
+	defer s.Destroy()
 
 	ep := loopback.New()
 	if testing.Verbose() {
@@ -2571,7 +2681,8 @@ func TestSmallSegReceiveWindowAdvertisement(t *testing.T) {
 		iss = iss.Add(payloadLen)
 
 		pkt := c.GetPacket()
-		return uint32(header.TCP(header.IPv4(pkt).Payload()).WindowSize()) << c.RcvdWindowScale
+		defer pkt.Release()
+		return uint32(header.TCP(header.IPv4(pkt.AsSlice()).Payload()).WindowSize()) << c.RcvdWindowScale
 	}
 
 	// Read the advertised receive window with the ACK for payload.
@@ -2651,6 +2762,7 @@ func TestNoWindowShrinking(t *testing.T) {
 
 	// Verify that the ACK does not shrink the window.
 	pkt := c.GetPacket()
+	defer pkt.Release()
 	iss = iss.Add(1)
 	checker.IPv4(t, pkt,
 		checker.TCP(
@@ -2661,7 +2773,7 @@ func TestNoWindowShrinking(t *testing.T) {
 		),
 	)
 	// Stash the initial window.
-	initialWnd := header.TCP(header.IPv4(pkt).Payload()).WindowSize() << c.RcvdWindowScale
+	initialWnd := header.TCP(header.IPv4(pkt.AsSlice()).Payload()).WindowSize() << c.RcvdWindowScale
 	initialLastAcceptableSeq := iss.Add(seqnum.Size(initialWnd))
 	// Now shrink the receive buffer to half its original size.
 	c.EP.SocketOptions().SetReceiveBufferSize(int64(rcvBufSize), true /* notify */)
@@ -2680,6 +2792,7 @@ func TestNoWindowShrinking(t *testing.T) {
 
 	// Verify that the ACK does not shrink the window.
 	pkt = c.GetPacket()
+	defer pkt.Release()
 	checker.IPv4(t, pkt,
 		checker.TCP(
 			checker.DstPort(context.TestPort),
@@ -2688,7 +2801,7 @@ func TestNoWindowShrinking(t *testing.T) {
 			checker.TCPFlags(header.TCPFlagAck),
 		),
 	)
-	newWnd := header.TCP(header.IPv4(pkt).Payload()).WindowSize() << c.RcvdWindowScale
+	newWnd := header.TCP(header.IPv4(pkt.AsSlice()).Payload()).WindowSize() << c.RcvdWindowScale
 	newLastAcceptableSeq := iss.Add(seqnum.Size(newWnd))
 	if newLastAcceptableSeq.LessThan(initialLastAcceptableSeq) {
 		t.Fatalf("receive window shrunk unexpectedly got: %d, want >= %d", newLastAcceptableSeq, initialLastAcceptableSeq)
@@ -2706,14 +2819,15 @@ func TestNoWindowShrinking(t *testing.T) {
 	})
 	iss = iss.Add(seqnum.Size(rcvBufSize / 2))
 
-	checker.IPv4(t, c.GetPacket(),
-		checker.TCP(
-			checker.DstPort(context.TestPort),
-			checker.TCPSeqNum(uint32(c.IRS)+1),
-			checker.TCPAckNum(uint32(iss)),
-			checker.TCPFlags(header.TCPFlagAck),
-			checker.TCPWindow(0),
-		),
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
+		checker.DstPort(context.TestPort),
+		checker.TCPSeqNum(uint32(c.IRS)+1),
+		checker.TCPAckNum(uint32(iss)),
+		checker.TCPFlags(header.TCPFlagAck),
+		checker.TCPWindow(0),
+	),
 	)
 
 	// Receive data and check it.
@@ -2724,14 +2838,15 @@ func TestNoWindowShrinking(t *testing.T) {
 
 	// Check that we get an ACK for the newly non-zero window, which is the new
 	// receive buffer size we set after the connection was established.
-	checker.IPv4(t, c.GetPacket(),
-		checker.TCP(
-			checker.DstPort(context.TestPort),
-			checker.TCPSeqNum(uint32(c.IRS)+1),
-			checker.TCPAckNum(uint32(iss)),
-			checker.TCPFlags(header.TCPFlagAck),
-			checker.TCPWindow(uint16(rcvBufSize/2)>>c.RcvdWindowScale),
-		),
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
+		checker.DstPort(context.TestPort),
+		checker.TCPSeqNum(uint32(c.IRS)+1),
+		checker.TCPAckNum(uint32(iss)),
+		checker.TCPFlags(header.TCPFlagAck),
+		checker.TCPWindow(uint16(rcvBufSize/2)>>c.RcvdWindowScale),
+	),
 	)
 }
 
@@ -2750,6 +2865,7 @@ func TestSimpleSend(t *testing.T) {
 
 	// Check that data is received.
 	b := c.GetPacket()
+	defer b.Release()
 	iss := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
 	checker.IPv4(t, b,
 		checker.PayloadLen(len(data)+header.TCPMinimumSize),
@@ -2761,7 +2877,7 @@ func TestSimpleSend(t *testing.T) {
 		),
 	)
 
-	if p := b[header.IPv4MinimumSize+header.TCPMinimumSize:]; !bytes.Equal(data, p) {
+	if p := b.AsSlice()[header.IPv4MinimumSize+header.TCPMinimumSize:]; !bytes.Equal(data, p) {
 		t.Fatalf("got data = %v, want = %v", p, data)
 	}
 
@@ -2791,6 +2907,7 @@ func TestZeroWindowSend(t *testing.T) {
 
 	// Check if we got a zero-window probe.
 	b := c.GetPacket()
+	defer b.Release()
 	iss := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
 	checker.IPv4(t, b,
 		checker.PayloadLen(header.TCPMinimumSize),
@@ -2814,6 +2931,7 @@ func TestZeroWindowSend(t *testing.T) {
 
 	// Check that data is received.
 	b = c.GetPacket()
+	defer b.Release()
 	checker.IPv4(t, b,
 		checker.PayloadLen(len(data)+header.TCPMinimumSize),
 		checker.TCP(
@@ -2824,7 +2942,7 @@ func TestZeroWindowSend(t *testing.T) {
 		),
 	)
 
-	if p := b[header.IPv4MinimumSize+header.TCPMinimumSize:]; !bytes.Equal(data, p) {
+	if p := b.AsSlice()[header.IPv4MinimumSize+header.TCPMinimumSize:]; !bytes.Equal(data, p) {
 		t.Fatalf("got data = %v, want = %v", p, data)
 	}
 
@@ -2860,6 +2978,7 @@ func TestScaledWindowConnect(t *testing.T) {
 	// Check that data is received, and that advertised window is 0x5fff,
 	// that is, that it is scaled.
 	b := c.GetPacket()
+	defer b.Release()
 	iss := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
 	checker.IPv4(t, b,
 		checker.PayloadLen(len(data)+header.TCPMinimumSize),
@@ -2892,6 +3011,7 @@ func TestNonScaledWindowConnect(t *testing.T) {
 	// Check that data is received, and that advertised window is 0xffff,
 	// that is, that it's not scaled.
 	b := c.GetPacket()
+	defer b.Release()
 	iss := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
 	checker.IPv4(t, b,
 		checker.PayloadLen(len(data)+header.TCPMinimumSize),
@@ -2964,6 +3084,7 @@ func TestScaledWindowAccept(t *testing.T) {
 	// Check that data is received, and that advertised window is 0x5fff,
 	// that is, that it is scaled.
 	b := c.GetPacket()
+	defer b.Release()
 	iss := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
 	checker.IPv4(t, b,
 		checker.PayloadLen(len(data)+header.TCPMinimumSize),
@@ -3036,6 +3157,7 @@ func TestNonScaledWindowAccept(t *testing.T) {
 	// Check that data is received, and that advertised window is 0xffff,
 	// that is, that it's not scaled.
 	b := c.GetPacket()
+	defer b.Release()
 	iss := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
 	checker.IPv4(t, b,
 		checker.PayloadLen(len(data)+header.TCPMinimumSize),
@@ -3080,6 +3202,7 @@ func TestZeroScaledWindowReceive(t *testing.T) {
 		})
 		sent += len(data)
 		pkt := c.GetPacket()
+		defer pkt.Release()
 		checker.IPv4(t, pkt,
 			checker.PayloadLen(header.TCPMinimumSize),
 			checker.TCP(
@@ -3090,7 +3213,7 @@ func TestZeroScaledWindowReceive(t *testing.T) {
 			),
 		)
 		// Don't reduce window to zero here.
-		if wnd := int(header.TCP(header.IPv4(pkt).Payload()).WindowSize()); wnd<<ws < len(data) {
+		if wnd := int(header.TCP(header.IPv4(pkt.AsSlice()).Payload()).WindowSize()); wnd<<ws < len(data) {
 			remain = wnd << ws
 			break
 		}
@@ -3109,6 +3232,7 @@ func TestZeroScaledWindowReceive(t *testing.T) {
 		})
 		sent += len(data)
 		pkt := c.GetPacket()
+		defer pkt.Release()
 		checker.IPv4(t, pkt,
 			checker.PayloadLen(header.TCPMinimumSize),
 			checker.TCP(
@@ -3122,7 +3246,7 @@ func TestZeroScaledWindowReceive(t *testing.T) {
 		// application data buffer the window does not always reflect the space
 		// available and actual space available can be a bit more than what is
 		// advertised in the window.
-		wnd := int(header.TCP(header.IPv4(pkt).Payload()).WindowSize())
+		wnd := int(header.TCP(header.IPv4(pkt.AsSlice()).Payload()).WindowSize())
 		if wnd == 0 {
 			break
 		}
@@ -3147,7 +3271,9 @@ func TestZeroScaledWindowReceive(t *testing.T) {
 		}
 	}
 
-	checker.IPv4(t, c.GetPacket(),
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v,
 		checker.PayloadLen(header.TCPMinimumSize),
 		checker.TCP(
 			checker.DstPort(context.TestPort),
@@ -3155,8 +3281,7 @@ func TestZeroScaledWindowReceive(t *testing.T) {
 			checker.TCPAckNum(uint32(iss)+uint32(sent)),
 			checker.TCPWindowGreaterThanEq(uint16(e2e.DefaultMTU>>ws)),
 			checker.TCPFlags(header.TCPFlagAck),
-		),
-	)
+		))
 }
 
 func TestSegmentMerging(t *testing.T) {
@@ -3218,6 +3343,7 @@ func TestSegmentMerging(t *testing.T) {
 			iss := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
 			for i := 0; i < tcp.InitialCwnd; i++ {
 				b := c.GetPacket()
+				defer b.Release()
 				checker.IPv4(t, b,
 					checker.PayloadLen(header.TCPMinimumSize+1),
 					checker.TCP(
@@ -3241,6 +3367,7 @@ func TestSegmentMerging(t *testing.T) {
 
 			// Check that data is received.
 			b := c.GetPacket()
+			defer b.Release()
 			checker.IPv4(t, b,
 				checker.PayloadLen(len(allData)+header.TCPMinimumSize),
 				checker.TCP(
@@ -3251,7 +3378,7 @@ func TestSegmentMerging(t *testing.T) {
 				),
 			)
 
-			if got := b[header.IPv4MinimumSize+header.TCPMinimumSize:]; !bytes.Equal(got, allData) {
+			if got := b.AsSlice()[header.IPv4MinimumSize+header.TCPMinimumSize:]; !bytes.Equal(got, allData) {
 				t.Fatalf("got data = %v, want = %v", got, allData)
 			}
 
@@ -3291,6 +3418,7 @@ func TestDelay(t *testing.T) {
 	for _, want := range [][]byte{allData[:1], allData[1:]} {
 		// Check that data is received.
 		b := c.GetPacket()
+		defer b.Release()
 		checker.IPv4(t, b,
 			checker.PayloadLen(len(want)+header.TCPMinimumSize),
 			checker.TCP(
@@ -3301,7 +3429,7 @@ func TestDelay(t *testing.T) {
 			),
 		)
 
-		if got := b[header.IPv4MinimumSize+header.TCPMinimumSize:]; !bytes.Equal(got, want) {
+		if got := b.AsSlice()[header.IPv4MinimumSize+header.TCPMinimumSize:]; !bytes.Equal(got, want) {
 			t.Fatalf("got data = %v, want = %v", got, want)
 		}
 
@@ -3339,6 +3467,7 @@ func TestUndelay(t *testing.T) {
 	iss := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
 	// Check that data is received.
 	first := c.GetPacket()
+	defer first.Release()
 	checker.IPv4(t, first,
 		checker.PayloadLen(len(allData[0])+header.TCPMinimumSize),
 		checker.TCP(
@@ -3349,7 +3478,7 @@ func TestUndelay(t *testing.T) {
 		),
 	)
 
-	if got, want := first[header.IPv4MinimumSize+header.TCPMinimumSize:], allData[0]; !bytes.Equal(got, want) {
+	if got, want := first.AsSlice()[header.IPv4MinimumSize+header.TCPMinimumSize:], allData[0]; !bytes.Equal(got, want) {
 		t.Fatalf("got first packet's data = %v, want = %v", got, want)
 	}
 
@@ -3362,6 +3491,7 @@ func TestUndelay(t *testing.T) {
 
 	// Check that data is received.
 	second := c.GetPacket()
+	defer second.Release()
 	checker.IPv4(t, second,
 		checker.PayloadLen(len(allData[1])+header.TCPMinimumSize),
 		checker.TCP(
@@ -3372,7 +3502,7 @@ func TestUndelay(t *testing.T) {
 		),
 	)
 
-	if got, want := second[header.IPv4MinimumSize+header.TCPMinimumSize:], allData[1]; !bytes.Equal(got, want) {
+	if got, want := second.AsSlice()[header.IPv4MinimumSize+header.TCPMinimumSize:], allData[1]; !bytes.Equal(got, want) {
 		t.Fatalf("got second packet's data = %v, want = %v", got, want)
 	}
 
@@ -3425,6 +3555,7 @@ func TestMSSNotDelayed(t *testing.T) {
 			for i, data := range allData {
 				// Check that data is received.
 				packet := c.GetPacket()
+				defer packet.Release()
 				checker.IPv4(t, packet,
 					checker.PayloadLen(len(data)+header.TCPMinimumSize),
 					checker.TCP(
@@ -3435,7 +3566,7 @@ func TestMSSNotDelayed(t *testing.T) {
 					),
 				)
 
-				if got, want := packet[header.IPv4MinimumSize+header.TCPMinimumSize:], data; !bytes.Equal(got, want) {
+				if got, want := packet.AsSlice()[header.IPv4MinimumSize+header.TCPMinimumSize:], data; !bytes.Equal(got, want) {
 					t.Fatalf("got packet #%d's data = %v, want = %v", i+1, got, want)
 				}
 
@@ -3473,7 +3604,7 @@ func TestDefaultTTL(t *testing.T) {
 		{"ipv4", ipv4.ProtocolNumber, context.TestAddr},
 		{"ipv6", ipv6.ProtocolNumber, context.TestV6Addr},
 	} {
-		t.Run(fmt.Sprint(test.name), func(t *testing.T) {
+		t.Run(test.name, func(t *testing.T) {
 			c := context.New(t, 65535)
 			defer c.Cleanup()
 
@@ -3502,9 +3633,13 @@ func TestDefaultTTL(t *testing.T) {
 
 			checkTTL := func(ttl uint8) {
 				if test.protoNum == ipv4.ProtocolNumber {
-					checker.IPv4(t, c.GetPacket(), checker.TTL(ttl))
+					v := c.GetPacket()
+					defer v.Release()
+					checker.IPv4(t, v, checker.TTL(ttl))
 				} else {
-					checker.IPv6(t, c.GetV6Packet(), checker.TTL(ttl))
+					v := c.GetV6Packet()
+					defer v.Release()
+					checker.IPv6(t, v, checker.TTL(ttl))
 				}
 			}
 
@@ -3533,7 +3668,7 @@ func TestSetTTL(t *testing.T) {
 		{"ipv4", ipv4.ProtocolNumber, context.TestAddr, tcpip.IPv4TTLOption, tcpip.IPv6HopLimitOption},
 		{"ipv6", ipv6.ProtocolNumber, context.TestV6Addr, tcpip.IPv6HopLimitOption, tcpip.IPv4TTLOption},
 	} {
-		t.Run(fmt.Sprint(test.name), func(t *testing.T) {
+		t.Run(test.name, func(t *testing.T) {
 			for _, wantTTL := range []uint8{1, 2, 50, 64, 128, 254, 255} {
 				t.Run(fmt.Sprintf("TTL:%d", wantTTL), func(t *testing.T) {
 					c := context.New(t, 65535)
@@ -3563,13 +3698,39 @@ func TestSetTTL(t *testing.T) {
 
 					// Receive SYN packet.
 					if test.protoNum == ipv4.ProtocolNumber {
-						checker.IPv4(t, c.GetPacket(), checker.TTL(wantTTL))
+						v := c.GetPacket()
+						defer v.Release()
+						checker.IPv4(t, v, checker.TTL(wantTTL))
 					} else {
-						checker.IPv6(t, c.GetV6Packet(), checker.TTL(wantTTL))
+						v := c.GetV6Packet()
+						defer v.Release()
+						checker.IPv6(t, v, checker.TTL(wantTTL))
 					}
 				})
 			}
 		})
+	}
+}
+
+func TestSendMSSLessThanOptionsSize(t *testing.T) {
+	const mss = 10
+	const writeSize = 300
+	c := context.New(t, 65535)
+	defer c.Cleanup()
+
+	// The sizes of these options add up to 12.
+	c.CreateConnectedWithRawOptions(context.TestInitialSequenceNumber, 30000, -1 /* epRcvBuf */, []byte{
+		header.TCPOptionMSS, 4, byte(mss / 256), byte(mss % 256),
+		header.TCPOptionTS, header.TCPOptionTSLength, 1, 2, 3, 4, 5, 6, 7, 8,
+		header.TCPOptionSACKPermitted, header.TCPOptionSackPermittedLength,
+	})
+	e2e.CheckBrokenUpWrite(t, c, writeSize)
+
+	var r bytes.Reader
+	r.Reset(make([]byte, writeSize))
+	_, err := c.EP.Write(&r, tcpip.WriteOptions{})
+	if err != nil {
+		t.Fatalf("Write failed: %s", err)
 	}
 }
 
@@ -3724,6 +3885,7 @@ func TestSynOptionsOnActiveConnect(t *testing.T) {
 
 	// Receive SYN packet.
 	b := c.GetPacket()
+	defer b.Release()
 	mss := uint16(mtu - header.IPv4MinimumSize - header.TCPMinimumSize)
 	checker.IPv4(t, b,
 		checker.TCP(
@@ -3733,19 +3895,20 @@ func TestSynOptionsOnActiveConnect(t *testing.T) {
 		),
 	)
 
-	tcpHdr := header.TCP(header.IPv4(b).Payload())
+	tcpHdr := header.TCP(header.IPv4(b.AsSlice()).Payload())
 	c.IRS = seqnum.Value(tcpHdr.SequenceNumber())
 
 	// Wait for retransmit.
 	time.Sleep(1 * time.Second)
-	checker.IPv4(t, c.GetPacket(),
-		checker.TCP(
-			checker.DstPort(context.TestPort),
-			checker.TCPFlags(header.TCPFlagSyn),
-			checker.SrcPort(tcpHdr.SourcePort()),
-			checker.TCPSeqNum(tcpHdr.SequenceNumber()),
-			checker.TCPSynOptions(header.TCPSynOptions{MSS: mss, WS: wndScale}),
-		),
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
+		checker.DstPort(context.TestPort),
+		checker.TCPFlags(header.TCPFlagSyn),
+		checker.SrcPort(tcpHdr.SourcePort()),
+		checker.TCPSeqNum(tcpHdr.SequenceNumber()),
+		checker.TCPSynOptions(header.TCPSynOptions{MSS: mss, WS: wndScale}),
+	),
 	)
 
 	// Send SYN-ACK.
@@ -3760,13 +3923,14 @@ func TestSynOptionsOnActiveConnect(t *testing.T) {
 	})
 
 	// Receive ACK packet.
-	checker.IPv4(t, c.GetPacket(),
-		checker.TCP(
-			checker.DstPort(context.TestPort),
-			checker.TCPFlags(header.TCPFlagAck),
-			checker.TCPSeqNum(uint32(c.IRS)+1),
-			checker.TCPAckNum(uint32(iss)+1),
-		),
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
+		checker.DstPort(context.TestPort),
+		checker.TCPFlags(header.TCPFlagAck),
+		checker.TCPSeqNum(uint32(c.IRS)+1),
+		checker.TCPAckNum(uint32(iss)+1),
+	),
 	)
 
 	// Wait for connection to be established.
@@ -3934,12 +4098,12 @@ func TestMaxRetransmitsTimeout(t *testing.T) {
 
 	// Expect first transmit and MaxRetries retransmits.
 	for i := 0; i < numRetries+1; i++ {
-		checker.IPv4(t, c.GetPacket(),
-			checker.TCP(
-				checker.DstPort(context.TestPort),
-				checker.TCPFlags(header.TCPFlagAck|header.TCPFlagPsh),
-			),
-		)
+		v := c.GetPacket()
+		defer v.Release()
+		checker.IPv4(t, v, checker.TCP(
+			checker.DstPort(context.TestPort),
+			checker.TCPFlags(header.TCPFlagAck|header.TCPFlagPsh),
+		))
 	}
 	select {
 	case <-notifyCh:
@@ -3954,12 +4118,12 @@ func TestMaxRetransmitsTimeout(t *testing.T) {
 		Flags:   header.TCPFlagAck,
 	})
 
-	checker.IPv4(t, c.GetPacket(),
-		checker.TCP(
-			checker.DstPort(context.TestPort),
-			checker.TCPFlags(header.TCPFlagRst),
-		),
-	)
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
+		checker.DstPort(context.TestPort),
+		checker.TCPFlags(header.TCPFlagRst),
+	))
 
 	if got := c.Stack().Stats().TCP.EstablishedTimedout.Value(); got != 1 {
 		t.Errorf("got c.Stack().Stats().TCP.EstablishedTimedout.Value() = %d, want = 1", got)
@@ -3992,21 +4156,22 @@ func TestMaxRTO(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Write failed: %s", err)
 	}
-	checker.IPv4(t, c.GetPacket(),
-		checker.TCP(
-			checker.DstPort(context.TestPort),
-			checker.TCPFlagsMatch(header.TCPFlagAck, ^header.TCPFlagPsh),
-		),
-	)
+
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
+		checker.DstPort(context.TestPort),
+		checker.TCPFlagsMatch(header.TCPFlagAck, ^header.TCPFlagPsh),
+	))
 	const numRetransmits = 2
 	for i := 0; i < numRetransmits; i++ {
 		start := time.Now()
-		checker.IPv4(t, c.GetPacket(),
-			checker.TCP(
-				checker.DstPort(context.TestPort),
-				checker.TCPFlagsMatch(header.TCPFlagAck, ^header.TCPFlagPsh),
-			),
-		)
+		v := c.GetPacket()
+		defer v.Release()
+		checker.IPv4(t, v, checker.TCP(
+			checker.DstPort(context.TestPort),
+			checker.TCPFlagsMatch(header.TCPFlagAck, ^header.TCPFlagPsh),
+		))
 		if elapsed := time.Since(start); elapsed.Round(time.Second).Seconds() != rto.Seconds() {
 			t.Errorf("Retransmit interval not capped to MaxRTO(%s). %s", rto, elapsed)
 		}
@@ -4036,12 +4201,12 @@ func TestZeroSizedWriteRetransmit(t *testing.T) {
 	// Do not ACK the packet and expect an original transmit and a
 	// retransmit. This should not cause a panic.
 	for i := 0; i < 2; i++ {
-		checker.IPv4(t, c.GetPacket(),
-			checker.TCP(
-				checker.DstPort(context.TestPort),
-				checker.TCPFlagsMatch(header.TCPFlagAck, ^header.TCPFlagPsh),
-			),
-		)
+		v := c.GetPacket()
+		defer v.Release()
+		checker.IPv4(t, v, checker.TCP(
+			checker.DstPort(context.TestPort),
+			checker.TCPFlagsMatch(header.TCPFlagAck, ^header.TCPFlagPsh),
+		))
 	}
 }
 
@@ -4079,6 +4244,7 @@ func TestRetransmitIPv4IDUniqueness(t *testing.T) {
 				t.Fatalf("Write failed: %s", err)
 			}
 			pkt := c.GetPacket()
+			defer pkt.Release()
 			checker.IPv4(t, pkt,
 				checker.FragmentFlags(0),
 				checker.TCP(
@@ -4086,11 +4252,12 @@ func TestRetransmitIPv4IDUniqueness(t *testing.T) {
 					checker.TCPFlagsMatch(header.TCPFlagAck, ^header.TCPFlagPsh),
 				),
 			)
-			idSet := map[uint16]struct{}{header.IPv4(pkt).ID(): {}}
+			idSet := map[uint16]struct{}{header.IPv4(pkt.AsSlice()).ID(): {}}
 			// Expect two retransmitted packets, and that all packets received have
 			// unique IPv4 ID values.
 			for i := 0; i <= 2; i++ {
 				pkt := c.GetPacket()
+				defer pkt.Release()
 				checker.IPv4(t, pkt,
 					checker.FragmentFlags(0),
 					checker.TCP(
@@ -4098,7 +4265,7 @@ func TestRetransmitIPv4IDUniqueness(t *testing.T) {
 						checker.TCPFlagsMatch(header.TCPFlagAck, ^header.TCPFlagPsh),
 					),
 				)
-				id := header.IPv4(pkt).ID()
+				id := header.IPv4(pkt.AsSlice()).ID()
 				if _, exists := idSet[id]; exists {
 					t.Fatalf("duplicate IPv4 ID=%d found in retransmitted packet", id)
 				}
@@ -4120,7 +4287,9 @@ func TestFinImmediately(t *testing.T) {
 	}
 
 	iss := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
-	checker.IPv4(t, c.GetPacket(),
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v,
 		checker.PayloadLen(header.TCPMinimumSize),
 		checker.TCP(
 			checker.DstPort(context.TestPort),
@@ -4141,7 +4310,9 @@ func TestFinImmediately(t *testing.T) {
 	})
 
 	// Check that the stack acks the FIN.
-	checker.IPv4(t, c.GetPacket(),
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v,
 		checker.PayloadLen(header.TCPMinimumSize),
 		checker.TCP(
 			checker.DstPort(context.TestPort),
@@ -4164,7 +4335,10 @@ func TestFinRetransmit(t *testing.T) {
 	}
 
 	iss := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
-	checker.IPv4(t, c.GetPacket(),
+
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v,
 		checker.PayloadLen(header.TCPMinimumSize),
 		checker.TCP(
 			checker.DstPort(context.TestPort),
@@ -4175,7 +4349,9 @@ func TestFinRetransmit(t *testing.T) {
 	)
 
 	// Don't acknowledge yet. We should get a retransmit of the FIN.
-	checker.IPv4(t, c.GetPacket(),
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v,
 		checker.PayloadLen(header.TCPMinimumSize),
 		checker.TCP(
 			checker.DstPort(context.TestPort),
@@ -4196,7 +4372,9 @@ func TestFinRetransmit(t *testing.T) {
 	})
 
 	// Check that the stack acks the FIN.
-	checker.IPv4(t, c.GetPacket(),
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v,
 		checker.PayloadLen(header.TCPMinimumSize),
 		checker.TCP(
 			checker.DstPort(context.TestPort),
@@ -4223,7 +4401,9 @@ func TestFinWithNoPendingData(t *testing.T) {
 
 	next := uint32(c.IRS) + 1
 	iss := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
-	checker.IPv4(t, c.GetPacket(),
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v,
 		checker.PayloadLen(len(view)+header.TCPMinimumSize),
 		checker.TCP(
 			checker.DstPort(context.TestPort),
@@ -4248,7 +4428,9 @@ func TestFinWithNoPendingData(t *testing.T) {
 		t.Fatalf("Shutdown failed: %s", err)
 	}
 
-	checker.IPv4(t, c.GetPacket(),
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v,
 		checker.PayloadLen(header.TCPMinimumSize),
 		checker.TCP(
 			checker.DstPort(context.TestPort),
@@ -4270,7 +4452,9 @@ func TestFinWithNoPendingData(t *testing.T) {
 	})
 
 	// Check that the stack acks the FIN.
-	checker.IPv4(t, c.GetPacket(),
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v,
 		checker.PayloadLen(header.TCPMinimumSize),
 		checker.TCP(
 			checker.DstPort(context.TestPort),
@@ -4301,7 +4485,9 @@ func TestFinWithPendingDataCwndFull(t *testing.T) {
 	next := uint32(c.IRS) + 1
 	iss := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
 	for i := tcp.InitialCwnd; i > 0; i-- {
-		checker.IPv4(t, c.GetPacket(),
+		v := c.GetPacket()
+		defer v.Release()
+		checker.IPv4(t, v,
 			checker.PayloadLen(len(view)+header.TCPMinimumSize),
 			checker.TCP(
 				checker.DstPort(context.TestPort),
@@ -4320,7 +4506,9 @@ func TestFinWithPendingDataCwndFull(t *testing.T) {
 		t.Fatalf("Shutdown failed: %s", err)
 	}
 
-	checker.IPv4(t, c.GetPacket(),
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v,
 		checker.PayloadLen(len(view)+header.TCPMinimumSize),
 		checker.TCP(
 			checker.DstPort(context.TestPort),
@@ -4340,7 +4528,9 @@ func TestFinWithPendingDataCwndFull(t *testing.T) {
 		RcvWnd:  30000,
 	})
 
-	checker.IPv4(t, c.GetPacket(),
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v,
 		checker.PayloadLen(header.TCPMinimumSize),
 		checker.TCP(
 			checker.DstPort(context.TestPort),
@@ -4361,7 +4551,9 @@ func TestFinWithPendingDataCwndFull(t *testing.T) {
 		RcvWnd:  30000,
 	})
 
-	checker.IPv4(t, c.GetPacket(),
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v,
 		checker.PayloadLen(header.TCPMinimumSize),
 		checker.TCP(
 			checker.DstPort(context.TestPort),
@@ -4388,7 +4580,9 @@ func TestFinWithPendingData(t *testing.T) {
 
 	next := uint32(c.IRS) + 1
 	iss := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
-	checker.IPv4(t, c.GetPacket(),
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v,
 		checker.PayloadLen(len(view)+header.TCPMinimumSize),
 		checker.TCP(
 			checker.DstPort(context.TestPort),
@@ -4414,7 +4608,9 @@ func TestFinWithPendingData(t *testing.T) {
 		t.Fatalf("Write failed: %s", err)
 	}
 
-	checker.IPv4(t, c.GetPacket(),
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v,
 		checker.PayloadLen(len(view)+header.TCPMinimumSize),
 		checker.TCP(
 			checker.DstPort(context.TestPort),
@@ -4430,7 +4626,9 @@ func TestFinWithPendingData(t *testing.T) {
 		t.Fatalf("Shutdown failed: %s", err)
 	}
 
-	checker.IPv4(t, c.GetPacket(),
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v,
 		checker.PayloadLen(header.TCPMinimumSize),
 		checker.TCP(
 			checker.DstPort(context.TestPort),
@@ -4451,7 +4649,9 @@ func TestFinWithPendingData(t *testing.T) {
 		RcvWnd:  30000,
 	})
 
-	checker.IPv4(t, c.GetPacket(),
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v,
 		checker.PayloadLen(header.TCPMinimumSize),
 		checker.TCP(
 			checker.DstPort(context.TestPort),
@@ -4479,7 +4679,9 @@ func TestFinWithPartialAck(t *testing.T) {
 
 	next := uint32(c.IRS) + 1
 	iss := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
-	checker.IPv4(t, c.GetPacket(),
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v,
 		checker.PayloadLen(len(view)+header.TCPMinimumSize),
 		checker.TCP(
 			checker.DstPort(context.TestPort),
@@ -4500,7 +4702,9 @@ func TestFinWithPartialAck(t *testing.T) {
 	})
 
 	// Check that we get an ACK for the fin.
-	checker.IPv4(t, c.GetPacket(),
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v,
 		checker.PayloadLen(header.TCPMinimumSize),
 		checker.TCP(
 			checker.DstPort(context.TestPort),
@@ -4516,7 +4720,9 @@ func TestFinWithPartialAck(t *testing.T) {
 		t.Fatalf("Write failed: %s", err)
 	}
 
-	checker.IPv4(t, c.GetPacket(),
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v,
 		checker.PayloadLen(len(view)+header.TCPMinimumSize),
 		checker.TCP(
 			checker.DstPort(context.TestPort),
@@ -4532,7 +4738,9 @@ func TestFinWithPartialAck(t *testing.T) {
 		t.Fatalf("Shutdown failed: %s", err)
 	}
 
-	checker.IPv4(t, c.GetPacket(),
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v,
 		checker.PayloadLen(header.TCPMinimumSize),
 		checker.TCP(
 			checker.DstPort(context.TestPort),
@@ -4627,7 +4835,9 @@ func scaledSendWindow(t *testing.T, scale uint8) {
 	}
 
 	// Check that only data that fits in the scaled window is sent.
-	checker.IPv4(t, c.GetPacket(),
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v,
 		checker.PayloadLen((1<<scale)+header.TCPMinimumSize),
 		checker.TCP(
 			checker.DstPort(context.TestPort),
@@ -4697,10 +4907,12 @@ func TestReceivedInvalidSegmentCountIncrement(t *testing.T) {
 		AckNum:  c.IRS.Add(1),
 		RcvWnd:  30000,
 	})
+	defer buf.Release()
 	tcpbuf := buf.Flatten()
 	tcpbuf[header.IPv4MinimumSize+header.TCPDataOffset] = ((header.TCPMinimumSize - 1) / 4) << 4
 
-	c.SendSegment(buffer.NewWithData(tcpbuf))
+	segbuf := bufferv2.MakeWithData(tcpbuf)
+	c.SendSegment(segbuf)
 
 	if got := stats.TCP.InvalidSegmentsReceived.Value(); got != want {
 		t.Errorf("got stats.TCP.InvalidSegmentsReceived.Value() = %d, want = %d", got, want)
@@ -4725,12 +4937,15 @@ func TestReceivedIncorrectChecksumIncrement(t *testing.T) {
 		AckNum:  c.IRS.Add(1),
 		RcvWnd:  30000,
 	})
+	defer buf.Release()
 	tcpbuf := buf.Flatten()
 	// Overwrite a byte in the payload which should cause checksum
 	// verification to fail.
 	tcpbuf[header.IPv4MinimumSize+((tcpbuf[header.IPv4MinimumSize+header.TCPDataOffset]>>4)*4)] = 0x4
 
-	c.SendSegment(buffer.NewWithData(tcpbuf))
+	segbuf := bufferv2.MakeWithData(tcpbuf)
+	defer segbuf.Release()
+	c.SendSegment(bufferv2.MakeWithData(tcpbuf))
 
 	if got := stats.TCP.ChecksumErrors.Value(); got != want {
 		t.Errorf("got stats.TCP.ChecksumErrors.Value() = %d, want = %d", got, want)
@@ -4768,6 +4983,7 @@ func TestReceivedSegmentQueuing(t *testing.T) {
 	last := iss.Add(seqnum.Size(200 * len(data)))
 	for {
 		b := c.GetPacket()
+		defer b.Release()
 		checker.IPv4(t, b,
 			checker.TCP(
 				checker.DstPort(context.TestPort),
@@ -4775,7 +4991,7 @@ func TestReceivedSegmentQueuing(t *testing.T) {
 				checker.TCPFlags(header.TCPFlagAck),
 			),
 		)
-		tcpHdr := header.TCP(header.IPv4(b).Payload())
+		tcpHdr := header.TCP(header.IPv4(b.AsSlice()).Payload())
 		ack := seqnum.Value(tcpHdr.AckNumber())
 		if ack == last {
 			break
@@ -4818,7 +5034,9 @@ func TestReadAfterClosedState(t *testing.T) {
 	}
 
 	iss := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
-	checker.IPv4(t, c.GetPacket(),
+	b := c.GetPacket()
+	defer b.Release()
+	checker.IPv4(t, b,
 		checker.PayloadLen(header.TCPMinimumSize),
 		checker.TCP(
 			checker.DstPort(context.TestPort),
@@ -4844,7 +5062,9 @@ func TestReadAfterClosedState(t *testing.T) {
 	})
 
 	// Check that ACK is received.
-	checker.IPv4(t, c.GetPacket(),
+	b = c.GetPacket()
+	defer b.Release()
+	checker.IPv4(t, b,
 		checker.TCP(
 			checker.DstPort(context.TestPort),
 			checker.TCPSeqNum(uint32(c.IRS)+2),
@@ -5009,7 +5229,9 @@ func TestTimeWaitAssassination(t *testing.T) {
 			c.CreateConnected(context.TestInitialSequenceNumber, 30000, -1)
 			c.EP.Close()
 
-			checker.IPv4(t, c.GetPacket(), checker.TCP(
+			v := c.GetPacket()
+			defer v.Release()
+			checker.IPv4(t, v, checker.TCP(
 				checker.SrcPort(port),
 				checker.DstPort(context.TestPort),
 				checker.TCPSeqNum(uint32(c.IRS+1)),
@@ -5103,6 +5325,7 @@ func TestDefaultBufferSizes(t *testing.T) {
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
 	})
+	defer s.Destroy()
 
 	// Check the default values.
 	ep, err := s.NewEndpoint(tcp.ProtocolNumber, ipv4.ProtocolNumber, &waiter.Queue{})
@@ -5166,6 +5389,7 @@ func TestBindToDeviceOption(t *testing.T) {
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol}})
 
+	defer s.Destroy()
 	ep, err := s.NewEndpoint(tcp.ProtocolNumber, ipv4.ProtocolNumber, &waiter.Queue{})
 	if err != nil {
 		t.Fatalf("NewEndpoint failed; %s", err)
@@ -5266,6 +5490,7 @@ func TestSelfConnect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer s.Destroy()
 
 	var wq waiter.Queue
 	ep, err := s.NewEndpoint(tcp.ProtocolNumber, ipv4.ProtocolNumber, &wq)
@@ -5370,6 +5595,7 @@ func TestConnectAvoidsBoundPorts(t *testing.T) {
 											if err != nil {
 												t.Fatal(err)
 											}
+											defer s.Destroy()
 
 											var wq waiter.Queue
 											var eps []tcpip.Endpoint
@@ -5490,13 +5716,15 @@ func TestPathMTUDiscovery(t *testing.T) {
 		t.Fatalf("Write failed: %s", err)
 	}
 
-	receivePackets := func(c *context.Context, sizes []int, which int, seqNum uint32) []byte {
-		var ret []byte
+	receivePackets := func(c *context.Context, sizes []int, which int, seqNum uint32) *bufferv2.View {
+		var ret *bufferv2.View
 		iss := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
 		for i, size := range sizes {
 			p := c.GetPacket()
 			if i == which {
 				ret = p
+			} else {
+				defer p.Release()
 			}
 			checker.IPv4(t, p,
 				checker.PayloadLen(size+header.TCPMinimumSize),
@@ -5515,11 +5743,13 @@ func TestPathMTUDiscovery(t *testing.T) {
 	// Receive three packets.
 	sizes := []int{maxPayload, maxPayload, writeSize - 2*maxPayload}
 	first := receivePackets(c, sizes, 0, uint32(c.IRS)+1)
+	defer first.Release()
 
 	// Send "packet too big" messages back to netstack.
 	const newMTU = 1200
 	const newMaxPayload = newMTU - header.IPv4MinimumSize - header.TCPMinimumSize
-	mtu := []byte{0, 0, newMTU / 256, newMTU % 256}
+	mtu := bufferv2.NewViewWithData([]byte{0, 0, newMTU / 256, newMTU % 256})
+	defer mtu.Release()
 	c.SendICMPPacket(header.ICMPv4DstUnreachable, header.ICMPv4FragmentationNeeded, mtu, first, newMTU)
 
 	// See retransmitted packets. None exceeding the new max.
@@ -5743,6 +5973,7 @@ func TestKeepalive(t *testing.T) {
 	iss := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
 	for i := 0; i < 10; i++ {
 		b := c.GetPacket()
+		defer b.Release()
 		checker.IPv4(t, b,
 			checker.TCP(
 				checker.DstPort(context.TestPort),
@@ -5777,7 +6008,9 @@ func TestKeepalive(t *testing.T) {
 	}
 
 	next := uint32(c.IRS) + 1
-	checker.IPv4(t, c.GetPacket(),
+	b := c.GetPacket()
+	defer b.Release()
+	checker.IPv4(t, b,
 		checker.PayloadLen(len(view)+header.TCPMinimumSize),
 		checker.TCP(
 			checker.DstPort(context.TestPort),
@@ -5789,7 +6022,9 @@ func TestKeepalive(t *testing.T) {
 
 	// Wait for the packet to be retransmitted. Verify that no keepalives
 	// were sent.
-	checker.IPv4(t, c.GetPacket(),
+	b = c.GetPacket()
+	defer b.Release()
+	checker.IPv4(t, b,
 		checker.PayloadLen(len(view)+header.TCPMinimumSize),
 		checker.TCP(
 			checker.DstPort(context.TestPort),
@@ -5815,7 +6050,8 @@ func TestKeepalive(t *testing.T) {
 	// Now receive 5 keepalives, but don't ACK them. The connection
 	// should be reset after 5.
 	for i := 0; i < 5; i++ {
-		b := c.GetPacket()
+		b = c.GetPacket()
+		defer b.Release()
 		checker.IPv4(t, b,
 			checker.TCP(
 				checker.DstPort(context.TestPort),
@@ -5843,7 +6079,9 @@ func TestKeepalive(t *testing.T) {
 		RcvWnd:  30000,
 	})
 
-	checker.IPv4(t, c.GetPacket(),
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v,
 		checker.TCP(checker.DstPort(context.TestPort), checker.TCPSeqNum(next), checker.TCPAckNum(uint32(0)), checker.TCPFlags(header.TCPFlagRst)),
 	)
 
@@ -5878,7 +6116,8 @@ func executeHandshake(t *testing.T, c *context.Context, srcPort uint16, synCooki
 
 	// Receive the SYN-ACK reply.
 	b := c.GetPacket()
-	tcpHdr := header.TCP(header.IPv4(b).Payload())
+	defer b.Release()
+	tcpHdr := header.TCP(header.IPv4(b.AsSlice()).Payload())
 	iss = seqnum.Value(tcpHdr.SequenceNumber())
 	tcpCheckers := []checker.TransportChecker{
 		checker.SrcPort(context.StackPort),
@@ -5931,7 +6170,8 @@ func executeV6Handshake(t *testing.T, c *context.Context, srcPort uint16, synCoo
 
 	// Receive the SYN-ACK reply.
 	b := c.GetV6Packet()
-	tcpHdr := header.TCP(header.IPv6(b).Payload())
+	defer b.Release()
+	tcpHdr := header.TCP(header.IPv6(b.AsSlice()).Payload())
 	iss = seqnum.Value(tcpHdr.SequenceNumber())
 	tcpCheckers := []checker.TransportChecker{
 		checker.SrcPort(context.StackPort),
@@ -6066,7 +6306,8 @@ func TestListenBacklogFull(t *testing.T) {
 	r.Reset(data)
 	newEP.Write(&r, tcpip.WriteOptions{})
 	b := c.GetPacket()
-	tcp := header.TCP(header.IPv4(b).Payload())
+	defer b.Release()
+	tcp := header.TCP(header.IPv4(b.AsSlice()).Payload())
 	if string(tcp.Payload()) != data {
 		t.Fatalf("unexpected data: got %s, want %s", string(tcp.Payload()), data)
 	}
@@ -6174,7 +6415,9 @@ func TestListenNoAcceptNonUnicastV4(t *testing.T) {
 				SeqNum:  irs,
 				RcvWnd:  30000,
 			}, context.TestAddr, context.StackAddr)
-			checker.IPv4(t, c.GetPacket(),
+			v := c.GetPacket()
+			defer v.Release()
+			checker.IPv4(t, v,
 				checker.TCP(
 					checker.SrcPort(context.StackPort),
 					checker.DstPort(context.TestPort),
@@ -6274,7 +6517,9 @@ func TestListenNoAcceptNonUnicastV6(t *testing.T) {
 				SeqNum:  irs,
 				RcvWnd:  30000,
 			}, context.TestV6Addr, context.StackV6Addr)
-			checker.IPv6(t, c.GetV6Packet(),
+			v := c.GetV6Packet()
+			defer v.Release()
+			checker.IPv6(t, v,
 				checker.TCP(
 					checker.SrcPort(context.StackPort),
 					checker.DstPort(context.TestPort),
@@ -6319,7 +6564,8 @@ func TestListenSynRcvdQueueFull(t *testing.T) {
 
 	// Receive the SYN-ACK reply.
 	b := c.GetPacket()
-	tcp := header.TCP(header.IPv4(b).Payload())
+	defer b.Release()
+	tcp := header.TCP(header.IPv4(b.AsSlice()).Payload())
 	iss := seqnum.Value(tcp.SequenceNumber())
 	tcpCheckers := []checker.TransportChecker{
 		checker.SrcPort(context.StackPort),
@@ -6379,7 +6625,8 @@ func TestListenSynRcvdQueueFull(t *testing.T) {
 	r.Reset(data)
 	newEP.Write(&r, tcpip.WriteOptions{})
 	pkt := c.GetPacket()
-	tcp = header.IPv4(pkt).Payload()
+	defer pkt.Release()
+	tcp = header.IPv4(pkt.AsSlice()).Payload()
 	if string(tcp.Payload()) != data {
 		t.Fatalf("unexpected data: got %s, want %s", string(tcp.Payload()), data)
 	}
@@ -6496,7 +6743,9 @@ func TestSYNRetransmit(t *testing.T) {
 		checker.TCPFlags(header.TCPFlagAck | header.TCPFlagSyn),
 		checker.TCPAckNum(uint32(irs) + 1),
 	}
-	checker.IPv4(t, c.GetPacket(), checker.TCP(tcpCheckers...))
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(tcpCheckers...))
 }
 
 func TestSynRcvdBadSeqNumber(t *testing.T) {
@@ -6532,7 +6781,8 @@ func TestSynRcvdBadSeqNumber(t *testing.T) {
 
 	// Receive the SYN-ACK reply.
 	b := c.GetPacket()
-	tcpHdr := header.TCP(header.IPv4(b).Payload())
+	defer b.Release()
+	tcpHdr := header.TCP(header.IPv4(b.AsSlice()).Payload())
 	iss := seqnum.Value(tcpHdr.SequenceNumber())
 	tcpCheckers := []checker.TransportChecker{
 		checker.SrcPort(context.StackPort),
@@ -6555,6 +6805,7 @@ func TestSynRcvdBadSeqNumber(t *testing.T) {
 
 	// Should receive an ACK with the expected SEQ number
 	b = c.GetPacket()
+	defer b.Release()
 	tcpCheckers = []checker.TransportChecker{
 		checker.SrcPort(context.StackPort),
 		checker.DstPort(context.TestPort),
@@ -6598,7 +6849,8 @@ func TestSynRcvdBadSeqNumber(t *testing.T) {
 	}
 
 	pkt := c.GetPacket()
-	tcpHdr = header.IPv4(pkt).Payload()
+	defer pkt.Release()
+	tcpHdr = header.IPv4(pkt.AsSlice()).Payload()
 	if string(tcpHdr.Payload()) != data {
 		t.Fatalf("unexpected data: got %s, want %s", string(tcpHdr.Payload()), data)
 	}
@@ -6769,7 +7021,9 @@ func TestListenDropIncrement(t *testing.T) {
 		Flags:   header.TCPFlagSyn,
 		SeqNum:  irs,
 	})
-	checker.IPv4(t, c.GetPacket(), checker.TCP(checker.SrcPort(context.StackPort),
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(checker.SrcPort(context.StackPort),
 		checker.DstPort(context.TestPort),
 		checker.TCPFlags(header.TCPFlagAck|header.TCPFlagSyn),
 		checker.TCPAckNum(uint32(irs)+1),
@@ -6906,7 +7160,8 @@ func TestReceiveBufferAutoTuningApplicationLimited(t *testing.T) {
 	rawEP.SendPacketWithTS(make([]byte, tcp.SegOverheadSize), tsVal)
 
 	pkt := rawEP.VerifyAndReturnACKWithTS(tsVal)
-	rcvWnd := header.TCP(header.IPv4(pkt).Payload()).WindowSize()
+	defer pkt.Release()
+	rcvWnd := header.TCP(header.IPv4(pkt.AsSlice()).Payload()).WindowSize()
 
 	time.Sleep(25 * time.Millisecond)
 
@@ -6941,7 +7196,8 @@ func TestReceiveBufferAutoTuningApplicationLimited(t *testing.T) {
 	// Since we sent almost the full receive buffer worth of data (some may have
 	// been dropped due to segment overheads), we should get a zero window back.
 	pkt = c.GetPacket()
-	tcpHdr := header.TCP(header.IPv4(pkt).Payload())
+	defer pkt.Release()
+	tcpHdr := header.TCP(header.IPv4(pkt.AsSlice()).Payload())
 	gotRcvWnd := tcpHdr.WindowSize()
 	wantAckNum := tcpHdr.AckNumber()
 	if got, want := int(gotRcvWnd), 0; got != want {
@@ -6965,6 +7221,7 @@ func TestReceiveBufferAutoTuningApplicationLimited(t *testing.T) {
 	// under thread santizer this test can end up sending more than 1
 	// ack, 1 for the non-zero window
 	p := c.GetPacket()
+	defer p.Release()
 	checker.IPv4(t, p, checker.TCP(
 		checker.TCPAckNum(wantAckNum),
 		func(t *testing.T, h header.Transport) {
@@ -7026,7 +7283,8 @@ func TestReceiveBufferAutoTuning(t *testing.T) {
 	rawEP.SendPacketWithTS(nil, tsVal)
 	rawEP.NextSeqNum++
 	pkt := rawEP.VerifyAndReturnACKWithTS(tsVal)
-	curRcvWnd := int(header.TCP(header.IPv4(pkt).Payload()).WindowSize()) << c.WindowScale
+	defer pkt.Release()
+	curRcvWnd := int(header.TCP(header.IPv4(pkt.AsSlice()).Payload()).WindowSize()) << c.WindowScale
 	scaleRcvWnd := func(rcvWnd int) uint16 {
 		return uint16(rcvWnd >> c.WindowScale)
 	}
@@ -7067,6 +7325,7 @@ func TestReceiveBufferAutoTuning(t *testing.T) {
 		time.Sleep(1 * time.Millisecond)
 
 		lastACK := c.GetPacket()
+		defer lastACK.Release()
 		// Discard any intermediate ACKs and only check the last ACK we get in a
 		// short time period of few ms.
 		for {
@@ -7075,9 +7334,10 @@ func TestReceiveBufferAutoTuning(t *testing.T) {
 			if pkt == nil {
 				break
 			}
+			defer pkt.Release()
 			lastACK = pkt
 		}
-		if got, want := int(header.TCP(header.IPv4(lastACK).Payload()).WindowSize()), int(scaleRcvWnd(curRcvWnd)); got > want {
+		if got, want := int(header.TCP(header.IPv4(lastACK.AsSlice()).Payload()).WindowSize()), int(scaleRcvWnd(curRcvWnd)); got > want {
 			t.Fatalf("advertised window got: %d, want <= %d", got, want)
 		}
 
@@ -7114,6 +7374,7 @@ func TestReceiveBufferAutoTuning(t *testing.T) {
 			// Read loop above could generate an ACK if the window had dropped to
 			// zero and then read had opened it up.
 			lastACK := c.GetPacket()
+			defer lastACK.Release()
 			// Discard any intermediate ACKs and only check the last ACK we get in a
 			// short time period of few ms.
 			for {
@@ -7122,9 +7383,10 @@ func TestReceiveBufferAutoTuning(t *testing.T) {
 				if pkt == nil {
 					break
 				}
+				defer pkt.Release()
 				lastACK = pkt
 			}
-			curRcvWnd = int(header.TCP(header.IPv4(lastACK).Payload()).WindowSize()) << c.WindowScale
+			curRcvWnd = int(header.TCP(header.IPv4(lastACK.AsSlice()).Payload()).WindowSize()) << c.WindowScale
 			// If thew new current window is close maxReceiveBufferSize then terminate
 			// the loop. This can happen before all iterations are done due to timing
 			// differences when running the test.
@@ -7256,7 +7518,8 @@ func TestTCPTimeWaitRSTIgnored(t *testing.T) {
 
 	// Receive the SYN-ACK reply.
 	b := c.GetPacket()
-	tcpHdr := header.TCP(header.IPv4(b).Payload())
+	defer b.Release()
+	tcpHdr := header.TCP(header.IPv4(b.AsSlice()).Payload())
 	c.IRS = seqnum.Value(tcpHdr.SequenceNumber())
 
 	ackHeaders := &context.Headers{
@@ -7291,7 +7554,10 @@ func TestTCPTimeWaitRSTIgnored(t *testing.T) {
 	}
 
 	c.EP.Close()
-	checker.IPv4(t, c.GetPacket(), checker.TCP(
+
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
 		checker.SrcPort(context.StackPort),
 		checker.DstPort(context.TestPort),
 		checker.TCPSeqNum(uint32(c.IRS+1)),
@@ -7309,7 +7575,10 @@ func TestTCPTimeWaitRSTIgnored(t *testing.T) {
 	c.SendPacket(nil, finHeaders)
 
 	// Get the ACK to the FIN we just sent.
-	checker.IPv4(t, c.GetPacket(), checker.TCP(
+
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
 		checker.SrcPort(context.StackPort),
 		checker.DstPort(context.TestPort),
 		checker.TCPSeqNum(uint32(c.IRS+2)),
@@ -7338,7 +7607,9 @@ func TestTCPTimeWaitRSTIgnored(t *testing.T) {
 		AckNum:  c.IRS + 3,
 	})
 
-	checker.IPv4(t, c.GetPacket(), checker.TCP(
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
 		checker.SrcPort(context.StackPort),
 		checker.DstPort(context.TestPort),
 		checker.TCPSeqNum(uint32(c.IRS+2)),
@@ -7375,7 +7646,8 @@ func TestTCPTimeWaitOutOfOrder(t *testing.T) {
 
 	// Receive the SYN-ACK reply.
 	b := c.GetPacket()
-	tcpHdr := header.TCP(header.IPv4(b).Payload())
+	defer b.Release()
+	tcpHdr := header.TCP(header.IPv4(b.AsSlice()).Payload())
 	c.IRS = seqnum.Value(tcpHdr.SequenceNumber())
 
 	ackHeaders := &context.Headers{
@@ -7410,7 +7682,10 @@ func TestTCPTimeWaitOutOfOrder(t *testing.T) {
 	}
 
 	c.EP.Close()
-	checker.IPv4(t, c.GetPacket(), checker.TCP(
+
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
 		checker.SrcPort(context.StackPort),
 		checker.DstPort(context.TestPort),
 		checker.TCPSeqNum(uint32(c.IRS+1)),
@@ -7428,7 +7703,9 @@ func TestTCPTimeWaitOutOfOrder(t *testing.T) {
 	c.SendPacket(nil, finHeaders)
 
 	// Get the ACK to the FIN we just sent.
-	checker.IPv4(t, c.GetPacket(), checker.TCP(
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
 		checker.SrcPort(context.StackPort),
 		checker.DstPort(context.TestPort),
 		checker.TCPSeqNum(uint32(c.IRS+2)),
@@ -7445,7 +7722,9 @@ func TestTCPTimeWaitOutOfOrder(t *testing.T) {
 		AckNum:  c.IRS + 3,
 	})
 
-	checker.IPv4(t, c.GetPacket(), checker.TCP(
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
 		checker.SrcPort(context.StackPort),
 		checker.DstPort(context.TestPort),
 		checker.TCPSeqNum(uint32(c.IRS+2)),
@@ -7482,7 +7761,8 @@ func TestTCPTimeWaitNewSyn(t *testing.T) {
 
 	// Receive the SYN-ACK reply.
 	b := c.GetPacket()
-	tcpHdr := header.TCP(header.IPv4(b).Payload())
+	defer b.Release()
+	tcpHdr := header.TCP(header.IPv4(b.AsSlice()).Payload())
 	c.IRS = seqnum.Value(tcpHdr.SequenceNumber())
 
 	ackHeaders := &context.Headers{
@@ -7517,7 +7797,10 @@ func TestTCPTimeWaitNewSyn(t *testing.T) {
 	}
 
 	c.EP.Close()
-	checker.IPv4(t, c.GetPacket(), checker.TCP(
+
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
 		checker.SrcPort(context.StackPort),
 		checker.DstPort(context.TestPort),
 		checker.TCPSeqNum(uint32(c.IRS+1)),
@@ -7535,7 +7818,9 @@ func TestTCPTimeWaitNewSyn(t *testing.T) {
 	c.SendPacket(nil, finHeaders)
 
 	// Get the ACK to the FIN we just sent.
-	checker.IPv4(t, c.GetPacket(), checker.TCP(
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
 		checker.SrcPort(context.StackPort),
 		checker.DstPort(context.TestPort),
 		checker.TCPSeqNum(uint32(c.IRS+2)),
@@ -7576,7 +7861,8 @@ func TestTCPTimeWaitNewSyn(t *testing.T) {
 
 	// Receive the SYN-ACK reply.
 	b = c.GetPacket()
-	tcpHdr = header.IPv4(b).Payload()
+	defer b.Release()
+	tcpHdr = header.IPv4(b.AsSlice()).Payload()
 	c.IRS = seqnum.Value(tcpHdr.SequenceNumber())
 
 	ackHeaders = &context.Headers{
@@ -7646,7 +7932,8 @@ func TestTCPTimeWaitDuplicateFINExtendsTimeWait(t *testing.T) {
 
 	// Receive the SYN-ACK reply.
 	b := c.GetPacket()
-	tcpHdr := header.TCP(header.IPv4(b).Payload())
+	defer b.Release()
+	tcpHdr := header.TCP(header.IPv4(b.AsSlice()).Payload())
 	c.IRS = seqnum.Value(tcpHdr.SequenceNumber())
 
 	ackHeaders := &context.Headers{
@@ -7681,7 +7968,9 @@ func TestTCPTimeWaitDuplicateFINExtendsTimeWait(t *testing.T) {
 	}
 
 	c.EP.Close()
-	checker.IPv4(t, c.GetPacket(), checker.TCP(
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
 		checker.SrcPort(context.StackPort),
 		checker.DstPort(context.TestPort),
 		checker.TCPSeqNum(uint32(c.IRS+1)),
@@ -7699,7 +7988,9 @@ func TestTCPTimeWaitDuplicateFINExtendsTimeWait(t *testing.T) {
 	c.SendPacket(nil, finHeaders)
 
 	// Get the ACK to the FIN we just sent.
-	checker.IPv4(t, c.GetPacket(), checker.TCP(
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
 		checker.SrcPort(context.StackPort),
 		checker.DstPort(context.TestPort),
 		checker.TCPSeqNum(uint32(c.IRS+2)),
@@ -7714,7 +8005,9 @@ func TestTCPTimeWaitDuplicateFINExtendsTimeWait(t *testing.T) {
 	c.SendPacket(nil, finHeaders)
 
 	// Get the ACK to the FIN we just sent.
-	checker.IPv4(t, c.GetPacket(), checker.TCP(
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
 		checker.SrcPort(context.StackPort),
 		checker.DstPort(context.TestPort),
 		checker.TCPSeqNum(uint32(c.IRS+2)),
@@ -7743,7 +8036,9 @@ func TestTCPTimeWaitDuplicateFINExtendsTimeWait(t *testing.T) {
 
 	// Receive the RST that should be generated as there is no valid
 	// endpoint.
-	checker.IPv4(t, c.GetPacket(), checker.TCP(
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
 		checker.SrcPort(context.StackPort),
 		checker.DstPort(context.TestPort),
 		checker.TCPSeqNum(uint32(ackHeaders.AckNum)),
@@ -7795,7 +8090,8 @@ func TestTCPCloseWithData(t *testing.T) {
 
 	// Receive the SYN-ACK reply.
 	b := c.GetPacket()
-	tcpHdr := header.TCP(header.IPv4(b).Payload())
+	defer b.Release()
+	tcpHdr := header.TCP(header.IPv4(b.AsSlice()).Payload())
 	c.IRS = seqnum.Value(tcpHdr.SequenceNumber())
 
 	ackHeaders := &context.Headers{
@@ -7843,7 +8139,9 @@ func TestTCPCloseWithData(t *testing.T) {
 	c.SendPacket(nil, finHeaders)
 
 	// Get the ACK to the FIN we just sent.
-	checker.IPv4(t, c.GetPacket(), checker.TCP(
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
 		checker.SrcPort(context.StackPort),
 		checker.DstPort(context.TestPort),
 		checker.TCPSeqNum(uint32(c.IRS+1)),
@@ -7861,6 +8159,7 @@ func TestTCPCloseWithData(t *testing.T) {
 
 	// Check that data is received.
 	b = c.GetPacket()
+	defer b.Release()
 	checker.IPv4(t, b,
 		checker.PayloadLen(len(data)+header.TCPMinimumSize),
 		checker.TCP(
@@ -7871,13 +8170,15 @@ func TestTCPCloseWithData(t *testing.T) {
 		),
 	)
 
-	if p := b[header.IPv4MinimumSize+header.TCPMinimumSize:]; !bytes.Equal(data, p) {
+	if p := b.AsSlice()[header.IPv4MinimumSize+header.TCPMinimumSize:]; !bytes.Equal(data, p) {
 		t.Errorf("got data = %x, want = %x", p, data)
 	}
 
 	c.EP.Close()
 	// Check the FIN.
-	checker.IPv4(t, c.GetPacket(), checker.TCP(
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
 		checker.SrcPort(context.StackPort),
 		checker.DstPort(context.TestPort),
 		checker.TCPSeqNum(uint32(c.IRS+1)+uint32(len(data))),
@@ -7923,7 +8224,9 @@ func TestTCPCloseWithData(t *testing.T) {
 	c.SendPacket(nil, ackHeaders)
 
 	// Check the RST.
-	checker.IPv4(t, c.GetPacket(), checker.TCP(
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
 		checker.SrcPort(context.StackPort),
 		checker.DstPort(context.TestPort),
 		checker.TCPSeqNum(uint32(ackHeaders.AckNum)),
@@ -7966,7 +8269,9 @@ func TestTCPUserTimeout(t *testing.T) {
 
 	next := uint32(c.IRS) + 1
 	iss := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
-	checker.IPv4(t, c.GetPacket(),
+	b := c.GetPacket()
+	defer b.Release()
+	checker.IPv4(t, b,
 		checker.PayloadLen(len(view)+header.TCPMinimumSize),
 		checker.TCP(
 			checker.DstPort(context.TestPort),
@@ -8002,13 +8307,14 @@ func TestTCPUserTimeout(t *testing.T) {
 		RcvWnd:  30000,
 	})
 
-	checker.IPv4(t, c.GetPacket(),
-		checker.TCP(
-			checker.DstPort(context.TestPort),
-			checker.TCPSeqNum(next),
-			checker.TCPAckNum(uint32(0)),
-			checker.TCPFlags(header.TCPFlagRst),
-		),
+	b = c.GetPacket()
+	defer b.Release()
+	checker.IPv4(t, b, checker.TCP(
+		checker.DstPort(context.TestPort),
+		checker.TCPSeqNum(next),
+		checker.TCPAckNum(uint32(0)),
+		checker.TCPFlags(header.TCPFlagRst),
+	),
 	)
 
 	ept := endpointTester{c.EP}
@@ -8060,6 +8366,7 @@ func TestKeepaliveWithUserTimeout(t *testing.T) {
 
 	// Now receive 1 keepalives, but don't ACK it.
 	b := c.GetPacket()
+	defer b.Release()
 	iss := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
 	checker.IPv4(t, b,
 		checker.TCP(
@@ -8087,13 +8394,14 @@ func TestKeepaliveWithUserTimeout(t *testing.T) {
 		RcvWnd:  30000,
 	})
 
-	checker.IPv4(t, c.GetPacket(),
-		checker.TCP(
-			checker.DstPort(context.TestPort),
-			checker.TCPSeqNum(uint32(c.IRS+1)),
-			checker.TCPAckNum(uint32(0)),
-			checker.TCPFlags(header.TCPFlagRst),
-		),
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
+		checker.DstPort(context.TestPort),
+		checker.TCPSeqNum(uint32(c.IRS+1)),
+		checker.TCPAckNum(uint32(0)),
+		checker.TCPFlags(header.TCPFlagRst),
+	),
 	)
 
 	ept.CheckReadError(t, &tcpip.ErrTimeout{})
@@ -8132,6 +8440,7 @@ func TestIncreaseWindowOnRead(t *testing.T) {
 		sent += len(data)
 		remain -= len(data)
 		pkt := c.GetPacket()
+		defer pkt.Release()
 		checker.IPv4(t, pkt,
 			checker.PayloadLen(header.TCPMinimumSize),
 			checker.TCP(
@@ -8142,7 +8451,7 @@ func TestIncreaseWindowOnRead(t *testing.T) {
 			),
 		)
 		// Break once the window drops below e2e.DefaultMTU/2
-		if wnd := header.TCP(header.IPv4(pkt).Payload()).WindowSize(); wnd < e2e.DefaultMTU/2 {
+		if wnd := header.TCP(header.IPv4(pkt.AsSlice()).Payload()).WindowSize(); wnd < e2e.DefaultMTU/2 {
 			break
 		}
 	}
@@ -8163,7 +8472,9 @@ func TestIncreaseWindowOnRead(t *testing.T) {
 	}
 
 	// After reading > MSS worth of data, we surely crossed MSS. See the ack:
-	checker.IPv4(t, c.GetPacket(),
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v,
 		checker.PayloadLen(header.TCPMinimumSize),
 		checker.TCP(
 			checker.DstPort(context.TestPort),
@@ -8201,7 +8512,9 @@ func TestIncreaseWindowOnBufferResize(t *testing.T) {
 		})
 		sent += len(data)
 		remain -= len(data)
-		checker.IPv4(t, c.GetPacket(),
+		v := c.GetPacket()
+		defer v.Release()
+		checker.IPv4(t, v,
 			checker.PayloadLen(header.TCPMinimumSize),
 			checker.TCP(
 				checker.DstPort(context.TestPort),
@@ -8216,7 +8529,9 @@ func TestIncreaseWindowOnBufferResize(t *testing.T) {
 	// Increasing the buffer from should generate an ACK,
 	// since window grew from small value to larger equal MSS
 	c.EP.SocketOptions().SetReceiveBufferSize(rcvBuf*4, true /* notify */)
-	checker.IPv4(t, c.GetPacket(),
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v,
 		checker.PayloadLen(header.TCPMinimumSize),
 		checker.TCP(
 			checker.DstPort(context.TestPort),
@@ -8265,7 +8580,9 @@ func TestTCPDeferAccept(t *testing.T) {
 	})
 
 	// Receive ACK for the data we sent.
-	checker.IPv4(t, c.GetPacket(), checker.TCP(
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
 		checker.DstPort(context.TestPort),
 		checker.TCPFlags(header.TCPFlagAck),
 		checker.TCPSeqNum(uint32(iss+1)),
@@ -8280,7 +8597,9 @@ func TestTCPDeferAccept(t *testing.T) {
 
 	aep.Close()
 	// Closing aep without reading the data should trigger a RST.
-	checker.IPv4(t, c.GetPacket(), checker.TCP(
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
 		checker.DstPort(context.TestPort),
 		checker.TCPFlags(header.TCPFlagRst|header.TCPFlagAck),
 		checker.TCPSeqNum(uint32(iss+1)),
@@ -8318,7 +8637,9 @@ func TestTCPDeferAcceptTimeout(t *testing.T) {
 	time.Sleep(tcpDeferAccept + 100*time.Millisecond)
 
 	// On timeout expiry we should get a SYN-ACK retransmission.
-	checker.IPv4(t, c.GetPacket(), checker.TCP(
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
 		checker.SrcPort(context.StackPort),
 		checker.DstPort(context.TestPort),
 		checker.TCPFlags(header.TCPFlagAck|header.TCPFlagSyn),
@@ -8334,7 +8655,9 @@ func TestTCPDeferAcceptTimeout(t *testing.T) {
 	})
 
 	// Receive ACK for the data we sent.
-	checker.IPv4(t, c.GetPacket(), checker.TCP(
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
 		checker.SrcPort(context.StackPort),
 		checker.DstPort(context.TestPort),
 		checker.TCPFlags(header.TCPFlagAck),
@@ -8350,7 +8673,9 @@ func TestTCPDeferAcceptTimeout(t *testing.T) {
 
 	aep.Close()
 	// Closing aep without reading the data should trigger a RST.
-	checker.IPv4(t, c.GetPacket(), checker.TCP(
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
 		checker.SrcPort(context.StackPort),
 		checker.DstPort(context.TestPort),
 		checker.TCPFlags(header.TCPFlagRst|header.TCPFlagAck),
@@ -8377,7 +8702,9 @@ func TestResetDuringClose(t *testing.T) {
 	})
 
 	// Receive ACK for the data we sent.
-	checker.IPv4(t, c.GetPacket(), checker.TCP(
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
 		checker.DstPort(context.TestPort),
 		checker.TCPFlags(header.TCPFlagAck),
 		checker.TCPSeqNum(uint32(irs.Add(1))),
@@ -8542,6 +8869,7 @@ func TestHandshakeRTT(t *testing.T) {
 func TestSetRTO(t *testing.T) {
 	c := context.New(t, e2e.DefaultMTU)
 	minRTO, maxRTO := tcpRTOMinMax(t, c)
+	c.Cleanup()
 	for _, tt := range []struct {
 		name   string
 		RTO    time.Duration
@@ -8570,6 +8898,7 @@ func TestSetRTO(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			c := context.New(t, e2e.DefaultMTU)
+			defer c.Cleanup()
 			var opt tcpip.SettableTransportProtocolOption
 			if tt.minRTO > 0 {
 				min := tcpip.TCPMinRTOOption(tt.minRTO)
@@ -8756,7 +9085,8 @@ func TestTimestampSynCookies(t *testing.T) {
 	})
 	// Get the TSVal of SYN-ACK.
 	b := c.GetPacket()
-	tcpHdr := header.TCP(header.IPv4(b).Payload())
+	defer b.Release()
+	tcpHdr := header.TCP(header.IPv4(b.AsSlice()).Payload())
 	c.IRS = seqnum.Value(tcpHdr.SequenceNumber())
 	initialTSVal := tcpHdr.ParsedOptions().TSVal
 	// derive the tsOffset.
@@ -8804,7 +9134,9 @@ func TestTimestampSynCookies(t *testing.T) {
 
 	// The endpoint should have a correct TSOffset so that the received TSVal
 	// should match our expectation.
-	if got, want := header.TCP(header.IPv4(c.GetPacket()).Payload()).ParsedOptions().TSVal, tsNow()+tsOffset; got != want {
+	p := c.GetPacket()
+	defer p.Release()
+	if got, want := header.TCP(header.IPv4(p.AsSlice()).Payload()).ParsedOptions().TSVal, tsNow()+tsOffset; got != want {
 		t.Fatalf("got TSVal = %d, want %d", got, want)
 	}
 }
@@ -8911,26 +9243,26 @@ func TestReleaseDanglingEndpoints(t *testing.T) {
 	// dangling.
 	ep.Close()
 	iss := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
-	checker.IPv4(t, c.GetPacket(),
-		checker.TCP(
-			checker.DstPort(context.TestPort),
-			checker.TCPSeqNum(uint32(c.IRS)+1),
-			checker.TCPAckNum(uint32(iss)),
-			checker.TCPFlags(header.TCPFlagAck|header.TCPFlagFin),
-		),
-	)
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
+		checker.DstPort(context.TestPort),
+		checker.TCPSeqNum(uint32(c.IRS)+1),
+		checker.TCPAckNum(uint32(iss)),
+		checker.TCPFlags(header.TCPFlagAck|header.TCPFlagFin),
+	))
 	tcpip.ReleaseDanglingEndpoints()
 
 	// ReleaseDanglingEndpoints should abort the half-closed endpoint causing
 	// a RST to be sent.
-	checker.IPv4(t, c.GetPacket(),
-		checker.TCP(
-			checker.DstPort(context.TestPort),
-			checker.TCPSeqNum(uint32(c.IRS)+2),
-			checker.TCPAckNum(uint32(iss)),
-			checker.TCPFlags(header.TCPFlagRst|header.TCPFlagAck),
-		),
-	)
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
+		checker.DstPort(context.TestPort),
+		checker.TCPSeqNum(uint32(c.IRS)+2),
+		checker.TCPAckNum(uint32(iss)),
+		checker.TCPFlags(header.TCPFlagRst|header.TCPFlagAck),
+	))
 
 	// Now send an ACK and it should trigger a RST as the endpoint is aborted.
 	c.SendPacket(nil, &context.Headers{
@@ -8942,14 +9274,14 @@ func TestReleaseDanglingEndpoints(t *testing.T) {
 		RcvWnd:  30000,
 	})
 
-	checker.IPv4(t, c.GetPacket(),
-		checker.TCP(
-			checker.DstPort(context.TestPort),
-			checker.TCPSeqNum(uint32(c.IRS)+2),
-			checker.TCPAckNum(0),
-			checker.TCPFlags(header.TCPFlagRst),
-		),
-	)
+	v = c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
+		checker.DstPort(context.TestPort),
+		checker.TCPSeqNum(uint32(c.IRS)+2),
+		checker.TCPAckNum(0),
+		checker.TCPFlags(header.TCPFlagRst),
+	))
 }
 
 func TestMain(m *testing.M) {
@@ -8959,6 +9291,6 @@ func TestMain(m *testing.M) {
 	// Allow TCP async work to complete to avoid false reports of leaks.
 	// TODO(gvisor.dev/issue/5940): Use fake clock in tests.
 	time.Sleep(1 * time.Second)
-	refsvfs2.DoLeakCheck()
+	refs.DoLeakCheck()
 	os.Exit(code)
 }

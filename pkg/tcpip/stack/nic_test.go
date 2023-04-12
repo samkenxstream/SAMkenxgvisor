@@ -19,7 +19,7 @@ import (
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/atomicbitops"
-	"gvisor.dev/gvisor/pkg/buffer"
+	"gvisor.dev/gvisor/pkg/bufferv2"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/testutil"
@@ -68,19 +68,19 @@ func (e *testIPv6Endpoint) MaxHeaderLength() uint16 {
 }
 
 // WritePacket implements NetworkEndpoint.WritePacket.
-func (*testIPv6Endpoint) WritePacket(*Route, NetworkHeaderParams, *PacketBuffer) tcpip.Error {
+func (*testIPv6Endpoint) WritePacket(*Route, NetworkHeaderParams, PacketBufferPtr) tcpip.Error {
 	return nil
 }
 
 // WriteHeaderIncludedPacket implements
 // NetworkEndpoint.WriteHeaderIncludedPacket.
-func (*testIPv6Endpoint) WriteHeaderIncludedPacket(*Route, *PacketBuffer) tcpip.Error {
+func (*testIPv6Endpoint) WriteHeaderIncludedPacket(*Route, PacketBufferPtr) tcpip.Error {
 	// Our tests don't use this so we don't support it.
 	return &tcpip.ErrNotSupported{}
 }
 
 // HandlePacket implements NetworkEndpoint.HandlePacket.
-func (*testIPv6Endpoint) HandlePacket(*PacketBuffer) {}
+func (*testIPv6Endpoint) HandlePacket(PacketBufferPtr) {}
 
 // Close implements NetworkEndpoint.Close.
 func (e *testIPv6Endpoint) Close() {
@@ -134,7 +134,7 @@ func (p *testIPv6Protocol) NewEndpoint(nic NetworkInterface, _ TransportDispatch
 		nic:      nic,
 		protocol: p,
 	}
-	e.AddressableEndpointState.Init(e)
+	e.AddressableEndpointState.Init(e, AddressableEndpointStateOptions{HiddenWhileDisabled: false})
 	return e
 }
 
@@ -155,7 +155,7 @@ func (*testIPv6Protocol) Close() {}
 func (*testIPv6Protocol) Wait() {}
 
 // Parse implements NetworkProtocol.Parse.
-func (*testIPv6Protocol) Parse(*PacketBuffer) (tcpip.TransportProtocolNumber, bool, bool) {
+func (*testIPv6Protocol) Parse(PacketBufferPtr) (tcpip.TransportProtocolNumber, bool, bool) {
 	return 0, false, false
 }
 
@@ -184,7 +184,7 @@ func TestDisabledRxStatsWhenNICDisabled(t *testing.T) {
 	}
 
 	nic.DeliverNetworkPacket(0, NewPacketBuffer(PacketBufferOptions{
-		Payload: buffer.NewWithData([]byte{1, 2, 3, 4}),
+		Payload: bufferv2.MakeWithData([]byte{1, 2, 3, 4}),
 	}))
 
 	if got := nic.stats.local.DisabledRx.Packets.Value(); got != 1 {
@@ -204,12 +204,12 @@ func TestDisabledRxStatsWhenNICDisabled(t *testing.T) {
 func TestPacketWithUnknownNetworkProtocolNumber(t *testing.T) {
 	nic := nic{
 		stats:   makeNICStats(tcpip.NICStats{}.FillIn()),
-		enabled: atomicbitops.FromUint32(1),
+		enabled: atomicbitops.FromBool(true),
 	}
 	// IPv4 isn't recognized since we haven't initialized the NIC with an IPv4
 	// endpoint.
 	nic.DeliverNetworkPacket(header.IPv4ProtocolNumber, NewPacketBuffer(PacketBufferOptions{
-		Payload: buffer.NewWithData([]byte{1, 2, 3, 4}),
+		Payload: bufferv2.MakeWithData([]byte{1, 2, 3, 4}),
 	}))
 	var count uint64
 	if got, ok := nic.stats.local.UnknownL3ProtocolRcvdPacketCounts.Get(uint64(header.IPv4ProtocolNumber)); ok {
@@ -224,12 +224,12 @@ func TestPacketWithUnknownTransportProtocolNumber(t *testing.T) {
 	nic := nic{
 		stack:   &Stack{},
 		stats:   makeNICStats(tcpip.NICStats{}.FillIn()),
-		enabled: atomicbitops.FromUint32(1),
+		enabled: atomicbitops.FromBool(true),
 	}
 	// UDP isn't recognized since we haven't initialized the NIC with a UDP
 	// protocol.
 	nic.DeliverTransportPacket(header.UDPProtocolNumber, NewPacketBuffer(PacketBufferOptions{
-		Payload: buffer.NewWithData([]byte{1, 2, 3, 4}),
+		Payload: bufferv2.MakeWithData([]byte{1, 2, 3, 4}),
 	}))
 	var count uint64
 	if got, ok := nic.stats.local.UnknownL4ProtocolRcvdPacketCounts.Get(uint64(header.UDPProtocolNumber)); ok {

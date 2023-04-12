@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "go_library")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "proc",
@@ -23,6 +26,7 @@ go_library(
         "//pkg/atomicbitops",
         "//pkg/cleanup",
         "//pkg/shim/runsc",
+        "//pkg/shim/utils",
         "@com_github_containerd_console//:go_default_library",
         "@com_github_containerd_containerd//errdefs:go_default_library",
         "@com_github_containerd_containerd//log:go_default_library",

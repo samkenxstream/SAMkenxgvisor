@@ -1,6 +1,7 @@
 load("//tools:defs.bzl", "cc_library", "cc_test", "coreutil", "default_net_util", "gbenchmark_internal", "gtest", "select_system")
 
 package(
+    default_applicable_licenses = ["//:license"],
     default_visibility = ["//:sandbox"],
     licenses = ["notice"],
 )
@@ -60,6 +61,20 @@ cc_library(
 )
 
 cc_library(
+    name = "io_uring_util",
+    testonly = 1,
+    srcs = ["io_uring_util.cc"],
+    hdrs = ["io_uring_util.h"],
+    deps = [
+        ":file_descriptor",
+        ":posix_error",
+        ":save_util",
+        "//test/util:temp_path",
+        "//test/util:test_util",
+    ],
+)
+
+cc_library(
     name = "proc_util",
     testonly = 1,
     srcs = ["proc_util.cc"],
@@ -68,7 +83,10 @@ cc_library(
         ":fs_util",
         ":posix_error",
         ":test_util",
+        "@com_google_absl//absl/algorithm:container",
+        "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:optional",
         gtest,
     ],
 )
@@ -153,6 +171,7 @@ cc_library(
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/strings",
         gtest,
+        "@com_google_absl//absl/types:span",
     ],
 )
 
@@ -251,6 +270,7 @@ cc_library(
     hdrs = ["signal_util.h"],
     deps = [
         ":cleanup",
+        ":file_descriptor",
         ":posix_error",
         ":test_util",
         gtest,
@@ -420,15 +440,15 @@ cc_library(
     defines = select_system(),
     deps = default_net_util() + [
         gtest,
-        "@com_google_absl//absl/memory",
-        "@com_google_absl//absl/strings",
-        "@com_google_absl//absl/strings:str_format",
-        "@com_google_absl//absl/time",
-        "@com_google_absl//absl/types:optional",
         "//test/util:file_descriptor",
         "//test/util:posix_error",
         "//test/util:temp_path",
         "//test/util:test_util",
         "//test/util:thread_util",
+        "@com_google_absl//absl/memory",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/time",
+        "@com_google_absl//absl/types:optional",
     ],
 )

@@ -1,12 +1,16 @@
 load("//tools:defs.bzl", "go_library", "go_test")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "gonet",
     srcs = ["gonet.go"],
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/log",
         "//pkg/sync",
         "//pkg/tcpip",
         "//pkg/tcpip/stack",

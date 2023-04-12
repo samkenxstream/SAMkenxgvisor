@@ -131,7 +131,7 @@ func TestLocalPing(t *testing.T) {
 			netProto:           ipv4.ProtocolNumber,
 			linkEndpoint:       loopback.New,
 			icmpBuf:            ipv4ICMPBuf,
-			expectedConnectErr: &tcpip.ErrNoRoute{},
+			expectedConnectErr: &tcpip.ErrHostUnreachable{},
 			checkLinkEndpoint:  func(*testing.T, stack.LinkEndpoint) {},
 		},
 		{
@@ -140,7 +140,7 @@ func TestLocalPing(t *testing.T) {
 			netProto:           ipv6.ProtocolNumber,
 			linkEndpoint:       loopback.New,
 			icmpBuf:            ipv6ICMPBuf,
-			expectedConnectErr: &tcpip.ErrNoRoute{},
+			expectedConnectErr: &tcpip.ErrHostUnreachable{},
 			checkLinkEndpoint:  func(*testing.T, stack.LinkEndpoint) {},
 		},
 		{
@@ -149,7 +149,7 @@ func TestLocalPing(t *testing.T) {
 			netProto:           ipv4.ProtocolNumber,
 			linkEndpoint:       channelEP,
 			icmpBuf:            ipv4ICMPBuf,
-			expectedConnectErr: &tcpip.ErrNoRoute{},
+			expectedConnectErr: &tcpip.ErrHostUnreachable{},
 			checkLinkEndpoint:  channelEPCheck,
 		},
 		{
@@ -158,7 +158,7 @@ func TestLocalPing(t *testing.T) {
 			netProto:           ipv6.ProtocolNumber,
 			linkEndpoint:       channelEP,
 			icmpBuf:            ipv6ICMPBuf,
-			expectedConnectErr: &tcpip.ErrNoRoute{},
+			expectedConnectErr: &tcpip.ErrHostUnreachable{},
 			checkLinkEndpoint:  channelEPCheck,
 		},
 	}
@@ -179,6 +179,7 @@ func TestLocalPing(t *testing.T) {
 						TransportProtocols: []stack.TransportProtocolFactory{icmp.NewProtocol4, icmp.NewProtocol6},
 						HandleLocal:        true,
 					})
+					defer s.Destroy()
 					e := test.linkEndpoint()
 					if err := s.CreateNIC(nicID, e); err != nil {
 						t.Fatalf("s.CreateNIC(%d, _): %s", nicID, err)
@@ -281,7 +282,7 @@ func TestLocalUDP(t *testing.T) {
 		{
 			name:             "Unassigned local address",
 			addAddress:       false,
-			expectedWriteErr: &tcpip.ErrNoRoute{},
+			expectedWriteErr: &tcpip.ErrHostUnreachable{},
 		},
 		{
 			name:             "Assigned local address",
@@ -301,6 +302,7 @@ func TestLocalUDP(t *testing.T) {
 					}
 
 					s := stack.New(stackOpts)
+					defer s.Destroy()
 					ep := channel.New(1, header.IPv6MinimumMTU, "")
 
 					if err := s.CreateNIC(nicID, ep); err != nil {

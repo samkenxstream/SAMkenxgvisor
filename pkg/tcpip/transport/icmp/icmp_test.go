@@ -20,9 +20,9 @@ import (
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/refs"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/checker"
+	"gvisor.dev/gvisor/pkg/tcpip/checksum"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
 	"gvisor.dev/gvisor/pkg/tcpip/link/sniffer"
@@ -97,6 +97,7 @@ func TestWriteUnboundWithBindToDevice(t *testing.T) {
 		TransportProtocols: []stack.TransportProtocolFactory{icmp.NewProtocol4},
 		HandleLocal:        true,
 	})
+	defer s.Destroy()
 
 	// Add two NICs, both with default routes on the same subnet. The first NIC
 	// added will be the default NIC for that subnet.
@@ -141,15 +142,14 @@ func TestWriteUnboundWithBindToDevice(t *testing.T) {
 
 		// Verify the packet was sent out the default NIC.
 		p := defaultEP.Read()
-		if p == nil {
+		if p.IsNil() {
 			t.Fatalf("got defaultEP.Read(_) = _, false; want = _, true (packet wasn't written out)")
 		}
+		defer p.DecRef()
+		v := p.ToView()
+		defer v.Release()
 
-		pkbuf := p.Buffer()
-		b := pkbuf.Flatten()
-		p.DecRef()
-
-		checker.IPv4(t, b, []checker.NetworkChecker{
+		checker.IPv4(t, v, []checker.NetworkChecker{
 			checker.SrcAddr(localV4Addr1),
 			checker.DstAddr(remoteV4Addr),
 			checker.ICMPv4(
@@ -159,7 +159,7 @@ func TestWriteUnboundWithBindToDevice(t *testing.T) {
 		}...)
 
 		// Verify the packet was not sent out the alternate NIC.
-		if p := alternateEP.Read(); p != nil {
+		if p := alternateEP.Read(); !p.IsNil() {
 			t.Fatalf("got alternateEP.Read(_) = %+v, true; want = _, false", p)
 		}
 	}
@@ -184,21 +184,20 @@ func TestWriteUnboundWithBindToDevice(t *testing.T) {
 		}
 
 		// Verify the packet was not sent out the default NIC.
-		if p := defaultEP.Read(); p != nil {
+		if p := defaultEP.Read(); !p.IsNil() {
 			t.Fatalf("got defaultEP.Read(_) = %+v, true; want = _, false", p)
 		}
 
 		// Verify the packet was sent out the alternate NIC.
 		p := alternateEP.Read()
-		if p == nil {
+		if p.IsNil() {
 			t.Fatalf("got alternateEP.Read(_) = _, false; want = _, true (packet wasn't written out)")
 		}
+		defer p.DecRef()
+		v := p.ToView()
+		defer v.Release()
 
-		pkbuf := p.Buffer()
-		b := pkbuf.Flatten()
-		p.DecRef()
-
-		checker.IPv4(t, b, []checker.NetworkChecker{
+		checker.IPv4(t, v, []checker.NetworkChecker{
 			checker.SrcAddr(localV4Addr2),
 			checker.DstAddr(remoteV4Addr),
 			checker.ICMPv4(
@@ -229,15 +228,14 @@ func TestWriteUnboundWithBindToDevice(t *testing.T) {
 
 		// Verify the packet was sent out the default NIC.
 		p := defaultEP.Read()
-		if p == nil {
+		if p.IsNil() {
 			t.Fatalf("got defaultEP.Read(_) = _, false; want = _, true (packet wasn't written out)")
 		}
+		defer p.DecRef()
+		v := p.ToView()
+		defer v.Release()
 
-		pkbuf := p.Buffer()
-		b := pkbuf.Flatten()
-		p.DecRef()
-
-		checker.IPv4(t, b, []checker.NetworkChecker{
+		checker.IPv4(t, v, []checker.NetworkChecker{
 			checker.SrcAddr(localV4Addr1),
 			checker.DstAddr(remoteV4Addr),
 			checker.ICMPv4(
@@ -247,7 +245,7 @@ func TestWriteUnboundWithBindToDevice(t *testing.T) {
 		}...)
 
 		// Verify the packet was not sent out the alternate NIC.
-		if p := alternateEP.Read(); p != nil {
+		if p := alternateEP.Read(); !p.IsNil() {
 			t.Fatalf("got alternateEP.Read(_) = %+v, true; want = _, false", p)
 		}
 	}
@@ -276,7 +274,7 @@ func buildV4EchoReplyPacket(payload []byte, h context.Header4Tuple) ([]byte, []b
 	icmp.SetType(header.ICMPv4EchoReply)
 	icmp.SetCode(header.ICMPv4UnusedCode)
 	icmp.SetIdent(h.Dst.Port)
-	icmp.SetChecksum(^header.Checksum(icmp, 0))
+	icmp.SetChecksum(^checksum.Checksum(icmp, 0))
 
 	return buf, icmp
 }
@@ -307,7 +305,7 @@ func buildV6EchoReplyPacket(payload []byte, h context.Header4Tuple) ([]byte, []b
 		Header:      icmpv6[:header.ICMPv6EchoMinimumSize],
 		Src:         h.Src.Addr,
 		Dst:         h.Dst.Addr,
-		PayloadCsum: header.Checksum(payload, 0),
+		PayloadCsum: checksum.Checksum(payload, 0),
 		PayloadLen:  len(payload),
 	}))
 
@@ -450,6 +448,6 @@ func TestReceiveControlMessages(t *testing.T) {
 func TestMain(m *testing.M) {
 	refs.SetLeakMode(refs.LeaksPanic)
 	code := m.Run()
-	refsvfs2.DoLeakCheck()
+	refs.DoLeakCheck()
 	os.Exit(code)
 }

@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "go_library")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "filter",
@@ -10,6 +13,8 @@ go_library(
         "config_arm64.go",
         "config_profile.go",
         "extra_filters.go",
+        "extra_filters_asan.go",
+        "extra_filters_hostinet.go",
         "extra_filters_msan.go",
         "extra_filters_race.go",
         "extra_filters_race_amd64.go",
@@ -24,6 +29,7 @@ go_library(
         "//pkg/log",
         "//pkg/seccomp",
         "//pkg/sentry/platform",
+        "//pkg/sentry/socket/hostinet",
         "//pkg/tcpip/link/fdbased",
         "@org_golang_x_sys//unix:go_default_library",
     ],

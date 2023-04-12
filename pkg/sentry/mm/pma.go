@@ -373,7 +373,7 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 						return pstart, pseg.PrevGap(), err
 					}
 					// Copy contents.
-					fr, err := mf.AllocateAndFill(uint64(copyAR.Length()), usage.Anonymous, &safemem.BlockSeqReader{mm.internalMappingsLocked(pseg, copyAR)})
+					fr, err := mf.AllocateAndFill(uint64(copyAR.Length()), usage.Anonymous, true /* populate */, &safemem.BlockSeqReader{mm.internalMappingsLocked(pseg, copyAR)})
 					if _, ok := err.(safecopy.BusError); ok {
 						// If we got SIGBUS during the copy, deliver SIGBUS to
 						// userspace (instead of SIGSEGV) if we're breaking
@@ -626,7 +626,27 @@ func (mm *MemoryManager) invalidateLocked(ar hostarch.AddrRange, invalidatePriva
 				// Unmap all of ar, not just pseg.Range(), to minimize host
 				// syscalls. AddressSpace mappings must be removed before
 				// mm.decPrivateRef().
-				mm.unmapASLocked(ar)
+				//
+				// Note that we do more than just ar here, and extrapolate
+				// to the end of any previous region that we may have mapped.
+				// This is done to ensure that lower layers can fully invalidate
+				// intermediate pagetable pages during the unmap.
+				var unmapAR hostarch.AddrRange
+				if prev := pseg.PrevSegment(); prev.Ok() {
+					unmapAR.Start = prev.End()
+				} else {
+					unmapAR.Start = mm.layout.MinAddr
+				}
+				if last := mm.pmas.LowerBoundSegment(ar.End); last.Ok() {
+					if last.Start() < ar.End {
+						unmapAR.End = ar.End
+					} else {
+						unmapAR.End = last.Start()
+					}
+				} else {
+					unmapAR.End = mm.layout.MaxAddr
+				}
+				mm.unmapASLocked(unmapAR)
 				didUnmapAS = true
 			}
 			if pma.private {

@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "go_library")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "utils",
@@ -8,8 +11,9 @@ go_library(
     srcs = ["utils.go"],
     visibility = ["//pkg/tcpip/tests:__subpackages__"],
     deps = [
-        "//pkg/buffer",
+        "//pkg/bufferv2",
         "//pkg/tcpip",
+        "//pkg/tcpip/checksum",
         "//pkg/tcpip/header",
         "//pkg/tcpip/link/channel",
         "//pkg/tcpip/link/ethernet",

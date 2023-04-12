@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "go_library", "go_test")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "sandbox",
@@ -10,8 +13,12 @@ go_library(
         "network_unsafe.go",
         "sandbox.go",
     ],
+    embedsrcs = [
+        "//runsc/sandbox/bpf:af_xdp_ebpf.o",  # keep
+    ],
     visibility = [
         "//runsc:__subpackages__",
+        "//test:__subpackages__",
     ],
     deps = [
         "//pkg/atomicbitops",
@@ -19,15 +26,15 @@ go_library(
         "//pkg/control/client",
         "//pkg/control/server",
         "//pkg/coverage",
-        "//pkg/eventchannel",
         "//pkg/log",
+        "//pkg/metric:metric_go_proto",
+        "//pkg/prometheus",
         "//pkg/sentry/control",
         "//pkg/sentry/platform",
         "//pkg/sentry/seccheck",
         "//pkg/sync",
         "//pkg/tcpip/header",
         "//pkg/tcpip/stack",
-        "//pkg/unet",
         "//pkg/urpc",
         "//runsc/boot",
         "//runsc/boot/procfs",
@@ -37,6 +44,8 @@ go_library(
         "//runsc/donation",
         "//runsc/specutils",
         "@com_github_cenkalti_backoff//:go_default_library",
+        "@com_github_cilium_ebpf//:go_default_library",
+        "@com_github_cilium_ebpf//link:go_default_library",
         "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
         "@com_github_syndtr_gocapability//capability:go_default_library",
         "@com_github_vishvananda_netlink//:go_default_library",

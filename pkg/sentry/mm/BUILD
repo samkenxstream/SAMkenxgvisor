@@ -2,7 +2,10 @@ load("//tools:defs.bzl", "go_library", "go_test")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
 load("//pkg/sync/locking:locking.bzl", "declare_mutex", "declare_rwmutex")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 declare_mutex(
     name = "aio_context_mutex",
@@ -28,6 +31,7 @@ declare_rwmutex(
 declare_rwmutex(
     name = "active_mutex",
     out = "active_mutex.go",
+    nested_lock_names = ["forked"],
     package = "mm",
     prefix = "active",
 )
@@ -121,7 +125,7 @@ go_template_instance(
     out = "aio_mappable_refs.go",
     package = "mm",
     prefix = "aioMappable",
-    template = "//pkg/refsvfs2:refs_template",
+    template = "//pkg/refs:refs_template",
     types = {
         "T": "aioMappable",
     },
@@ -132,7 +136,7 @@ go_template_instance(
     out = "special_mappable_refs.go",
     package = "mm",
     prefix = "SpecialMappable",
-    template = "//pkg/refsvfs2:refs_template",
+    template = "//pkg/refs:refs_template",
     types = {
         "T": "SpecialMappable",
     },
@@ -178,12 +182,9 @@ go_library(
         "//pkg/hostarch",
         "//pkg/log",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/safecopy",
         "//pkg/safemem",
         "//pkg/sentry/arch",
-        "//pkg/sentry/fs/proc/seqfile",
-        "//pkg/sentry/fsbridge",
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/kernel/futex",
         "//pkg/sentry/kernel/shm",
@@ -192,6 +193,7 @@ go_library(
         "//pkg/sentry/pgalloc",
         "//pkg/sentry/platform",
         "//pkg/sentry/usage",
+        "//pkg/sentry/vfs",
         "//pkg/sync",
         "//pkg/sync/locking",
         "//pkg/usermem",

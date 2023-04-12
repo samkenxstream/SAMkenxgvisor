@@ -17,39 +17,53 @@ package gofer
 import (
 	"testing"
 
-	"gvisor.dev/gvisor/pkg/p9"
+	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/lisafs"
 	"gvisor.dev/gvisor/pkg/sentry/contexttest"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/time"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 )
 
 func TestDestroyIdempotent(t *testing.T) {
 	ctx := contexttest.Context(t)
 	fs := filesystem{
-		mfp:              pgalloc.MemoryFileProviderFromContext(ctx),
-		syncableDentries: make(map[*dentry]struct{}),
-		inoByQIDPath:     make(map[uint64]uint64),
-		inoByKey:         make(map[inoKey]uint64),
+		mfp:      pgalloc.MemoryFileProviderFromContext(ctx),
+		inoByKey: make(map[inoKey]uint64),
+		clock:    time.RealtimeClockFromContext(ctx),
 		// Test relies on no dentry being held in the cache.
 		dentryCache: &dentryCache{maxCachedDentries: 0},
+		client:      &lisafs.Client{},
 	}
 
-	attr := &p9.Attr{
-		Mode: p9.ModeRegular,
+	parentInode := lisafs.Inode{
+		ControlFD: 1,
+		Stat: linux.Statx{
+			Mask: linux.STATX_TYPE | linux.STATX_MODE,
+			Mode: linux.S_IFDIR | 0666,
+		},
 	}
-	mask := p9.AttrMask{
-		Mode: true,
-		Size: true,
-	}
-	parent, err := fs.newDentry(ctx, p9file{}, p9.QID{}, mask, attr)
+	parent, err := fs.newLisafsDentry(ctx, &parentInode)
 	if err != nil {
-		t.Fatalf("fs.newDentry(): %v", err)
+		t.Fatalf("fs.newLisafsDentry(): %v", err)
 	}
 
-	child, err := fs.newDentry(ctx, p9file{}, p9.QID{}, mask, attr)
-	if err != nil {
-		t.Fatalf("fs.newDentry(): %v", err)
+	childInode := lisafs.Inode{
+		ControlFD: 2,
+		Stat: linux.Statx{
+			Mask: linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_SIZE,
+			Mode: linux.S_IFREG | 0666,
+			Size: 0,
+		},
 	}
+	child, err := fs.newLisafsDentry(ctx, &childInode)
+	if err != nil {
+		t.Fatalf("fs.newLisafsDentry(): %v", err)
+	}
+	parent.opMu.Lock()
+	parent.childrenMu.Lock()
 	parent.cacheNewChildLocked(child, "child")
+	parent.childrenMu.Unlock()
+	parent.opMu.Unlock()
 
 	fs.renameMu.Lock()
 	defer fs.renameMu.Unlock()
@@ -63,4 +77,26 @@ func TestDestroyIdempotent(t *testing.T) {
 	}
 	child.checkCachingLocked(ctx, true /* renameMuWriteLocked */)
 	child.checkCachingLocked(ctx, true /* renameMuWriteLocked */)
+}
+
+func TestStringFixedCache(t *testing.T) {
+	names := []string{"a", "b", "c"}
+	cache := stringFixedCache{}
+
+	cache.init(uint64(len(names)))
+	if inited := cache.isInited(); !inited {
+		t.Fatalf("cache.isInited(): %v, want: true", inited)
+	}
+	for _, s := range names {
+		victim := cache.add(s)
+		if victim != "" {
+			t.Fatalf("cache.add(): %v, want: \"\"", victim)
+		}
+	}
+	for _, s := range names {
+		victim := cache.add("something")
+		if victim != s {
+			t.Fatalf("cache.add(): %v, want: %v", victim, s)
+		}
+	}
 }

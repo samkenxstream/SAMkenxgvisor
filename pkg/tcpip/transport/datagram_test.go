@@ -168,7 +168,7 @@ func (e *mockEndpoint) Attach(d stack.NetworkDispatcher)      { e.disp = d }
 func (e *mockEndpoint) IsAttached() bool                      { return e.disp != nil }
 func (*mockEndpoint) Wait()                                   {}
 func (*mockEndpoint) ARPHardwareType() header.ARPHardwareType { return header.ARPHardwareNone }
-func (*mockEndpoint) AddHeader(*stack.PacketBuffer)           {}
+func (*mockEndpoint) AddHeader(stack.PacketBufferPtr)         {}
 func (e *mockEndpoint) releasePackets() {
 	e.pkts.DecRef()
 	e.pkts = stack.PacketBufferList{}
@@ -740,7 +740,7 @@ func TestIPv6PacketInfo(t *testing.T) {
 			pktInfo: tcpip.IPv6PacketInfo{
 				NIC: nicID1,
 			},
-			expectedErr: &tcpip.ErrNoRoute{},
+			expectedErr: &tcpip.ErrHostUnreachable{},
 		},
 		{
 			name: "Bind wildcard and NIC & SendTo with packet info NIC matching",
@@ -773,7 +773,7 @@ func TestIPv6PacketInfo(t *testing.T) {
 			pktInfo: tcpip.IPv6PacketInfo{
 				NIC: nicID1,
 			},
-			expectedErr: &tcpip.ErrNoRoute{},
+			expectedErr: &tcpip.ErrHostUnreachable{},
 		},
 		{
 			name: "Bind specified & SendTo with packet info NIC not matching bound addr",
@@ -857,7 +857,7 @@ func TestIPv6PacketInfo(t *testing.T) {
 			pktInfo: tcpip.IPv6PacketInfo{
 				NIC: nicID1,
 			},
-			expectedErr: &tcpip.ErrNoRoute{},
+			expectedErr: &tcpip.ErrHostUnreachable{},
 		},
 		{
 			name: "Bind wildcard & Connect with NIC then Send with packet info NIC matching",
@@ -890,7 +890,7 @@ func TestIPv6PacketInfo(t *testing.T) {
 			pktInfo: tcpip.IPv6PacketInfo{
 				NIC: nicID1,
 			},
-			expectedErr: &tcpip.ErrNoRoute{},
+			expectedErr: &tcpip.ErrHostUnreachable{},
 		},
 		{
 			name: "Bind specified & Connect then Send with packet info NIC not matching but local addr specified",
@@ -907,7 +907,7 @@ func TestIPv6PacketInfo(t *testing.T) {
 				NIC:  nicID1,
 				Addr: ipv6Addr1,
 			},
-			expectedErr: &tcpip.ErrNoRoute{},
+			expectedErr: &tcpip.ErrHostUnreachable{},
 		},
 
 		// Connect
@@ -950,7 +950,7 @@ func TestIPv6PacketInfo(t *testing.T) {
 			pktInfo: tcpip.IPv6PacketInfo{
 				NIC: nicID1,
 			},
-			expectedErr: &tcpip.ErrNoRoute{},
+			expectedErr: &tcpip.ErrHostUnreachable{},
 		},
 		{
 			name: "Connect then Send with packet info NIC not matching",
@@ -962,7 +962,7 @@ func TestIPv6PacketInfo(t *testing.T) {
 			pktInfo: tcpip.IPv6PacketInfo{
 				NIC: nicID1,
 			},
-			expectedErr: &tcpip.ErrNoRoute{},
+			expectedErr: &tcpip.ErrHostUnreachable{},
 		},
 
 		// Connect and SendTo
@@ -1096,7 +1096,7 @@ func TestIPv6PacketInfo(t *testing.T) {
 
 					{
 						p := e1.Read()
-						if p == nil {
+						if p.IsNil() {
 							t.Fatal("packet didn't arrive at ep1")
 						}
 
@@ -1106,7 +1106,7 @@ func TestIPv6PacketInfo(t *testing.T) {
 						)
 					}
 
-					if p := e2.Read(); p != nil {
+					if p := e2.Read(); !p.IsNil() {
 						t.Errorf("unexpected packet from ep2 = %#v", p)
 					}
 				})

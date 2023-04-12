@@ -2,6 +2,8 @@ load("//tools:defs.bzl", "go_library", "go_test")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
 load("//pkg/sync/locking:locking.bzl", "declare_mutex", "declare_rwmutex")
 
+package(default_applicable_licenses = ["//:license"])
+
 licenses(["notice"])
 
 go_template_instance(
@@ -32,7 +34,7 @@ go_template_instance(
     out = "inode_refs.go",
     package = "tmpfs",
     prefix = "inode",
-    template = "//pkg/refsvfs2:refs_template",
+    template = "//pkg/refs:refs_template",
     types = {
         "T": "inode",
     },
@@ -92,17 +94,16 @@ go_library(
         "//pkg/atomicbitops",
         "//pkg/context",
         "//pkg/errors/linuxerr",
+        "//pkg/fd",
         "//pkg/fspath",
         "//pkg/hostarch",
         "//pkg/log",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/safemem",
         "//pkg/sentry/arch",
-        "//pkg/sentry/fs",
-        "//pkg/sentry/fs/fsutil",
-        "//pkg/sentry/fs/lock",
+        "//pkg/sentry/fsimpl/lock",
         "//pkg/sentry/fsmetric",
+        "//pkg/sentry/fsutil",
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/kernel/pipe",
         "//pkg/sentry/kernel/time",
@@ -127,13 +128,9 @@ go_test(
     deps = [
         ":tmpfs",
         "//pkg/abi/linux",
-        "//pkg/context",
-        "//pkg/errors/linuxerr",
         "//pkg/fspath",
         "//pkg/refs",
         "//pkg/sentry/contexttest",
-        "//pkg/sentry/fs",
-        "//pkg/sentry/fs/tmpfs",
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/vfs",
     ],
@@ -156,7 +153,7 @@ go_test(
         "//pkg/errors/linuxerr",
         "//pkg/fspath",
         "//pkg/sentry/contexttest",
-        "//pkg/sentry/fs/lock",
+        "//pkg/sentry/fsimpl/lock",
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/vfs",
         "//pkg/usermem",

@@ -2,6 +2,7 @@ load("//tools:defs.bzl", "go_library")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
 
 package(
+    default_applicable_licenses = ["//:license"],
     default_visibility = ["//:sandbox"],
     licenses = ["notice"],
 )
@@ -11,7 +12,7 @@ go_template_instance(
     out = "namespace_refs.go",
     package = "inet",
     prefix = "namespace",
-    template = "//pkg/refsvfs2:refs_template",
+    template = "//pkg/refs:refs_template",
     types = {
         "T": "Namespace",
     },
@@ -42,7 +43,7 @@ go_library(
         "//pkg/abi/linux",
         "//pkg/atomicbitops",
         "//pkg/context",
-        "//pkg/refsvfs2",
+        "//pkg/refs",
         "//pkg/tcpip",
         "//pkg/tcpip/stack",
     ],

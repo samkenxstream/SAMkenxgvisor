@@ -21,17 +21,16 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	"gvisor.dev/gvisor/pkg/sentry/fs"
-	"gvisor.dev/gvisor/pkg/sentry/fsbridge"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
 // Prctl implements linux syscall prctl(2).
 // It has a list of subfunctions which operate on the process. The arguments are
 // all based on each subfunction.
-func Prctl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func Prctl(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	option := args[0].Int()
 
 	switch option {
@@ -132,12 +131,16 @@ func Prctl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 			defer file.DecRef(t)
 
 			// They trying to set exe to a non-file?
-			if !fs.IsFile(file.Dirent.Inode.StableAttr) {
+			stat, err := file.Stat(t, vfs.StatOptions{Mask: linux.STATX_TYPE})
+			if err != nil {
+				return 0, nil, err
+			}
+			if stat.Mask&linux.STATX_TYPE == 0 || stat.Mode&linux.FileTypeMask != linux.ModeRegular {
 				return 0, nil, linuxerr.EBADF
 			}
 
 			// Set the underlying executable.
-			t.MemoryManager().SetExecutable(t, fsbridge.NewFSFile(file))
+			t.MemoryManager().SetExecutable(t, file)
 
 		case linux.PR_SET_MM_AUXV,
 			linux.PR_SET_MM_START_CODE,
@@ -152,7 +155,7 @@ func Prctl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 			linux.PR_SET_MM_ENV_START,
 			linux.PR_SET_MM_ENV_END:
 
-			t.Kernel().EmitUnimplementedEvent(t)
+			t.Kernel().EmitUnimplementedEvent(t, sysno)
 			fallthrough
 		default:
 			return 0, nil, linuxerr.EINVAL
@@ -231,7 +234,7 @@ func Prctl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 			return 0, nil, nil
 		}
 
-		t.Kernel().EmitUnimplementedEvent(t)
+		t.Kernel().EmitUnimplementedEvent(t, sysno)
 		return 0, nil, linuxerr.EINVAL
 
 	case linux.PR_GET_TIMING,
@@ -251,7 +254,7 @@ func Prctl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 		linux.PR_MPX_ENABLE_MANAGEMENT,
 		linux.PR_MPX_DISABLE_MANAGEMENT:
 
-		t.Kernel().EmitUnimplementedEvent(t)
+		t.Kernel().EmitUnimplementedEvent(t, sysno)
 		fallthrough
 	default:
 		return 0, nil, linuxerr.EINVAL

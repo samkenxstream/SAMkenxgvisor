@@ -471,7 +471,7 @@ TEST(SendFileTest, SendToNotARegularFile) {
       ASSERT_NO_ERRNO_AND_VALUE(Open(out_file.path(), O_WRONLY));
 
   // Receive an error since a directory is not a regular file.
-  EXPECT_THAT(sendfile(outf.get(), inf.get(), nullptr, 0),
+  EXPECT_THAT(sendfile(outf.get(), inf.get(), nullptr, 1),
               SyscallFailsWithErrno(EINVAL));
 }
 
@@ -634,7 +634,7 @@ TEST(SendFileTest, SendFileToSelf) {
 TEST(SendFileTest, LargeCount) {
   // Create input file with some wisdom. It is imperative to use a
   // Shakespearean quote, consistent with the rest of this file.
-  constexpr std::string_view kData =
+  constexpr absl::string_view kData =
       "We know what we are, but know not what we may be.";
   const TempPath in_file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
       GetAbsoluteTestTmpdir(), kData, TempPath::kDefaultFileMode));

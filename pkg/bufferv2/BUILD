@@ -1,14 +1,17 @@
 load("//tools:defs.bzl", "go_library", "go_test")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_template_instance(
     name = "chunk_refs",
     out = "chunk_refs.go",
     package = "bufferv2",
     prefix = "chunk",
-    template = "//pkg/refsvfs2:refs_template",
+    template = "//pkg/refs:refs_template",
     types = {
         "T": "chunk",
     },
@@ -45,8 +48,9 @@ go_library(
         "//pkg/ilist",
         "//pkg/log",
         "//pkg/pool",
-        "//pkg/refsvfs2",
+        "//pkg/refs",
         "//pkg/sync",
+        "//pkg/tcpip/checksum",
     ],
 )
 
@@ -59,6 +63,7 @@ go_test(
     library = ":bufferv2",
     deps = [
         "//pkg/state",
+        "//pkg/tcpip/checksum",
         "@com_github_google_go_cmp//cmp:go_default_library",
     ],
 )

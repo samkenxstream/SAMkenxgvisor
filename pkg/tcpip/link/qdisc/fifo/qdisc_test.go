@@ -20,9 +20,8 @@ import (
 	"testing"
 	"time"
 
-	"gvisor.dev/gvisor/pkg/buffer"
+	"gvisor.dev/gvisor/pkg/bufferv2"
 	"gvisor.dev/gvisor/pkg/refs"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/link/qdisc/fifo"
@@ -68,7 +67,7 @@ func TestFastSimultaneousWrites(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < nWrites; j++ {
 				pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-					Payload: buffer.NewWithData(v),
+					Payload: bufferv2.MakeWithData(v),
 				})
 				pkt.Hash = rand.Uint32()
 				linkEP.WritePacket(pkt)
@@ -84,7 +83,7 @@ func TestWriteRefusedAfterClosed(t *testing.T) {
 	linkEp := fifo.New(nil, 1, 2)
 
 	linkEp.Close()
-	err := linkEp.WritePacket(nil)
+	err := linkEp.WritePacket(stack.PacketBufferPtr{})
 	_, ok := err.(*tcpip.ErrClosedForSend)
 	if !ok {
 		t.Errorf("got err = %s, want %s", err, &tcpip.ErrClosedForSend{})
@@ -101,7 +100,7 @@ func TestWriteMorePacketsThanBatchSize(t *testing.T) {
 		linkEp := fifo.New(lower, 1, 1000)
 		for i := 0; i < want; i++ {
 			pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-				Payload: buffer.NewWithData(v),
+				Payload: bufferv2.MakeWithData(v),
 			})
 			linkEp.WritePacket(pkt)
 			pkt.DecRef()
@@ -118,6 +117,6 @@ func TestWriteMorePacketsThanBatchSize(t *testing.T) {
 func TestMain(m *testing.M) {
 	refs.SetLeakMode(refs.LeaksPanic)
 	code := m.Run()
-	refsvfs2.DoLeakCheck()
+	refs.DoLeakCheck()
 	os.Exit(code)
 }

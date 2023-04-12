@@ -25,10 +25,15 @@ import (
 // FlagSet is an alias for flag.FlagSet.
 type FlagSet = flag.FlagSet
 
+// Flag is an alias for flag.Flag.
+type Flag = flag.Flag
+
 // Aliases for flag functions.
 var (
 	Bool        = flag.Bool
 	CommandLine = flag.CommandLine
+	Duration    = flag.Duration
+	Float64     = flag.Float64
 	Int         = flag.Int
 	Int64       = flag.Int64
 	NewFlagSet  = flag.NewFlagSet
@@ -36,6 +41,7 @@ var (
 	String      = flag.String
 	StringVar   = flag.StringVar
 	Uint        = flag.Uint
+	Uint64      = flag.Uint64
 	Var         = flag.Var
 )
 
@@ -43,6 +49,6 @@ var (
 const ContinueOnError = flag.ContinueOnError
 
 // Get returns the flag's underlying object.
-func Get(v flag.Value) interface{} {
+func Get(v flag.Value) any {
 	return v.(flag.Getter).Get()
 }

@@ -75,7 +75,7 @@ func (c *Create) SetFlags(f *flag.FlagSet) {
 }
 
 // Execute implements subcommands.Command.Execute.
-func (c *Create) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
+func (c *Create) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	if f.NArg() != 1 {
 		f.Usage()
 		return subcommands.ExitUsageError
@@ -96,7 +96,7 @@ func (c *Create) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}
 	if err != nil {
 		return util.Errorf("reading spec: %v", err)
 	}
-	specutils.LogSpec(spec)
+	specutils.LogSpecDebug(spec, conf.OCISeccomp)
 
 	// Create the container. A new sandbox will be created for the
 	// container unless the metadata specifies that it should be run in an

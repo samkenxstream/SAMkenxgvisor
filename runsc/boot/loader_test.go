@@ -18,15 +18,18 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/syndtr/gocapability/capability"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/control/server"
+	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/pkg/p9"
+	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/unet"
@@ -87,31 +90,29 @@ func startGofer(root string) (int, func(), error) {
 		unix.Close(goferEnd)
 		return 0, nil, fmt.Errorf("error creating server on FD %d: %v", goferEnd, err)
 	}
-	at, err := fsgofer.NewAttachPoint(root, fsgofer.Config{ROMount: true})
+	server := fsgofer.NewLisafsServer(fsgofer.Config{})
+	c, err := server.CreateConnection(socket, root, true /* readonly */)
 	if err != nil {
 		return 0, nil, err
 	}
-	go func() {
-		s := p9.NewServer(at)
-		if err := s.Handle(socket); err != nil {
-			log.Infof("Gofer is stopping. FD: %d, err: %v\n", goferEnd, err)
-		}
-	}()
+	server.StartConnection(c)
 	// Closing the gofer socket will stop the gofer and exit goroutine above.
 	cleanup := func() {
 		if err := socket.Close(); err != nil {
 			log.Warningf("Error closing gofer socket: %v", err)
 		}
+		server.Wait()
+		server.Destroy()
 	}
 	return sandboxEnd, cleanup, nil
 }
 
-func createLoader(spec *specs.Spec) (*Loader, func(), error) {
-	fd, err := server.CreateSocket(ControlSocketAddr(fmt.Sprintf("%010d", rand.Int())[:10]))
+func createLoader(conf *config.Config, spec *specs.Spec) (*Loader, func(), error) {
+	sock := fmt.Sprintf("\x00loader-test.%010d", rand.Int())
+	fd, err := server.CreateSocket(sock)
 	if err != nil {
 		return nil, nil, err
 	}
-	conf := testConfig()
 	sandEnd, cleanup, err := startGofer(spec.Root.Path)
 	if err != nil {
 		return nil, nil, err
@@ -135,6 +136,7 @@ func createLoader(spec *specs.Spec) (*Loader, func(), error) {
 		GoferFDs:        []int{sandEnd},
 		StdioFDs:        stdio,
 		PodInitConfigFD: -1,
+		ExecFD:          -1,
 	}
 	l, err := New(args)
 	if err != nil {
@@ -146,7 +148,7 @@ func createLoader(spec *specs.Spec) (*Loader, func(), error) {
 
 // TestRun runs a simple application in a sandbox and checks that it succeeds.
 func TestRun(t *testing.T) {
-	l, cleanup, err := createLoader(testSpec())
+	l, cleanup, err := createLoader(testConfig(), testSpec())
 	if err != nil {
 		t.Fatalf("error creating loader: %v", err)
 	}
@@ -184,7 +186,7 @@ func TestRun(t *testing.T) {
 // TestStartSignal tests that the controller Start message will cause
 // WaitForStartSignal to return.
 func TestStartSignal(t *testing.T) {
-	l, cleanup, err := createLoader(testSpec())
+	l, cleanup, err := createLoader(testConfig(), testSpec())
 	if err != nil {
 		t.Fatalf("error creating loader: %v", err)
 	}
@@ -228,6 +230,53 @@ func TestStartSignal(t *testing.T) {
 		// OK.
 	case <-time.After(50 * time.Millisecond):
 		t.Errorf("WaitForStartSignal did not complete but it should have")
+	}
+}
+
+// Test that network=host with raw sockets enabled requires CAP_NET_RAW on the
+// host.
+func TestHostnetWithRawSockets(t *testing.T) {
+	// Drop CAP_NET_RAW from effective capabilities, if we have it.
+	pid := os.Getpid()
+	caps, err := capability.NewPid2(os.Getpid())
+	if err != nil {
+		t.Fatalf("error getting capabilities for pid %d: %v", pid, err)
+	}
+	if err := caps.Load(); err != nil {
+		t.Fatalf("error loading capabilities: %v", err)
+	}
+	if caps.Get(capability.EFFECTIVE, capability.CAP_NET_RAW) {
+		caps.Unset(capability.EFFECTIVE, capability.CAP_NET_RAW)
+		if err := caps.Apply(capability.EFFECTIVE); err != nil {
+			t.Fatalf("error applying capabilities")
+		}
+		// Be nice and add it back when we are done.
+		defer func() {
+			caps.Set(capability.EFFECTIVE, capability.CAP_NET_RAW)
+			if err := caps.Apply(capability.EFFECTIVE); err != nil {
+				t.Fatalf("error restoring capabilities")
+			}
+		}()
+	}
+
+	// Configure host network with raw sockets.
+	conf := testConfig()
+	conf.Network = config.NetworkHost
+	conf.EnableRaw = true
+
+	// Creating loader should fail.
+	l, err := New(Args{
+		ID:   "should-fail",
+		Spec: testSpec(),
+		Conf: conf,
+	})
+	if err == nil {
+		l.Destroy()
+		t.Fatalf("expected loader.New() to fail but it did not")
+	}
+	// Error message must be about CAP_NET_RAW.
+	if !strings.Contains(err.Error(), "CAP_NET_RAW") {
+		t.Errorf("expected error to contain CAP_NET_RAW but got %q", err)
 	}
 }
 
@@ -413,14 +462,14 @@ func TestCreateMountNamespace(t *testing.T) {
 			spec.Root = tc.spec.Root
 
 			t.Logf("Using root: %q", spec.Root.Path)
-			l, loaderCleanup, err := createLoader(spec)
+			l, loaderCleanup, err := createLoader(testConfig(), spec)
 			if err != nil {
 				t.Fatalf("failed to create loader: %v", err)
 			}
 			defer l.Destroy()
 			defer loaderCleanup()
 
-			mntr := newContainerMounter(&l.root, l.k, l.mountHints, "")
+			mntr := newContainerMounter(&l.root, l.k, l.mountHints, "", l.sandboxID)
 			if err := mntr.processHints(l.root.conf, l.root.procArgs.Credentials); err != nil {
 				t.Fatalf("failed process hints: %v", err)
 			}
@@ -449,4 +498,10 @@ func TestCreateMountNamespace(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMain(m *testing.M) {
+	cpuid.Initialize()
+	seccheck.Initialize()
+	os.Exit(m.Run())
 }

@@ -1,11 +1,14 @@
 load("//tools:defs.bzl", "bzl_library", "more_shards", "most_shards")
 load("//test/runtimes:defs.bzl", "runtime_test")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 runtime_test(
-    name = "go1.16",
-    exclude_file = "exclude/go1.16.csv",
+    name = "go1.20",
+    exclude_file = "exclude/go1.20.csv",
     lang = "go",
     shard_count = more_shards,
 )

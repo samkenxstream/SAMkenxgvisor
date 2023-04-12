@@ -18,11 +18,13 @@ package sandbox
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -37,13 +39,13 @@ import (
 	"gvisor.dev/gvisor/pkg/control/client"
 	"gvisor.dev/gvisor/pkg/control/server"
 	"gvisor.dev/gvisor/pkg/coverage"
-	"gvisor.dev/gvisor/pkg/eventchannel"
 	"gvisor.dev/gvisor/pkg/log"
+	metricpb "gvisor.dev/gvisor/pkg/metric/metric_go_proto"
+	"gvisor.dev/gvisor/pkg/prometheus"
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sync"
-	"gvisor.dev/gvisor/pkg/unet"
 	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/boot/procfs"
@@ -53,6 +55,40 @@ import (
 	"gvisor.dev/gvisor/runsc/donation"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
+
+const (
+	// namespaceAnnotation is a pod annotation populated by containerd.
+	// It contains the name of the pod that a sandbox is in when running in Kubernetes.
+	podNameAnnotation = "io.kubernetes.cri.sandbox-name"
+
+	// namespaceAnnotation is a pod annotation populated by containerd.
+	// It contains the namespace of the pod that a sandbox is in when running in Kubernetes.
+	namespaceAnnotation = "io.kubernetes.cri.sandbox-namespace"
+)
+
+// createControlSocket finds a location and creates the socket used to
+// communicate with the sandbox.
+func createControlSocket(rootDir, id string) (string, int, error) {
+	name := fmt.Sprintf("runsc-%s.sock", id)
+
+	// Only use absolute paths to guarantee resolution from anywhere.
+	var paths []string
+	for _, dir := range []string{rootDir, "/var/run", "/run", "/tmp"} {
+		paths = append(paths, filepath.Join(dir, name))
+	}
+	// If nothing else worked, use the abstract namespace.
+	paths = append(paths, fmt.Sprintf("\x00runsc-sandbox.%s", id))
+
+	for _, path := range paths {
+		log.Debugf("Attempting to create socket file %q", path)
+		fd, err := server.CreateSocket(path)
+		if err == nil {
+			log.Debugf("Using socket file %q", path)
+			return path, fd, nil
+		}
+	}
+	return "", -1, fmt.Errorf("unable to find location to write socket file")
+}
 
 // pid is an atomic type that implements JSON marshal/unmarshal interfaces.
 type pid struct {
@@ -96,6 +132,14 @@ type Sandbox struct {
 	// ID as the first container run in the sandbox.
 	ID string `json:"id"`
 
+	// PodName is the name of the Kubernetes Pod (if any) that this sandbox
+	// represents. Unset if not running under containerd or Kubernetes.
+	PodName string `json:"podName"`
+
+	// Namespace is the Kubernetes namespace (if any) of the pod that this
+	// sandbox represents. Unset if not running under containerd or Kubernetes.
+	Namespace string `json:"namespace"`
+
 	// Pid is the pid of the running sandbox. May be 0 if the sandbox
 	// is not running.
 	Pid pid `json:"pid"`
@@ -112,6 +156,27 @@ type Sandbox struct {
 	// OriginalOOMScoreAdj stores the value of oom_score_adj when the sandbox
 	// started, before it may be modified.
 	OriginalOOMScoreAdj int `json:"originalOomScoreAdj"`
+
+	// RegisteredMetrics is the set of metrics registered in the sandbox.
+	// Used for verifying metric data integrity after containers are started.
+	// Only populated if exporting metrics was requested when the sandbox was
+	// created.
+	RegisteredMetrics *metricpb.MetricRegistration `json:"registeredMetrics"`
+
+	// MetricMetadata are key-value pairs that are useful to export about this
+	// sandbox, but not part of the set of labels that uniquely identify it.
+	// They are static once initialized, and typically contain high-level
+	// configuration information about the sandbox.
+	MetricMetadata map[string]string `json:"metricMetadata"`
+
+	// MetricServerAddress is the address of the metric server that this sandbox
+	// intends to export metrics for.
+	// Only populated if exporting metrics was requested when the sandbox was
+	// created.
+	MetricServerAddress string `json:"metricServerAddress"`
+
+	// ControlAddress is the uRPC address used to connect to the sandbox.
+	ControlAddress string `json:"control_address"`
 
 	// child is set if a sandbox process is a child of the current process.
 	//
@@ -152,10 +217,14 @@ type Args struct {
 	// UserLog is the filename to send user-visible logs to. It may be empty.
 	UserLog string
 
-	// IOFiles is the list of files that connect to a 9P endpoint for the mounts
-	// points using Gofers. They must be in the same order as mounts appear in
-	// the spec.
+	// IOFiles is the list of files that connect to a gofer endpoint for the
+	// mounts points using Gofers. They must be in the same order as mounts
+	// appear in the spec.
 	IOFiles []*os.File
+
+	// OverlayFilestoreFiles are the regular files that will back the tmpfs upper
+	// mount in the overlay mounts.
+	OverlayFilestoreFiles []*os.File
 
 	// MountsFile is a file container mount information from the spec. It's
 	// equivalent to the mounts from the spec, except that all paths have been
@@ -172,6 +241,13 @@ type Args struct {
 	// SinkFiles is the an ordered array of files to be used by seccheck sinks
 	// configured from the --pod-init-config file.
 	SinkFiles []*os.File
+
+	// PassFiles are user-supplied files from the host to be exposed to the
+	// sandboxed app.
+	PassFiles map[int]*os.File
+
+	// ExecFile is the file from the host used for program execution.
+	ExecFile *os.File
 }
 
 // New creates the sandbox process. The caller must call Destroy() on the
@@ -180,12 +256,18 @@ func New(conf *config.Config, args *Args) (*Sandbox, error) {
 	s := &Sandbox{
 		ID: args.ID,
 		CgroupJSON: cgroup.CgroupJSON{
-			Cgroup:     args.Cgroup,
-			UseSystemd: conf.SystemdCgroup,
+			Cgroup: args.Cgroup,
 		},
-		UID: -1, // prevent usage before it's set.
-		GID: -1, // prevent usage before it's set.
+		UID:                 -1, // prevent usage before it's set.
+		GID:                 -1, // prevent usage before it's set.
+		MetricMetadata:      conf.MetricMetadata(),
+		MetricServerAddress: conf.MetricServer,
 	}
+	if args.Spec != nil && args.Spec.Annotations != nil {
+		s.PodName = args.Spec.Annotations[podNameAnnotation]
+		s.Namespace = args.Spec.Annotations[namespaceAnnotation]
+	}
+
 	// The Cleanup object cleans up partially created sandboxes when an error
 	// occurs. Any errors occurring during cleanup itself are ignored.
 	c := cleanup.Make(func() {
@@ -240,6 +322,17 @@ func New(conf *config.Config, args *Args) (*Sandbox, error) {
 		return nil, fmt.Errorf("cannot read client sync file: %w", err)
 	}
 
+	if conf.MetricServer != "" {
+		// The control server is up and the sandbox was configured to export metrics.
+		// We must gather data about registered metrics prior to any process starting in the sandbox.
+		log.Debugf("Getting metric registration information from sandbox %q", s.ID)
+		var registeredMetrics control.MetricsRegistrationResponse
+		if err := s.call(boot.MetricsGetRegistered, nil, &registeredMetrics); err != nil {
+			return nil, fmt.Errorf("cannot get registered metrics: %v", err)
+		}
+		s.RegisteredMetrics = registeredMetrics.RegisteredMetrics
+	}
+
 	c.Release()
 	return s, nil
 }
@@ -256,18 +349,12 @@ func (s *Sandbox) CreateSubcontainer(conf *config.Config, cid string, tty *os.Fi
 		return err
 	}
 
-	sandboxConn, err := s.sandboxConnect()
-	if err != nil {
-		return fmt.Errorf("couldn't connect to sandbox: %v", err)
-	}
-	defer sandboxConn.Close()
-
 	args := boot.CreateArgs{
 		CID:         cid,
 		FilePayload: urpc.FilePayload{Files: files},
 	}
-	if err := sandboxConn.Call(boot.ContMgrCreateSubcontainer, &args, nil); err != nil {
-		return fmt.Errorf("creating sub-container %q: %v", cid, err)
+	if err := s.call(boot.ContMgrCreateSubcontainer, &args, nil); err != nil {
+		return fmt.Errorf("creating sub-container %q: %w", cid, err)
 	}
 	return nil
 }
@@ -284,47 +371,45 @@ func (s *Sandbox) StartRoot(spec *specs.Spec, conf *config.Config) error {
 
 	// Configure the network.
 	if err := setupNetwork(conn, pid, conf); err != nil {
-		return fmt.Errorf("setting up network: %v", err)
+		return fmt.Errorf("setting up network: %w", err)
 	}
 
-	// Send a message to the sandbox control server to start the root
-	// container.
+	// Send a message to the sandbox control server to start the root container.
 	if err := conn.Call(boot.ContMgrRootContainerStart, &s.ID, nil); err != nil {
-		return fmt.Errorf("starting root container: %v", err)
+		return fmt.Errorf("starting root container: %w", err)
 	}
 
 	return nil
 }
 
 // StartSubcontainer starts running a sub-container inside the sandbox.
-func (s *Sandbox) StartSubcontainer(spec *specs.Spec, conf *config.Config, cid string, stdios, goferFiles []*os.File) error {
+func (s *Sandbox) StartSubcontainer(spec *specs.Spec, conf *config.Config, cid string, stdios, goferFiles, overlayFilestoreFiles []*os.File) error {
 	log.Debugf("Start sub-container %q in sandbox %q, PID: %d", cid, s.ID, s.Pid.load())
 
 	if err := s.configureStdios(conf, stdios); err != nil {
 		return err
 	}
 
-	sandboxConn, err := s.sandboxConnect()
-	if err != nil {
-		return fmt.Errorf("couldn't connect to sandbox: %v", err)
-	}
-	defer sandboxConn.Close()
-
-	// The payload must contain stdin/stdout/stderr (which may be empty if using
-	// TTY) followed by gofer files.
+	// The payload contains (in this specific order):
+	// * stdin/stdout/stderr (optional: only present when not using TTY)
+	// * The subcontainer's overlay filestore files (optional: only present when
+	//   host file backed overlay is configured)
+	// * Gofer files.
 	payload := urpc.FilePayload{}
 	payload.Files = append(payload.Files, stdios...)
+	payload.Files = append(payload.Files, overlayFilestoreFiles...)
 	payload.Files = append(payload.Files, goferFiles...)
 
 	// Start running the container.
 	args := boot.StartArgs{
-		Spec:        spec,
-		Conf:        conf,
-		CID:         cid,
-		FilePayload: payload,
+		Spec:                   spec,
+		Conf:                   conf,
+		CID:                    cid,
+		NumOverlayFilestoreFDs: len(overlayFilestoreFiles),
+		FilePayload:            payload,
 	}
-	if err := sandboxConn.Call(boot.ContMgrStartSubcontainer, &args, nil); err != nil {
-		return fmt.Errorf("starting sub-container %v: %v", spec.Process.Args, err)
+	if err := s.call(boot.ContMgrStartSubcontainer, &args, nil); err != nil {
+		return fmt.Errorf("starting sub-container %v: %w", spec.Process.Args, err)
 	}
 	return nil
 }
@@ -377,14 +462,8 @@ func (s *Sandbox) Restore(cid string, spec *specs.Spec, conf *config.Config, fil
 // given container in this sandbox.
 func (s *Sandbox) Processes(cid string) ([]*control.Process, error) {
 	log.Debugf("Getting processes for container %q in sandbox %q", cid, s.ID)
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-
 	var pl []*control.Process
-	if err := conn.Call(boot.ContMgrProcesses, &cid, &pl); err != nil {
+	if err := s.call(boot.ContMgrProcesses, &cid, &pl); err != nil {
 		return nil, fmt.Errorf("retrieving process data from sandbox: %v", err)
 	}
 	return pl, nil
@@ -404,12 +483,6 @@ func (s *Sandbox) CreateTraceSession(config *seccheck.SessionConfig, force bool)
 		}
 	}()
 
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
 	arg := boot.CreateTraceSessionArgs{
 		Config: *config,
 		Force:  force,
@@ -417,7 +490,7 @@ func (s *Sandbox) CreateTraceSession(config *seccheck.SessionConfig, force bool)
 			Files: sinkFiles,
 		},
 	}
-	if err := conn.Call(boot.ContMgrCreateTraceSession, &arg, nil); err != nil {
+	if err := s.call(boot.ContMgrCreateTraceSession, &arg, nil); err != nil {
 		return fmt.Errorf("creating trace session: %w", err)
 	}
 	return nil
@@ -426,13 +499,7 @@ func (s *Sandbox) CreateTraceSession(config *seccheck.SessionConfig, force bool)
 // DeleteTraceSession deletes an existing trace session.
 func (s *Sandbox) DeleteTraceSession(name string) error {
 	log.Debugf("Deleting trace session %q in sandbox %q", name, s.ID)
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	if err := conn.Call(boot.ContMgrDeleteTraceSession, name, nil); err != nil {
+	if err := s.call(boot.ContMgrDeleteTraceSession, name, nil); err != nil {
 		return fmt.Errorf("deleting trace session: %w", err)
 	}
 	return nil
@@ -441,14 +508,8 @@ func (s *Sandbox) DeleteTraceSession(name string) error {
 // ListTraceSessions lists all trace sessions.
 func (s *Sandbox) ListTraceSessions() ([]seccheck.SessionConfig, error) {
 	log.Debugf("Listing trace sessions in sandbox %q", s.ID)
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-
 	var sessions []seccheck.SessionConfig
-	if err := conn.Call(boot.ContMgrListTraceSessions, nil, &sessions); err != nil {
+	if err := s.call(boot.ContMgrListTraceSessions, nil, &sessions); err != nil {
 		return nil, fmt.Errorf("listing trace session: %w", err)
 	}
 	return sessions, nil
@@ -457,15 +518,9 @@ func (s *Sandbox) ListTraceSessions() ([]seccheck.SessionConfig, error) {
 // ProcfsDump collects and returns a procfs dump for the sandbox.
 func (s *Sandbox) ProcfsDump() ([]procfs.ProcessProcfsDump, error) {
 	log.Debugf("Procfs dump %q", s.ID)
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-
 	var procfsDump []procfs.ProcessProcfsDump
-	if err := conn.Call(boot.ContMgrProcfsDump, nil, &procfsDump); err != nil {
-		return nil, fmt.Errorf("getting sandbox %q stacks: %v", s.ID, err)
+	if err := s.call(boot.ContMgrProcfsDump, nil, &procfsDump); err != nil {
+		return nil, fmt.Errorf("getting sandbox %q stacks: %w", s.ID, err)
 	}
 	return procfsDump, nil
 }
@@ -480,20 +535,24 @@ func (s *Sandbox) NewCGroup() (cgroup.Cgroup, error) {
 func (s *Sandbox) Execute(conf *config.Config, args *control.ExecArgs) (int32, error) {
 	log.Debugf("Executing new process in container %q in sandbox %q", args.ContainerID, s.ID)
 
-	if err := s.configureStdios(conf, args.Files); err != nil {
+	// Stdios are those files which have an FD <= 2 in the process. We do not
+	// want the ownership of other files to be changed by configureStdios.
+	var stdios []*os.File
+	for i, fd := range args.GuestFDs {
+		if fd > 2 || i >= len(args.Files) {
+			continue
+		}
+		stdios = append(stdios, args.Files[i])
+	}
+
+	if err := s.configureStdios(conf, stdios); err != nil {
 		return 0, err
 	}
 
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return 0, s.connError(err)
-	}
-	defer conn.Close()
-
 	// Send a message to the sandbox control server to start the container.
 	var pid int32
-	if err := conn.Call(boot.ContMgrExecuteAsync, args, &pid); err != nil {
-		return 0, fmt.Errorf("executing command %q in sandbox: %v", args, err)
+	if err := s.call(boot.ContMgrExecuteAsync, args, &pid); err != nil {
+		return 0, fmt.Errorf("executing command %q in sandbox: %w", args, err)
 	}
 	return pid, nil
 }
@@ -501,29 +560,49 @@ func (s *Sandbox) Execute(conf *config.Config, args *control.ExecArgs) (int32, e
 // Event retrieves stats about the sandbox such as memory and CPU utilization.
 func (s *Sandbox) Event(cid string) (*boot.EventOut, error) {
 	log.Debugf("Getting events for container %q in sandbox %q", cid, s.ID)
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-
 	var e boot.EventOut
 	// TODO(b/129292330): Pass in the container id (cid) here. The sandbox
 	// should return events only for that container.
-	if err := conn.Call(boot.ContMgrEvent, nil, &e); err != nil {
-		return nil, fmt.Errorf("retrieving event data from sandbox: %v", err)
+	if err := s.call(boot.ContMgrEvent, nil, &e); err != nil {
+		return nil, fmt.Errorf("retrieving event data from sandbox: %w", err)
 	}
 	e.Event.ID = cid
 	return &e, nil
 }
 
+// PortForward starts port forwarding to the sandbox.
+func (s *Sandbox) PortForward(opts *boot.PortForwardOpts) error {
+	log.Debugf("Requesting port forward for container %q in sandbox %q: %+v", opts.ContainerID, s.ID, opts)
+	conn, err := s.sandboxConnect()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	if err := conn.Call(boot.ContMgrPortForward, opts, nil); err != nil {
+		return fmt.Errorf("port forwarding to sandbox: %v", err)
+	}
+
+	return nil
+}
+
 func (s *Sandbox) sandboxConnect() (*urpc.Client, error) {
 	log.Debugf("Connecting to sandbox %q", s.ID)
-	conn, err := client.ConnectTo(boot.ControlSocketAddr(s.ID))
+	conn, err := client.ConnectTo(s.ControlAddress)
 	if err != nil {
 		return nil, s.connError(err)
 	}
 	return conn, nil
+}
+
+func (s *Sandbox) call(method string, arg, result any) error {
+	conn, err := s.sandboxConnect()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	return conn.Call(method, arg, result)
 }
 
 func (s *Sandbox) connError(err error) error {
@@ -535,6 +614,28 @@ func (s *Sandbox) connError(err error) error {
 func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyncFile *os.File) error {
 	donations := donation.Agency{}
 	defer donations.Close()
+
+	// pgalloc.MemoryFile (which provides application memory) sometimes briefly
+	// mlock(2)s ranges of memory in order to fault in a large number of pages at
+	// a time. Try to make RLIMIT_MEMLOCK unlimited so that it can do so. runsc
+	// expects to run in a memory cgroup that limits its memory usage as
+	// required.
+	// This needs to be done before exec'ing `runsc boot`, as that subcommand
+	// runs as an unprivileged user that will not be able to call `setrlimit`
+	// by itself. Calling `setrlimit` here will have the side-effect of setting
+	// the limit on the currently-running `runsc` process as well, but that
+	// should be OK too.
+	var rlim unix.Rlimit
+	if err := unix.Getrlimit(unix.RLIMIT_MEMLOCK, &rlim); err != nil {
+		log.Warningf("Failed to get RLIMIT_MEMLOCK: %v", err)
+	} else if rlim.Cur != unix.RLIM_INFINITY || rlim.Max != unix.RLIM_INFINITY {
+		rlim.Cur = unix.RLIM_INFINITY
+		rlim.Max = unix.RLIM_INFINITY
+		if err := unix.Setrlimit(unix.RLIMIT_MEMLOCK, &rlim); err != nil {
+			// We may not have CAP_SYS_RESOURCE, so this failure may be expected.
+			log.Infof("Failed to set RLIMIT_MEMLOCK: %v", err)
+		}
+	}
 
 	//
 	// These flags must come BEFORE the "boot" command in cmd.Args.
@@ -552,8 +653,10 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 			test = t
 		}
 	}
-	if err := donations.DonateDebugLogFile("debug-log-fd", conf.DebugLog, "boot", test); err != nil {
-		return err
+	if specutils.IsDebugCommand(conf, "boot") {
+		if err := donations.DonateDebugLogFile("debug-log-fd", conf.DebugLog, "boot", test); err != nil {
+			return err
+		}
 	}
 	if err := donations.DonateDebugLogFile("panic-log-fd", conf.PanicLog, "panic", test); err != nil {
 		return err
@@ -591,6 +694,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 
 	// If there is a gofer, sends all socket ends to the sandbox.
 	donations.DonateAndClose("io-fds", args.IOFiles...)
+	donations.DonateAndClose("overlay-filestore-fds", args.OverlayFilestoreFiles...)
 	donations.DonateAndClose("mounts-fd", args.MountsFile)
 	donations.Donate("start-sync-fd", startSyncFile)
 	if err := donations.OpenAndDonate("user-log-fd", args.UserLog, os.O_CREATE|os.O_WRONLY|os.O_APPEND); err != nil {
@@ -614,12 +718,12 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	}
 
 	// Create a socket for the control server and donate it to the sandbox.
-	addr := boot.ControlSocketAddr(s.ID)
-	sockFD, err := server.CreateSocket(addr)
-	log.Infof("Creating sandbox process with addr: %s", addr[1:]) // skip "\00".
+	controlAddress, sockFD, err := createControlSocket(conf.RootDir, s.ID)
 	if err != nil {
-		return fmt.Errorf("creating control server socket for sandbox %q: %v", s.ID, err)
+		return fmt.Errorf("creating control socket %q: %v", s.ControlAddress, err)
 	}
+	log.Infof("Control socket: %q", s.ControlAddress)
+	s.ControlAddress = controlAddress
 	donations.DonateAndClose("controller-fd", os.NewFile(uintptr(sockFD), "control_server_socket"))
 
 	specFile, err := specutils.OpenSpec(args.BundleDir)
@@ -689,14 +793,17 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	s.UID = os.Getuid()
 	s.GID = os.Getgid()
 
-	// User namespace depends on the network type. Host network requires to run
-	// inside the user namespace specified in the spec or the current namespace
-	// if none is configured.
-	if conf.Network == config.NetworkHost {
+	// User namespace depends on the network type or whether access to the host
+	// filesystem is required. These features require to run inside the user
+	// namespace specified in the spec or the current namespace if none is
+	// configured.
+	if conf.Network == config.NetworkHost || conf.DirectFS {
 		if userns, ok := specutils.GetNS(specs.UserNamespace, args.Spec); ok {
 			log.Infof("Sandbox will be started in container's user namespace: %+v", userns)
 			nss = append(nss, userns)
 			specutils.SetUIDGIDMappings(cmd, args.Spec)
+			// We need to set UID and GID to have capabilities in a new user namespace.
+			cmd.SysProcAttr.Credential = &syscall.Credential{Uid: 0, Gid: 0}
 		} else {
 			log.Infof("Sandbox will be started in the current user namespace")
 		}
@@ -709,7 +816,6 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		// bind-mount the executable inside it.
 		if conf.TestOnlyAllowRunAsCurrentUserWithoutChroot {
 			log.Warningf("Running sandbox in test mode without chroot. This is only safe in tests!")
-
 		} else if specutils.HasCapabilities(capability.CAP_SYS_ADMIN) {
 			log.Infof("Sandbox will be started in minimal chroot")
 			cmd.Args = append(cmd.Args, "--setup-root")
@@ -717,18 +823,19 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 			return fmt.Errorf("can't run sandbox process in minimal chroot since we don't have CAP_SYS_ADMIN")
 		}
 	} else {
+		rootlessEUID := unix.Getuid() != 0
 		// If we have CAP_SETUID and CAP_SETGID, then we can also run
 		// as user nobody.
 		if conf.TestOnlyAllowRunAsCurrentUserWithoutChroot {
 			log.Warningf("Running sandbox in test mode as current user (uid=%d gid=%d). This is only safe in tests!", os.Getuid(), os.Getgid())
 			log.Warningf("Running sandbox in test mode without chroot. This is only safe in tests!")
-		} else if specutils.HasCapabilities(capability.CAP_SETUID, capability.CAP_SETGID) {
+		} else if rootlessEUID || specutils.HasCapabilities(capability.CAP_SETUID, capability.CAP_SETGID) {
 			log.Infof("Sandbox will be started in new user namespace")
 			nss = append(nss, specs.LinuxNamespace{Type: specs.UserNamespace})
 			cmd.Args = append(cmd.Args, "--setup-root")
 
 			const nobody = 65534
-			if conf.Rootless {
+			if rootlessEUID || conf.Rootless {
 				log.Infof("Rootless mode: sandbox will run as nobody inside user namespace, mapped to the current user, uid: %d, gid: %d", os.Getuid(), os.Getgid())
 			} else {
 				// Map nobody in the new namespace to nobody in the parent namespace.
@@ -877,8 +984,13 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		cmd.Args = append(cmd.Args, "--attached")
 	}
 
-	// nextFD must not be used beyond this point.
-	_ = donations.Transfer(cmd, nextFD)
+	if args.ExecFile != nil {
+		donations.Donate("exec-fd", args.ExecFile)
+	}
+
+	nextFD = donations.Transfer(cmd, nextFD)
+
+	_ = donation.DonateAndTransferCustomFiles(cmd, nextFD, args.PassFiles)
 
 	// Add container ID as the last argument.
 	cmd.Args = append(cmd.Args, s.ID)
@@ -971,18 +1083,12 @@ func (s *Sandbox) Wait(cid string) (unix.WaitStatus, error) {
 func (s *Sandbox) WaitPID(cid string, pid int32) (unix.WaitStatus, error) {
 	log.Debugf("Waiting for PID %d in sandbox %q", pid, s.ID)
 	var ws unix.WaitStatus
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return ws, err
-	}
-	defer conn.Close()
-
 	args := &boot.WaitPIDArgs{
 		PID: pid,
 		CID: cid,
 	}
-	if err := conn.Call(boot.ContMgrWaitPID, args, &ws); err != nil {
-		return ws, fmt.Errorf("waiting on PID %d in sandbox %q: %v", pid, s.ID, err)
+	if err := s.call(boot.ContMgrWaitPID, args, &ws); err != nil {
+		return ws, fmt.Errorf("waiting on PID %d in sandbox %q: %w", pid, s.ID, err)
 	}
 	return ws, nil
 }
@@ -996,15 +1102,21 @@ func (s *Sandbox) IsRootContainer(cid string) bool {
 // Destroy frees all resources associated with the sandbox. It fails fast and
 // is idempotent.
 func (s *Sandbox) destroy() error {
-	log.Debugf("Destroy sandbox %q", s.ID)
+	log.Debugf("Destroying sandbox %q", s.ID)
+	// Only delete the control file if it exists and is not an abstract UDS.
+	if len(s.ControlAddress) > 0 && s.ControlAddress[0] != 0 {
+		if err := os.Remove(s.ControlAddress); err != nil {
+			log.Warningf("failed to delete control socket file %q: %v", s.ControlAddress, err)
+		}
+	}
 	pid := s.Pid.load()
 	if pid != 0 {
 		log.Debugf("Killing sandbox %q", s.ID)
 		if err := unix.Kill(pid, unix.SIGKILL); err != nil && err != unix.ESRCH {
-			return fmt.Errorf("killing sandbox %q PID %q: %v", s.ID, pid, err)
+			return fmt.Errorf("killing sandbox %q PID %q: %w", s.ID, pid, err)
 		}
 		if err := s.waitForStopped(); err != nil {
-			return fmt.Errorf("waiting sandbox %q stop: %v", s.ID, err)
+			return fmt.Errorf("waiting sandbox %q stop: %w", s.ID, err)
 		}
 	}
 
@@ -1016,12 +1128,6 @@ func (s *Sandbox) destroy() error {
 // returning.
 func (s *Sandbox) SignalContainer(cid string, sig unix.Signal, all bool) error {
 	log.Debugf("Signal sandbox %q", s.ID)
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
 	mode := boot.DeliverToProcess
 	if all {
 		mode = boot.DeliverToAllProcesses
@@ -1032,8 +1138,8 @@ func (s *Sandbox) SignalContainer(cid string, sig unix.Signal, all bool) error {
 		Signo: int32(sig),
 		Mode:  mode,
 	}
-	if err := conn.Call(boot.ContMgrSignal, &args, nil); err != nil {
-		return fmt.Errorf("signaling container %q: %v", cid, err)
+	if err := s.call(boot.ContMgrSignal, &args, nil); err != nil {
+		return fmt.Errorf("signaling container %q: %w", cid, err)
 	}
 	return nil
 }
@@ -1044,11 +1150,6 @@ func (s *Sandbox) SignalContainer(cid string, sig unix.Signal, all bool) error {
 // is attached to a host TTY.
 func (s *Sandbox) SignalProcess(cid string, pid int32, sig unix.Signal, fgProcess bool) error {
 	log.Debugf("Signal sandbox %q", s.ID)
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
 
 	mode := boot.DeliverToProcess
 	if fgProcess {
@@ -1061,7 +1162,7 @@ func (s *Sandbox) SignalProcess(cid string, pid int32, sig unix.Signal, fgProces
 		PID:   pid,
 		Mode:  mode,
 	}
-	if err := conn.Call(boot.ContMgrSignal, &args, nil); err != nil {
+	if err := s.call(boot.ContMgrSignal, &args, nil); err != nil {
 		return fmt.Errorf("signaling container %q PID %d: %v", cid, pid, err)
 	}
 	return nil
@@ -1071,20 +1172,14 @@ func (s *Sandbox) SignalProcess(cid string, pid int32, sig unix.Signal, fgProces
 // The statefile will be written to f.
 func (s *Sandbox) Checkpoint(cid string, f *os.File) error {
 	log.Debugf("Checkpoint sandbox %q", s.ID)
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
 	opt := control.SaveOpts{
 		FilePayload: urpc.FilePayload{
 			Files: []*os.File{f},
 		},
 	}
 
-	if err := conn.Call(boot.ContMgrCheckpoint, &opt, nil); err != nil {
-		return fmt.Errorf("checkpointing container %q: %v", cid, err)
+	if err := s.call(boot.ContMgrCheckpoint, &opt, nil); err != nil {
+		return fmt.Errorf("checkpointing container %q: %w", cid, err)
 	}
 	return nil
 }
@@ -1092,14 +1187,8 @@ func (s *Sandbox) Checkpoint(cid string, f *os.File) error {
 // Pause sends the pause call for a container in the sandbox.
 func (s *Sandbox) Pause(cid string) error {
 	log.Debugf("Pause sandbox %q", s.ID)
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	if err := conn.Call(boot.LifecyclePause, nil, nil); err != nil {
-		return fmt.Errorf("pausing container %q: %v", cid, err)
+	if err := s.call(boot.LifecyclePause, nil, nil); err != nil {
+		return fmt.Errorf("pausing container %q: %w", cid, err)
 	}
 	return nil
 }
@@ -1107,118 +1196,63 @@ func (s *Sandbox) Pause(cid string) error {
 // Resume sends the resume call for a container in the sandbox.
 func (s *Sandbox) Resume(cid string) error {
 	log.Debugf("Resume sandbox %q", s.ID)
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	if err := conn.Call(boot.LifecycleResume, nil, nil); err != nil {
-		return fmt.Errorf("resuming container %q: %v", cid, err)
-	}
-	return nil
-}
-
-// Cat sends the cat call for a container in the sandbox.
-func (s *Sandbox) Cat(cid string, files []string, out *os.File) error {
-	log.Debugf("Cat sandbox %q", s.ID)
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	if err := conn.Call(boot.FsCat, &control.CatOpts{
-		Files:       files,
-		FilePayload: urpc.FilePayload{Files: []*os.File{out}},
-	}, nil); err != nil {
-		return fmt.Errorf("Cat container %q: %v", cid, err)
+	if err := s.call(boot.LifecycleResume, nil, nil); err != nil {
+		return fmt.Errorf("resuming container %q: %w", cid, err)
 	}
 	return nil
 }
 
 // Usage sends the collect call for a container in the sandbox.
-func (s *Sandbox) Usage(cid string, Full bool) (control.MemoryUsage, error) {
+func (s *Sandbox) Usage(Full bool) (control.MemoryUsage, error) {
 	log.Debugf("Usage sandbox %q", s.ID)
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return control.MemoryUsage{}, err
-	}
-	defer conn.Close()
-
+	opts := control.MemoryUsageOpts{Full: Full}
 	var m control.MemoryUsage
-	err = conn.Call(boot.UsageCollect, &control.MemoryUsageOpts{
-		Full: Full,
-	}, &m)
-	return m, err
+	if err := s.call(boot.UsageCollect, &opts, &m); err != nil {
+		return control.MemoryUsage{}, fmt.Errorf("collecting usage: %w", err)
+	}
+	return m, nil
 }
 
 // UsageFD sends the usagefd call for a container in the sandbox.
-func (s *Sandbox) UsageFD(cid string) (*control.MemoryUsageRecord, error) {
+func (s *Sandbox) UsageFD() (*control.MemoryUsageRecord, error) {
 	log.Debugf("Usage sandbox %q", s.ID)
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-
+	opts := control.MemoryUsageFileOpts{Version: 1}
 	var m control.MemoryUsageFile
-	if err := conn.Call(boot.UsageUsageFD, &control.MemoryUsageFileOpts{
-		Version: 1,
-	}, &m); err != nil {
-		return nil, fmt.Errorf("UsageFD failed: %v", err)
+	if err := s.call(boot.UsageUsageFD, &opts, &m); err != nil {
+		return nil, fmt.Errorf("collecting usage FD: %w", err)
 	}
 
 	if len(m.FilePayload.Files) != 2 {
 		return nil, fmt.Errorf("wants exactly two fds")
 	}
-
 	return control.NewMemoryUsageRecord(*m.FilePayload.Files[0], *m.FilePayload.Files[1])
 }
 
-// Reduce sends the reduce call for a container in the sandbox.
-func (s *Sandbox) Reduce(cid string, wait bool) error {
-	log.Debugf("Reduce sandbox %q", s.ID)
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return err
+// GetRegisteredMetrics returns metric registration data from the sandbox.
+// This data is meant to be used as a way to sanity-check any exported metrics data during the
+// lifetime of the sandbox in order to avoid a compromised sandbox from being able to produce
+// bogus metrics.
+// This returns an error if the sandbox has not requested instrumentation during creation time.
+func (s *Sandbox) GetRegisteredMetrics() (*metricpb.MetricRegistration, error) {
+	if s.RegisteredMetrics == nil {
+		return nil, errors.New("sandbox did not request instrumentation when it was created")
 	}
-	defer conn.Close()
-
-	return conn.Call(boot.UsageReduce, &control.UsageReduceOpts{
-		Wait: wait,
-	}, nil)
+	return s.RegisteredMetrics, nil
 }
 
-// Stream sends the AttachDebugEmitter call for a container in the sandbox, and
-// dumps filtered events to out.
-func (s *Sandbox) Stream(cid string, filters []string, out *os.File) error {
-	log.Debugf("Stream sandbox %q", s.ID)
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return err
+// ExportMetrics returns a snapshot of metric values from the sandbox in Prometheus format.
+func (s *Sandbox) ExportMetrics(opts control.MetricsExportOpts) (*prometheus.Snapshot, error) {
+	log.Debugf("Metrics export sandbox %q", s.ID)
+	var data control.MetricsExportData
+	if err := s.call(boot.MetricsExport, &opts, &data); err != nil {
+		return nil, err
 	}
-	defer conn.Close()
-
-	r, w, err := unet.SocketPair(false)
-	if err != nil {
-		return err
+	// Since we do not trust the output of the sandbox as-is, double-check that the options were
+	// respected.
+	if err := opts.Verify(&data); err != nil {
+		return nil, err
 	}
-
-	wfd, err := w.Release()
-	if err != nil {
-		return fmt.Errorf("failed to release write socket FD: %v", err)
-	}
-
-	if err := conn.Call(boot.EventsAttachDebugEmitter, &control.EventsOpts{
-		FilePayload: urpc.FilePayload{Files: []*os.File{
-			os.NewFile(uintptr(wfd), "event sink"),
-		}},
-	}, nil); err != nil {
-		return fmt.Errorf("AttachDebugEmitter failed: %v", err)
-	}
-
-	return eventchannel.ProcessAll(r, filters, out)
+	return data.Snapshot, nil
 }
 
 // IsRunning returns true if the sandbox or gofer process is running.
@@ -1237,15 +1271,9 @@ func (s *Sandbox) IsRunning() bool {
 // Stacks collects and returns all stacks for the sandbox.
 func (s *Sandbox) Stacks() (string, error) {
 	log.Debugf("Stacks sandbox %q", s.ID)
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return "", err
-	}
-	defer conn.Close()
-
 	var stacks string
-	if err := conn.Call(boot.DebugStacks, nil, &stacks); err != nil {
-		return "", fmt.Errorf("getting sandbox %q stacks: %v", s.ID, err)
+	if err := s.call(boot.DebugStacks, nil, &stacks); err != nil {
+		return "", fmt.Errorf("getting sandbox %q stacks: %w", s.ID, err)
 	}
 	return stacks, nil
 }
@@ -1253,94 +1281,58 @@ func (s *Sandbox) Stacks() (string, error) {
 // HeapProfile writes a heap profile to the given file.
 func (s *Sandbox) HeapProfile(f *os.File, delay time.Duration) error {
 	log.Debugf("Heap profile %q", s.ID)
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
 	opts := control.HeapProfileOpts{
 		FilePayload: urpc.FilePayload{Files: []*os.File{f}},
 		Delay:       delay,
 	}
-	return conn.Call(boot.ProfileHeap, &opts, nil)
+	return s.call(boot.ProfileHeap, &opts, nil)
 }
 
 // CPUProfile collects a CPU profile.
 func (s *Sandbox) CPUProfile(f *os.File, duration time.Duration) error {
 	log.Debugf("CPU profile %q", s.ID)
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
 	opts := control.CPUProfileOpts{
 		FilePayload: urpc.FilePayload{Files: []*os.File{f}},
 		Duration:    duration,
 	}
-	return conn.Call(boot.ProfileCPU, &opts, nil)
+	return s.call(boot.ProfileCPU, &opts, nil)
 }
 
 // BlockProfile writes a block profile to the given file.
 func (s *Sandbox) BlockProfile(f *os.File, duration time.Duration) error {
 	log.Debugf("Block profile %q", s.ID)
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
 	opts := control.BlockProfileOpts{
 		FilePayload: urpc.FilePayload{Files: []*os.File{f}},
 		Duration:    duration,
 	}
-	return conn.Call(boot.ProfileBlock, &opts, nil)
+	return s.call(boot.ProfileBlock, &opts, nil)
 }
 
 // MutexProfile writes a mutex profile to the given file.
 func (s *Sandbox) MutexProfile(f *os.File, duration time.Duration) error {
 	log.Debugf("Mutex profile %q", s.ID)
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
 	opts := control.MutexProfileOpts{
 		FilePayload: urpc.FilePayload{Files: []*os.File{f}},
 		Duration:    duration,
 	}
-	return conn.Call(boot.ProfileMutex, &opts, nil)
+	return s.call(boot.ProfileMutex, &opts, nil)
 }
 
 // Trace collects an execution trace.
 func (s *Sandbox) Trace(f *os.File, duration time.Duration) error {
 	log.Debugf("Trace %q", s.ID)
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
 	opts := control.TraceProfileOpts{
 		FilePayload: urpc.FilePayload{Files: []*os.File{f}},
 		Duration:    duration,
 	}
-	return conn.Call(boot.ProfileTrace, &opts, nil)
+	return s.call(boot.ProfileTrace, &opts, nil)
 }
 
 // ChangeLogging changes logging options.
 func (s *Sandbox) ChangeLogging(args control.LoggingArgs) error {
 	log.Debugf("Change logging start %q", s.ID)
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	if err := conn.Call(boot.LoggingChange, &args, nil); err != nil {
-		return fmt.Errorf("changing sandbox %q logging: %v", s.ID, err)
+	if err := s.call(boot.LoggingChange, &args, nil); err != nil {
+		return fmt.Errorf("changing sandbox %q logging: %w", s.ID, err)
 	}
 	return nil
 }
@@ -1365,13 +1357,8 @@ func (s *Sandbox) destroyContainer(cid string) error {
 	}
 
 	log.Debugf("Destroying container, cid: %s, sandbox: %s", cid, s.ID)
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	if err := conn.Call(boot.ContMgrDestroySubcontainer, &cid, nil); err != nil {
-		return fmt.Errorf("destroying container %q: %v", cid, err)
+	if err := s.call(boot.ContMgrDestroySubcontainer, &cid, nil); err != nil {
+		return fmt.Errorf("destroying container %q: %w", cid, err)
 	}
 	return nil
 }
@@ -1385,7 +1372,7 @@ func (s *Sandbox) waitForStopped() error {
 			return nil
 		}
 		// The sandbox process is a child of the current process,
-		// so we can wait it and collect its zombie.
+		// so we can wait on it to terminate and collect its zombie.
 		if _, err := unix.Wait4(int(pid), &s.status, 0, nil); err != nil {
 			return fmt.Errorf("error waiting the sandbox process: %v", err)
 		}
@@ -1419,6 +1406,10 @@ func (s *Sandbox) configureStdios(conf *config.Config, stdios []*os.File) error 
 	for _, file := range stdios {
 		log.Debugf("Changing %q ownership to %d/%d", file.Name(), s.UID, s.GID)
 		if err := file.Chown(s.UID, s.GID); err != nil {
+			if errors.Is(err, unix.EINVAL) || errors.Is(err, unix.EPERM) || errors.Is(err, unix.EROFS) {
+				log.Warningf("can't change an owner of %s: %s", file.Name(), err)
+				continue
+			}
 			return err
 		}
 	}
@@ -1467,4 +1458,45 @@ func checkBinaryPermissions(conf *config.Config) error {
 		return fmt.Errorf(specutils.FaqErrorMsg("runsc-perms", fmt.Sprintf("%s does not have the correct permissions", exePath)))
 	}
 	return nil
+}
+
+// CgroupsReadControlFile reads a single cgroupfs control file in the sandbox.
+func (s *Sandbox) CgroupsReadControlFile(file control.CgroupControlFile) (string, error) {
+	log.Debugf("CgroupsReadControlFiles sandbox %q", s.ID)
+	args := control.CgroupsReadArgs{
+		Args: []control.CgroupsReadArg{
+			{
+				File: file,
+			},
+		},
+	}
+	var out control.CgroupsResults
+	if err := s.call(boot.CgroupsReadControlFiles, &args, &out); err != nil {
+		return "", err
+	}
+	if len(out.Results) != 1 {
+		return "", fmt.Errorf("expected 1 result, got %d, raw: %+v", len(out.Results), out)
+	}
+	return out.Results[0].Unpack()
+}
+
+// CgroupsWriteControlFile writes a single cgroupfs control file in the sandbox.
+func (s *Sandbox) CgroupsWriteControlFile(file control.CgroupControlFile, value string) error {
+	log.Debugf("CgroupsReadControlFiles sandbox %q", s.ID)
+	args := control.CgroupsWriteArgs{
+		Args: []control.CgroupsWriteArg{
+			{
+				File:  file,
+				Value: value,
+			},
+		},
+	}
+	var out control.CgroupsResults
+	if err := s.call(boot.CgroupsWriteControlFiles, &args, &out); err != nil {
+		return err
+	}
+	if len(out.Results) != 1 {
+		return fmt.Errorf("expected 1 result, got %d, raw: %+v", len(out.Results), out)
+	}
+	return out.Results[0].AsError()
 }

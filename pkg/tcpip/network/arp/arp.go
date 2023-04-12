@@ -133,7 +133,7 @@ func (e *endpoint) MaxHeaderLength() uint16 {
 
 func (*endpoint) Close() {}
 
-func (*endpoint) WritePacket(*stack.Route, stack.NetworkHeaderParams, *stack.PacketBuffer) tcpip.Error {
+func (*endpoint) WritePacket(*stack.Route, stack.NetworkHeaderParams, stack.PacketBufferPtr) tcpip.Error {
 	return &tcpip.ErrNotSupported{}
 }
 
@@ -142,11 +142,11 @@ func (*endpoint) NetworkProtocolNumber() tcpip.NetworkProtocolNumber {
 	return ProtocolNumber
 }
 
-func (*endpoint) WriteHeaderIncludedPacket(*stack.Route, *stack.PacketBuffer) tcpip.Error {
+func (*endpoint) WriteHeaderIncludedPacket(*stack.Route, stack.PacketBufferPtr) tcpip.Error {
 	return &tcpip.ErrNotSupported{}
 }
 
-func (e *endpoint) HandlePacket(pkt *stack.PacketBuffer) {
+func (e *endpoint) HandlePacket(pkt stack.PacketBufferPtr) {
 	stats := e.stats.arp
 	stats.packetsReceived.Increment()
 
@@ -160,7 +160,7 @@ func (e *endpoint) HandlePacket(pkt *stack.PacketBuffer) {
 		return
 	}
 
-	h := header.ARP(pkt.NetworkHeader().View())
+	h := header.ARP(pkt.NetworkHeader().Slice())
 	if !h.IsValid() {
 		stats.malformedPacketsReceived.Increment()
 		return
@@ -230,12 +230,11 @@ func (e *endpoint) HandlePacket(pkt *stack.PacketBuffer) {
 		e.dad.StopLocked(addr, &stack.DADDupAddrDetected{HolderLinkAddress: linkAddr})
 		e.mu.Unlock()
 
-		// The solicited, override, and isRouter flags are not available for ARP;
-		// they are only available for IPv6 Neighbor Advertisements.
 		switch err := e.nic.HandleNeighborConfirmation(header.IPv4ProtocolNumber, addr, linkAddr, stack.ReachabilityConfirmationFlags{
-			// Solicited and unsolicited (also referred to as gratuitous) ARP Replies
-			// are handled equivalently to a solicited Neighbor Advertisement.
-			Solicited: true,
+			// Only unicast ARP replies are considered solicited. Broadcast replies
+			// are gratuitous ARP replies and should not move neighbor entries to the
+			// reachable state.
+			Solicited: pkt.PktType == tcpip.PacketHost,
 			// If a different link address is received than the one cached, the entry
 			// should always go to Stale.
 			Override: false,
@@ -384,7 +383,7 @@ func (*protocol) Close() {}
 func (*protocol) Wait() {}
 
 // Parse implements stack.NetworkProtocol.Parse.
-func (*protocol) Parse(pkt *stack.PacketBuffer) (proto tcpip.TransportProtocolNumber, hasTransportHdr bool, ok bool) {
+func (*protocol) Parse(pkt stack.PacketBufferPtr) (proto tcpip.TransportProtocolNumber, hasTransportHdr bool, ok bool) {
 	return 0, false, parse.ARP(pkt)
 }
 

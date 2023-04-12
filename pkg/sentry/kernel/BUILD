@@ -2,7 +2,17 @@ load("//tools:defs.bzl", "go_library", "go_test", "proto_library")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
 load("//pkg/sync/locking:locking.bzl", "declare_mutex", "declare_rwmutex")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
+
+declare_mutex(
+    name = "cpu_clock_mutex",
+    out = "cpu_clock_mutex.go",
+    package = "kernel",
+    prefix = "cpuClock",
+)
 
 declare_mutex(
     name = "user_counters_mutex",
@@ -21,6 +31,7 @@ declare_rwmutex(
 declare_mutex(
     name = "task_mutex",
     out = "task_mutex.go",
+    nested_lock_names = ["child"],
     package = "kernel",
     prefix = "task",
 )
@@ -49,6 +60,7 @@ declare_mutex(
 declare_mutex(
     name = "signal_handlers_mutex",
     out = "signal_handlers_mutex.go",
+    nested_lock_names = ["tg"],
     package = "kernel",
     prefix = "signalHandlers",
 )
@@ -120,23 +132,11 @@ go_template_instance(
 )
 
 go_template_instance(
-    name = "socket_list",
-    out = "socket_list.go",
-    package = "kernel",
-    prefix = "socket",
-    template = "//pkg/ilist:generic_list",
-    types = {
-        "Element": "*SocketRecordVFS1",
-        "Linker": "*SocketRecordVFS1",
-    },
-)
-
-go_template_instance(
     name = "fd_table_refs",
     out = "fd_table_refs.go",
     package = "kernel",
     prefix = "FDTable",
-    template = "//pkg/refsvfs2:refs_template",
+    template = "//pkg/refs:refs_template",
     types = {
         "T": "FDTable",
     },
@@ -147,7 +147,7 @@ go_template_instance(
     out = "fs_context_refs.go",
     package = "kernel",
     prefix = "FSContext",
-    template = "//pkg/refsvfs2:refs_template",
+    template = "//pkg/refs:refs_template",
     types = {
         "T": "FSContext",
     },
@@ -158,7 +158,7 @@ go_template_instance(
     out = "ipc_namespace_refs.go",
     package = "kernel",
     prefix = "IPCNamespace",
-    template = "//pkg/refsvfs2:refs_template",
+    template = "//pkg/refs:refs_template",
     types = {
         "T": "IPCNamespace",
     },
@@ -169,7 +169,7 @@ go_template_instance(
     out = "process_group_refs.go",
     package = "kernel",
     prefix = "ProcessGroup",
-    template = "//pkg/refsvfs2:refs_template",
+    template = "//pkg/refs:refs_template",
     types = {
         "T": "ProcessGroup",
     },
@@ -180,7 +180,7 @@ go_template_instance(
     out = "session_refs.go",
     package = "kernel",
     prefix = "Session",
-    template = "//pkg/refsvfs2:refs_template",
+    template = "//pkg/refs:refs_template",
     types = {
         "T": "Session",
     },
@@ -201,6 +201,7 @@ go_library(
         "cgroup.go",
         "cgroup_mutex.go",
         "context.go",
+        "cpu_clock_mutex.go",
         "fd_table.go",
         "fd_table_mutex.go",
         "fd_table_refs.go",
@@ -234,7 +235,6 @@ go_library(
         "signal.go",
         "signal_handlers.go",
         "signal_handlers_mutex.go",
-        "socket_list.go",
         "syscalls.go",
         "syscalls_state.go",
         "syslog.go",
@@ -305,16 +305,12 @@ go_library(
         "//pkg/marshal/primitive",
         "//pkg/metric",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/safemem",
         "//pkg/secio",
         "//pkg/sentry/arch",
         "//pkg/sentry/device",
-        "//pkg/sentry/fs",
-        "//pkg/sentry/fs/lock",
-        "//pkg/sentry/fs/timerfd",
-        "//pkg/sentry/fsbridge",
         "//pkg/sentry/fsimpl/kernfs",
+        "//pkg/sentry/fsimpl/lock",
         "//pkg/sentry/fsimpl/mqfs",
         "//pkg/sentry/fsimpl/pipefs",
         "//pkg/sentry/fsimpl/sockfs",
@@ -379,13 +375,12 @@ go_test(
         "//pkg/hostarch",
         "//pkg/sentry/arch",
         "//pkg/sentry/contexttest",
-        "//pkg/sentry/fs",
-        "//pkg/sentry/fs/filetest",
         "//pkg/sentry/kernel/sched",
         "//pkg/sentry/limits",
         "//pkg/sentry/pgalloc",
         "//pkg/sentry/time",
         "//pkg/sentry/usage",
+        "//pkg/sentry/vfs",
         "//pkg/sync",
     ],
 )

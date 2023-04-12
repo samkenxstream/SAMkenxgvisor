@@ -21,9 +21,8 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-	"gvisor.dev/gvisor/pkg/buffer"
+	"gvisor.dev/gvisor/pkg/bufferv2"
 	"gvisor.dev/gvisor/pkg/refs"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/faketime"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -45,9 +44,9 @@ var (
 	defaultRoute              = stack.MulticastRoute{inputNICID, defaultOutgoingInterfaces}
 )
 
-func newPacketBuffer(body string) *stack.PacketBuffer {
+func newPacketBuffer(body string) stack.PacketBufferPtr {
 	return stack.NewPacketBuffer(stack.PacketBufferOptions{
-		Payload: buffer.NewWithData([]byte(body)),
+		Payload: bufferv2.MakeWithData([]byte(body)),
 	})
 }
 
@@ -258,8 +257,8 @@ func TestAddInstalledRouteWithPending(t *testing.T) {
 	defer pkt.DecRef()
 
 	cmpOpts := []cmp.Option{
-		cmp.Transformer("AsSlices", func(pkt *stack.PacketBuffer) [][]byte {
-			return pkt.Slices()
+		cmp.Transformer("AsSlices", func(pkt stack.PacketBufferPtr) [][]byte {
+			return pkt.AsSlices()
 		}),
 		cmp.Comparer(func(a [][]byte, b [][]byte) bool {
 			return cmp.Equal(a, b)
@@ -269,12 +268,12 @@ func TestAddInstalledRouteWithPending(t *testing.T) {
 	testCases := []struct {
 		name    string
 		advance time.Duration
-		want    []*stack.PacketBuffer
+		want    []stack.PacketBufferPtr
 	}{
 		{
 			name:    "not expired",
 			advance: DefaultPendingRouteExpiration,
-			want:    []*stack.PacketBuffer{pkt},
+			want:    []stack.PacketBufferPtr{pkt},
 		},
 		{
 			name:    "expired",
@@ -514,6 +513,6 @@ func TestSetLastUsedTimestamp(t *testing.T) {
 func TestMain(m *testing.M) {
 	refs.SetLeakMode(refs.LeaksPanic)
 	code := m.Run()
-	refsvfs2.DoLeakCheck()
+	refs.DoLeakCheck()
 	os.Exit(code)
 }

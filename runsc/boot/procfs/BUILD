@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "go_library")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "procfs",
@@ -9,6 +12,7 @@ go_library(
     deps = [
         "//pkg/abi/linux",
         "//pkg/context",
+        "//pkg/hostarch",
         "//pkg/log",
         "//pkg/sentry/fsimpl/proc",
         "//pkg/sentry/kernel",

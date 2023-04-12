@@ -18,8 +18,10 @@ import (
 	"fmt"
 	"testing"
 
+	"gvisor.dev/gvisor/pkg/bufferv2"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/checker"
+	"gvisor.dev/gvisor/pkg/tcpip/checksum"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
@@ -271,7 +273,7 @@ func (flow TestFlow) SockProto() tcpip.NetworkProtocolNumber {
 }
 
 // CheckerFn returns the correct network checker for the current TestFlow.
-func (flow TestFlow) CheckerFn() func(*testing.T, []byte, ...checker.NetworkChecker) {
+func (flow TestFlow) CheckerFn() func(*testing.T, *bufferv2.View, ...checker.NetworkChecker) {
 	if flow.IsV4() {
 		return checker.IPv4
 	}
@@ -371,7 +373,7 @@ func BuildV4UDPPacket(payload []byte, h Header4Tuple, tos, ttl uint8, badChecksu
 	xsum := header.PseudoHeaderChecksum(udp.ProtocolNumber, h.Src.Addr, h.Dst.Addr, uint16(len(u)))
 
 	// Calculate the UDP checksum and set it.
-	xsum = header.Checksum(payload, xsum)
+	xsum = checksum.Checksum(payload, xsum)
 	u.SetChecksum(^u.CalculateChecksum(xsum))
 
 	if badChecksum {
@@ -418,7 +420,7 @@ func BuildV6UDPPacket(payload []byte, h Header4Tuple, tclass, hoplimit uint8, ba
 	xsum := header.PseudoHeaderChecksum(udp.ProtocolNumber, h.Src.Addr, h.Dst.Addr, uint16(len(u)))
 
 	// Calculate the UDP checksum and set it.
-	xsum = header.Checksum(payload, xsum)
+	xsum = checksum.Checksum(payload, xsum)
 	u.SetChecksum(^u.CalculateChecksum(xsum))
 
 	if badChecksum {

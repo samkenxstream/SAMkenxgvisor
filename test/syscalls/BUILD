@@ -1,7 +1,10 @@
 load("//tools:defs.bzl", "more_shards", "most_shards")
 load("//test/runner:defs.bzl", "syscall_test")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 # Please keep syscall tests ordered alphabetically by name.
 
@@ -10,16 +13,19 @@ syscall_test(
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:accept_bind_stream_test",
 )
 
 syscall_test(
     size = "large",
+    add_hostinet = True,
     shard_count = most_shards,
     test = "//test/syscalls/linux:accept_bind_test",
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:access_test",
 )
@@ -49,6 +55,7 @@ syscall_test(
 
 syscall_test(
     size = "large",
+    add_hostinet = True,
     add_overlay = True,
     test = "//test/syscalls/linux:bind_test",
 )
@@ -58,32 +65,38 @@ syscall_test(
 )
 
 syscall_test(
+    one_sandbox = False,
     test = "//test/syscalls/linux:cgroup_test",
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:chdir_test",
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:chmod_test",
 )
 
 syscall_test(
     size = "medium",
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:chown_test",
     use_tmpfs = True,  # chown tests require gofer to be running as root.
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:chroot_test",
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:pivot_root_test",
     use_tmpfs = True,
@@ -107,22 +120,47 @@ syscall_test(
 )
 
 syscall_test(
-    add_uds_tree = True,
-    test = "//test/syscalls/linux:connect_external_test",
+    add_host_connector = True,
+    add_hostinet = True,
+    one_sandbox = False,
+    test = "//test/syscalls/linux:bind_external_test",
+    # Shared mode tests replace /tmp which hides the files created for
+    # add_host_connector. use_tmpfs makes shared mode be skipped.
     use_tmpfs = True,
 )
 
 syscall_test(
+    add_host_uds = True,
+    add_hostinet = True,
+    one_sandbox = False,
+    test = "//test/syscalls/linux:connect_external_test",
+    # Shared mode tests replace /tmp which hides the files created for
+    # add_host_uds. use_tmpfs makes shared mode be skipped.
+    use_tmpfs = True,
+)
+
+syscall_test(
+    add_host_fifo = True,
+    one_sandbox = False,
+    test = "//test/syscalls/linux:pipe_external_test",
+    # Shared mode tests replace /tmp which hides the files created for
+    # add_host_fifo. use_tmpfs makes shared mode be skipped.
+    use_tmpfs = True,
+)
+
+syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:creat_test",
 )
 
 syscall_test(
-    fuse = "True",
+    allow_native = False,
     test = "//test/syscalls/linux:dev_test",
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:dup_test",
 )
@@ -161,6 +199,7 @@ syscall_test(
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:fallocate_test",
 )
@@ -170,6 +209,7 @@ syscall_test(
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:fchdir_test",
 )
@@ -202,6 +242,7 @@ syscall_test(
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:fsync_test",
 )
@@ -210,6 +251,10 @@ syscall_test(
     size = "medium",
     shard_count = more_shards,
     test = "//test/syscalls/linux:futex_test",
+)
+
+syscall_test(
+    test = "//test/syscalls/linux:fuse_test",
 )
 
 syscall_test(
@@ -247,6 +292,13 @@ syscall_test(
 )
 
 syscall_test(
+    iouring = True,
+    # Temporarily added due to intermittent ENOMEM failures. See b/216213621.
+    tags = ["notap"],
+    test = "//test/syscalls/linux:iouring_test",
+)
+
+syscall_test(
     test = "//test/syscalls/linux:iptables_test",
 )
 
@@ -269,12 +321,16 @@ syscall_test(
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:link_test",
-    use_tmpfs = True,  # gofer needs CAP_DAC_READ_SEARCH to use AT_EMPTY_PATH with linkat(2)
+    # TODO(gvisor.dev/issue/6739): Remove use_tmpfs=True once gofer filesystem
+    # supports hard links correctly.
+    use_tmpfs = True,
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:lseek_test",
 )
@@ -300,11 +356,13 @@ syscall_test(
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:mkdir_test",
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:mknod_test",
 )
@@ -356,29 +414,35 @@ syscall_test(
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:open_create_test",
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     shard_count = more_shards,
     test = "//test/syscalls/linux:open_test",
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:packet_socket_dgram_test",
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:packet_socket_raw_test",
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:packet_socket_test",
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:partial_bad_buffer_test",
 )
 
@@ -388,6 +452,7 @@ syscall_test(
 
 syscall_test(
     size = "medium",
+    add_hostinet = True,
     # Takes too long under gotsan to run.
     tags = ["nogotsan"],
     test = "//test/syscalls/linux:ping_socket_test",
@@ -418,16 +483,19 @@ syscall_test(
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:pread64_test",
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:preadv_test",
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:preadv2_test",
 )
@@ -443,6 +511,7 @@ syscall_test(
 
 syscall_test(
     container = True,
+    one_sandbox = False,
     test = "//test/syscalls/linux:proc_isolated_test",
 )
 
@@ -482,29 +551,35 @@ syscall_test(
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:pwritev2_test",
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:pwrite64_test",
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:raw_socket_hdrincl_test",
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:raw_socket_icmp_test",
 )
 
 syscall_test(
+    add_hostinet = True,
     shard_count = more_shards,
     test = "//test/syscalls/linux:raw_socket_test",
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:read_test",
 )
@@ -516,18 +591,21 @@ syscall_test(
 
 syscall_test(
     size = "medium",
+    add_hostinet = True,
     shard_count = more_shards,
     test = "//test/syscalls/linux:readv_socket_test",
 )
 
 syscall_test(
     size = "medium",
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:readv_test",
 )
 
 syscall_test(
     size = "medium",
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:rename_test",
 )
@@ -570,6 +648,7 @@ syscall_test(
 )
 
 syscall_test(
+    add_hostinet = True,
     add_overlay = True,
     test = "//test/syscalls/linux:sendfile_socket_test",
 )
@@ -668,13 +747,16 @@ syscall_test(
 
 syscall_test(
     size = "large",
+    add_hostinet = True,
     container = True,
+    one_sandbox = False,
     shard_count = most_shards,
     test = "//test/syscalls/linux:socket_inet_loopback_isolated_test",
 )
 
 syscall_test(
     size = "large",
+    add_hostinet = True,
     shard_count = most_shards,
     # Takes too long for TSAN. Creates a lot of TCP sockets.
     tags = ["nogotsan"],
@@ -682,11 +764,13 @@ syscall_test(
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:socket_ipv4_udp_unbound_external_networking_test",
 )
 
 syscall_test(
     size = "large",
+    add_hostinet = True,
     shard_count = most_shards,
     test = "//test/syscalls/linux:socket_ip_tcp_generic_loopback_test",
 )
@@ -699,6 +783,7 @@ syscall_test(
 
 syscall_test(
     size = "large",
+    add_hostinet = True,
     shard_count = most_shards,
     test = "//test/syscalls/linux:socket_ip_tcp_loopback_test",
 )
@@ -718,12 +803,14 @@ syscall_test(
 
 syscall_test(
     size = "large",
+    add_hostinet = True,
     shard_count = most_shards,
     test = "//test/syscalls/linux:socket_ip_udp_loopback_test",
 )
 
 syscall_test(
     size = "medium",
+    add_hostinet = True,
     test = "//test/syscalls/linux:socket_ipv4_datagram_based_socket_unbound_loopback_test",
 )
 
@@ -734,6 +821,7 @@ syscall_test(
 
 syscall_test(
     size = "medium",
+    add_hostinet = True,
     test = "//test/syscalls/linux:socket_ipv6_udp_unbound_loopback_test",
 )
 
@@ -747,24 +835,30 @@ syscall_test(
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:socket_ipv4_udp_unbound_loopback_netlink_test",
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:socket_ipv6_udp_unbound_loopback_netlink_test",
 )
 
 syscall_test(
+    # TODO(b/267210840): Flaky on hostinet.
+    # add_hostinet = True,
     shard_count = more_shards,
     test = "//test/syscalls/linux:socket_ip_unbound_test",
 )
 
 syscall_test(
+    add_hostinet = True,
     shard_count = more_shards,
     test = "//test/syscalls/linux:socket_ipv6_unbound_test",
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:socket_ip_unbound_netlink_test",
 )
 
@@ -774,22 +868,27 @@ syscall_test(
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:socket_netlink_test",
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:socket_netlink_route_test",
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:socket_netlink_uevent_test",
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:socket_blocking_local_test",
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:socket_blocking_ip_test",
 )
 
@@ -799,11 +898,13 @@ syscall_test(
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:socket_non_stream_blocking_udp_test",
 )
 
 syscall_test(
     size = "large",
+    add_hostinet = True,
     test = "//test/syscalls/linux:socket_stream_blocking_local_test",
 )
 
@@ -814,11 +915,13 @@ syscall_test(
 
 syscall_test(
     size = "medium",
+    add_hostinet = True,
     test = "//test/syscalls/linux:socket_stream_local_test",
 )
 
 syscall_test(
     size = "medium",
+    add_hostinet = True,
     test = "//test/syscalls/linux:socket_stream_nonblock_local_test",
 )
 
@@ -829,6 +932,7 @@ syscall_test(
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:socket_test",
 )
 
@@ -889,17 +993,20 @@ syscall_test(
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:statfs_test",
     use_tmpfs = True,  # Test specifically relies on TEST_TMPDIR to be tmpfs.
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:stat_test",
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:stat_times_test",
 )
@@ -910,16 +1017,19 @@ syscall_test(
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:symlink_test",
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:sync_test",
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:sync_file_range_test",
 )
@@ -938,6 +1048,7 @@ syscall_test(
 
 syscall_test(
     size = "medium",
+    add_hostinet = True,
     shard_count = more_shards,
     test = "//test/syscalls/linux:tcp_socket_test",
 )
@@ -964,6 +1075,7 @@ syscall_test(
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:truncate_test",
 )
@@ -984,7 +1096,8 @@ syscall_test(
 
 syscall_test(
     size = "medium",
-    add_hostinet = True,
+    # TODO(b/267210840): Flaky on hostinet.
+    # add_hostinet = True,
     shard_count = more_shards,
     test = "//test/syscalls/linux:udp_socket_test",
 )
@@ -998,6 +1111,7 @@ syscall_test(
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:unlink_test",
 )
@@ -1034,6 +1148,7 @@ syscall_test(
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:write_test",
 )

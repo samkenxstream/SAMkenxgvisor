@@ -1,8 +1,10 @@
-load("//tools:defs.bzl", "arch_genrule", "go_library", "go_test", "select_arch")
+load("//tools:defs.bzl", "go_library", "go_test")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
-load("//tools/nogo:defs.bzl", "nogo_facts")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_template_instance(
     name = "atomicptr_machine",
@@ -15,37 +17,6 @@ go_template_instance(
     },
 )
 
-nogo_facts(
-    name = "bluepill_impl",
-    srcs = [
-        "//pkg/ring0:aarch64.go",
-        "//pkg/ring0:defs.go",
-        "//pkg/ring0:defs_amd64.go",
-        "//pkg/ring0:defs_arm64.go",
-        "//pkg/ring0:entry_template.go",
-        "//pkg/ring0:x86.go",
-    ],
-    output = "bluepill_impl.s",
-    template = select_arch(
-        amd64 = "bluepill_amd64.s",
-        arm64 = "bluepill_arm64.s",
-    ),
-    deps = [
-        "//pkg/abi/linux",
-        "//pkg/cpuid",
-        "//pkg/hostarch",
-        "//pkg/ring0/pagetables",
-        "//pkg/sentry/arch",
-        "//pkg/sentry/arch/fpu",
-    ],
-)
-
-arch_genrule(
-    name = "bluepill_impl_arch",
-    src = ":bluepill_impl",
-    template = "bluepill_impl_%s.s",
-)
-
 go_library(
     name = "kvm",
     srcs = [
@@ -56,8 +27,10 @@ go_library(
         "bluepill.go",
         "bluepill_allocator.go",
         "bluepill_amd64.go",
+        "bluepill_amd64.s",
         "bluepill_amd64_unsafe.go",
         "bluepill_arm64.go",
+        "bluepill_arm64.s",
         "bluepill_arm64_unsafe.go",
         "bluepill_fault.go",
         "bluepill_unsafe.go",
@@ -71,6 +44,7 @@ go_library(
         "kvm_arm64.go",
         "kvm_arm64_unsafe.go",
         "kvm_const.go",
+        "kvm_const_amd64.go",
         "kvm_const_arm64.go",
         "machine.go",
         "machine_amd64.go",
@@ -82,7 +56,6 @@ go_library(
         "physical_map_amd64.go",
         "physical_map_arm64.go",
         "virtual_map.go",
-        ":bluepill_impl_arch",
     ],
     visibility = ["//pkg/sentry:internal"],
     deps = [
@@ -91,9 +64,9 @@ go_library(
         "//pkg/context",
         "//pkg/cpuid",
         "//pkg/hostarch",
+        "//pkg/hosttid",
         "//pkg/log",
         "//pkg/metric",
-        "//pkg/procid",
         "//pkg/ring0",
         "//pkg/ring0/pagetables",
         "//pkg/seccomp",

@@ -2,6 +2,8 @@ load("//tools:defs.bzl", "go_library", "go_test")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
 load("//pkg/sync/locking:locking.bzl", "declare_mutex", "declare_rwmutex")
 
+package(default_applicable_licenses = ["//:license"])
+
 licenses(["notice"])
 
 go_template_instance(
@@ -44,7 +46,7 @@ go_template_instance(
     out = "static_directory_refs.go",
     package = "kernfs",
     prefix = "StaticDirectory",
-    template = "//pkg/refsvfs2:refs_template",
+    template = "//pkg/refs:refs_template",
     types = {
         "T": "StaticDirectory",
     },
@@ -55,7 +57,7 @@ go_template_instance(
     out = "dir_refs.go",
     package = "kernfs_test",
     prefix = "dir",
-    template = "//pkg/refsvfs2:refs_template",
+    template = "//pkg/refs:refs_template",
     types = {
         "T": "dir",
     },
@@ -66,7 +68,7 @@ go_template_instance(
     out = "readonly_dir_refs.go",
     package = "kernfs_test",
     prefix = "readonlyDir",
-    template = "//pkg/refsvfs2:refs_template",
+    template = "//pkg/refs:refs_template",
     types = {
         "T": "readonlyDir",
     },
@@ -77,7 +79,7 @@ go_template_instance(
     out = "synthetic_directory_refs.go",
     package = "kernfs",
     prefix = "syntheticDirectory",
-    template = "//pkg/refsvfs2:refs_template",
+    template = "//pkg/refs:refs_template",
     types = {
         "T": "syntheticDirectory",
     },
@@ -127,10 +129,9 @@ go_library(
         "//pkg/hostarch",
         "//pkg/log",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/safemem",
-        "//pkg/sentry/fs/fsutil",
-        "//pkg/sentry/fs/lock",
+        "//pkg/sentry/fsimpl/lock",
+        "//pkg/sentry/fsutil",
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/kernel/time",
         "//pkg/sentry/memmap",
@@ -159,7 +160,6 @@ go_test(
         "//pkg/fspath",
         "//pkg/log",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/sentry/contexttest",
         "//pkg/sentry/fsimpl/testutil",
         "//pkg/sentry/kernel/auth",

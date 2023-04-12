@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "go_library", "go_test", "more_shards")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_test(
     name = "tcp_test",
@@ -9,10 +12,9 @@ go_test(
     shard_count = more_shards,
     deps = [
         ":e2e",
-        "//pkg/buffer",
+        "//pkg/bufferv2",
         "//pkg/rand",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/sync",
         "//pkg/tcpip",
         "//pkg/tcpip/checker",
@@ -40,7 +42,6 @@ go_test(
     deps = [
         ":e2e",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/tcpip",
         "//pkg/tcpip/checker",
         "//pkg/tcpip/header",
@@ -76,7 +77,6 @@ go_test(
     deps = [
         ":e2e",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/tcpip",
         "//pkg/tcpip/checker",
         "//pkg/tcpip/header",
@@ -102,7 +102,6 @@ go_test(
     srcs = ["sack_scoreboard_test.go"],
     deps = [
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/tcpip/header",
         "//pkg/tcpip/seqnum",
         "//pkg/tcpip/transport/tcp",
@@ -116,7 +115,6 @@ go_test(
     deps = [
         ":e2e",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/tcpip",
         "//pkg/tcpip/checker",
         "//pkg/tcpip/header",
@@ -133,8 +131,8 @@ go_test(
     srcs = ["tcp_rack_test.go"],
     deps = [
         ":e2e",
+        "//pkg/bufferv2",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/tcpip",
         "//pkg/tcpip/header",
         "//pkg/tcpip/seqnum",
@@ -150,8 +148,8 @@ go_test(
     srcs = ["tcp_sack_test.go"],
     deps = [
         ":e2e",
+        "//pkg/bufferv2",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/tcpip",
         "//pkg/tcpip/checker",
         "//pkg/tcpip/header",
@@ -173,7 +171,6 @@ go_test(
     deps = [
         ":e2e",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/tcpip",
         "//pkg/tcpip/header",
         "//pkg/tcpip/transport/tcp",

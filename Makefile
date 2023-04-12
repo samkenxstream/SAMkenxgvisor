@@ -105,14 +105,14 @@ endif
 ##     DOCKER_RELOAD_COMMAND - The command to run to reload Docker. (default: sudo systemctl reload docker).
 
 ifeq (,$(BRANCH_NAME))
-RUNTIME     := runsc
+RUNTIME     ?= runsc
 else
-RUNTIME     := $(BRANCH_NAME)
+RUNTIME     ?= $(BRANCH_NAME)
 endif
 RUNTIME_DIR     ?= $(shell dirname $(shell mktemp -u))/$(RUNTIME)
-RUNTIME_BIN     := $(RUNTIME_DIR)/runsc
-RUNTIME_LOG_DIR := $(RUNTIME_DIR)/logs
-RUNTIME_LOGS    := $(RUNTIME_LOG_DIR)/runsc.log.%TEST%.%TIMESTAMP%.%COMMAND%
+RUNTIME_BIN     ?= $(RUNTIME_DIR)/runsc
+RUNTIME_LOG_DIR ?= $(RUNTIME_DIR)/logs
+RUNTIME_LOGS    ?= $(RUNTIME_LOG_DIR)/runsc.log.%TEST%.%TIMESTAMP%.%COMMAND%
 RUNTIME_ARGS    ?=
 DOCKER_RELOAD_COMMAND ?= sudo systemctl reload docker
 
@@ -162,9 +162,7 @@ dev: $(RUNTIME_BIN) ## Installs a set of local runtimes. Requires sudo.
 	@$(call configure_noreload,$(RUNTIME),--net-raw)
 	@$(call configure_noreload,$(RUNTIME)-d,--net-raw --debug --strace --log-packets)
 	@$(call configure_noreload,$(RUNTIME)-p,--net-raw --profile)
-	@$(call configure_noreload,$(RUNTIME)-fuse-d,--net-raw --debug --strace --log-packets --fuse)
 	@$(call configure_noreload,$(RUNTIME)-cgroup-d,--net-raw --debug --strace --log-packets --cgroupfs)
-	@$(call configure_noreload,$(RUNTIME)-lisafs-d,--net-raw --debug --strace --log-packets --lisafs)
 	@$(call configure_noreload,$(RUNTIME)-systemd-d,--net-raw --debug --strace --log-packets --systemd-cgroup)
 	@$(call reload_docker)
 .PHONY: dev
@@ -201,18 +199,18 @@ smoke-race-tests: ## Runs a smoke test after build building runsc in race config
 .PHONY: smoke-race-tests
 
 nogo-tests:
-	@$(call test,--build_tag_filters=nogo --test_tag_filters=nogo --//tools/nogo:full  //:all pkg/... tools/...)
+	@$(call test,--test_tag_filters=nogo //:all pkg/... tools/...)
 .PHONY: nogo-tests
 
 # For unit tests, we take everything in the root, pkg/... and tools/..., and
 # pull in all directories in runsc except runsc/container.
 unit-tests: ## Local package unit tests in pkg/..., tools/.., etc.
-	@$(call test,--build_tag_filters=-nogo --test_tag_filters=-nogo --test_filter=-//runsc/container/... //:all pkg/... tools/... runsc/... vdso/... test/trace/...)
+	@$(call test,--test_tag_filters=-nogo --test_filter=-//runsc/container/... //:all pkg/... tools/... runsc/... vdso/... test/trace/...)
 .PHONY: unit-tests
 
 # See unit-tests: this includes runsc/container.
 container-tests: $(RUNTIME_BIN) ## Run all tests in runsc/container/...
-	@$(call test,--test_env=RUNTIME=$(RUNTIME_BIN) runsc/container/...)
+	@$(call test,--test_tag_filters=-nogo --test_env=RUNTIME=$(RUNTIME_BIN) runsc/container/...)
 .PHONY: container-tests
 
 tests: ## Runs all unit tests and syscall tests.
@@ -229,20 +227,23 @@ network-tests: iptables-tests packetdrill-tests packetimpact-tests
 .PHONY: network-tests
 
 syscall-tests: $(RUNTIME_BIN) ## Run all system call tests.
-	@$(call test,--test_env=RUNTIME=$(RUNTIME_BIN) $(PARTITIONS) test/syscalls/... test/fuse/...)
+	@$(call test,--test_env=RUNTIME=$(RUNTIME_BIN) --cxxopt=-Werror $(PARTITIONS) test/syscalls/...)
 .PHONY: syscall-tests
 
 packetimpact-tests:
 	@$(call test,--jobs=HOST_CPUS*3 --local_test_jobs=HOST_CPUS*3 //test/packetimpact/tests:all_tests)
 .PHONY: packetimpact-tests
 
+# Extra configuration options for runtime tests.
+RUNTIME_TESTS_FILTER ?=
+RUNTIME_TESTS_PER_TEST_TIMEOUT ?= 20m
+RUNTIME_TESTS_RUNS_PER_TEST ?= 1
+RUNTIME_TESTS_FLAKY_IS_ERROR ?= true
+RUNTIME_TESTS_FLAKY_SHORT_CIRCUIT ?= true
+
 %-runtime-tests: load-runtimes_% $(RUNTIME_BIN)
 	@$(call install_runtime,$(RUNTIME),--watchdog-action=panic)
-	@$(call test_runtime,$(RUNTIME),--test_timeout=1800 //test/runtimes:$*)
-
-%-runtime-tests_lisafs: load-runtimes_% $(RUNTIME_BIN)
-	@$(call install_runtime,$(RUNTIME), --lisafs --watchdog-action=panic)
-	@$(call test_runtime,$(RUNTIME),--test_timeout=1800 //test/runtimes:$*)
+	@$(call test_runtime,$(RUNTIME),--test_timeout=1800 --test_env=RUNTIME_TESTS_FILTER=$(RUNTIME_TESTS_FILTER) --test_env=RUNTIME_TESTS_PER_TEST_TIMEOUT=$(RUNTIME_TESTS_PER_TEST_TIMEOUT) --test_env=RUNTIME_TESTS_RUNS_PER_TEST=$(RUNTIME_TESTS_RUNS_PER_TEST) --test_env=RUNTIME_TESTS_FLAKY_IS_ERROR=$(RUNTIME_TESTS_FLAKY_IS_ERROR) --test_env=RUNTIME_TESTS_FLAKY_SHORT_CIRCUIT=$(RUNTIME_TESTS_FLAKY_SHORT_CIRCUIT) //test/runtimes:$*)
 
 do-tests: $(RUNTIME_BIN)
 	@$(RUNTIME_BIN) --rootless do true
@@ -261,24 +262,29 @@ arm-qemu-smoke-test: $(RUNTIME_BIN) load-arm-qemu
 simple-tests: unit-tests # Compatibility target.
 .PHONY: simple-tests
 
+portforward-tests: load-basic_redis load-basic_nginx $(RUNTIME_BIN)
+	@$(call install_runtime,$(RUNTIME),--network=sandbox)
+	@$(call sudo,test/root:portforward_test,--runtime=$(RUNTIME) -test.v)
+	@$(call install_runtime,$(RUNTIME),--network=host)
+	@$(call sudo,test/root:portforward_test,--runtime=$(RUNTIME) -test.v)
+.PHONY: portforward-test
+
 # Standard integration targets.
 INTEGRATION_TARGETS := //test/image:image_test //test/e2e:integration_test
 
 docker-tests: load-basic $(RUNTIME_BIN)
-	@$(call install_runtime,$(RUNTIME),) # Clear flags.
-	# Used by TestRlimitNoFile.
-	@$(call install_runtime,$(RUNTIME)-fdlimit,--fdlimit=2000)
-	@$(call install_runtime,$(RUNTIME)-dcache,--fdlimit=2000 --dcache=100)
-	@$(call test_runtime,$(RUNTIME),$(INTEGRATION_TARGETS) //test/e2e:integration_runtime_test)
-	@$(call install_runtime,$(RUNTIME), --lisafs) # Run again with lisafs.
-	@$(call install_runtime,$(RUNTIME)-fdlimit,--lisafs --fdlimit=2000)
-	@$(call install_runtime,$(RUNTIME)-dcache,--lisafs --fdlimit=2000 --dcache=100)
+	@$(call install_runtime,$(RUNTIME),--overlay2=none)
+	@$(call install_runtime,$(RUNTIME)-fdlimit,--fdlimit=2000) # Used by TestRlimitNoFile.
+	@$(call install_runtime,$(RUNTIME)-dcache,--fdlimit=2000 --dcache=100) # Used by TestDentryCacheLimit.
+	@$(call install_runtime,$(RUNTIME)-host-uds,--host-uds=all) # Used by TestHostSocketConnect.
+	@$(call install_runtime,$(RUNTIME)-overlay,--overlay2=all:self) # Used by TestOverlay*.
+	@$(call install_runtime,$(RUNTIME)-no-overlay,--overlay2=none) # Used by TestCheckpointRestore.
 	@$(call test_runtime,$(RUNTIME),$(INTEGRATION_TARGETS) //test/e2e:integration_runtime_test)
 .PHONY: docker-tests
 
 overlay-tests: load-basic $(RUNTIME_BIN)
-	@$(call install_runtime,$(RUNTIME),--overlay)
-	@$(call test_runtime,$(RUNTIME),$(INTEGRATION_TARGETS))
+	@$(call install_runtime,$(RUNTIME),--overlay2=all:dir=/tmp)
+	@$(call test_runtime,$(RUNTIME),--test_env=TEST_OVERLAY=true $(INTEGRATION_TARGETS))
 .PHONY: overlay-tests
 
 swgso-tests: load-basic $(RUNTIME_BIN)
@@ -287,8 +293,8 @@ swgso-tests: load-basic $(RUNTIME_BIN)
 .PHONY: swgso-tests
 
 hostnet-tests: load-basic $(RUNTIME_BIN)
-	@$(call install_runtime,$(RUNTIME),--network=host)
-	@$(call test_runtime,$(RUNTIME),--test_env=CHECKPOINT=false  --test_env=HOSTNET=true $(INTEGRATION_TARGETS))
+	@$(call install_runtime,$(RUNTIME),--network=host --net-raw)
+	@$(call test_runtime,$(RUNTIME),--test_env=TEST_CHECKPOINT=false --test_env=TEST_HOSTNET=true --test_env=TEST_NET_RAW=true $(INTEGRATION_TARGETS))
 .PHONY: hostnet-tests
 
 kvm-tests: load-basic $(RUNTIME_BIN)
@@ -299,6 +305,11 @@ kvm-tests: load-basic $(RUNTIME_BIN)
 	@$(call test_runtime,$(RUNTIME),$(INTEGRATION_TARGETS))
 .PHONY: kvm-tests
 
+systrap-tests: load-basic $(RUNTIME_BIN)
+	@$(call install_runtime,$(RUNTIME),--platform=systrap)
+	@$(call test_runtime,$(RUNTIME),$(INTEGRATION_TARGETS))
+.PHONY: systrap-tests
+
 iptables-tests: load-iptables $(RUNTIME_BIN)
 	@sudo modprobe iptable_filter
 	@sudo modprobe ip6table_filter
@@ -307,7 +318,7 @@ iptables-tests: load-iptables $(RUNTIME_BIN)
 	@# FIXME(b/218923513): Need to fix permissions issues.
 	@#$(call test,--test_env=RUNTIME=runc //test/iptables:iptables_test)
 	@$(call install_runtime,$(RUNTIME),--net-raw)
-	@$(call test_runtime,$(RUNTIME),//test/iptables:iptables_test)
+	@$(call test_runtime,$(RUNTIME),--test_env=TEST_NET_RAW=true //test/iptables:iptables_test)
 .PHONY: iptables-tests
 
 packetdrill-tests: load-packetdrill $(RUNTIME_BIN)
@@ -320,10 +331,11 @@ fsstress-test: load-basic $(RUNTIME_BIN)
 	@$(call test_runtime,$(RUNTIME),//test/fsstress:fsstress_test)
 .PHONY: fsstress-test
 
+
 # Specific containerd version tests.
 containerd-test-%: load-basic_alpine load-basic_python load-basic_busybox load-basic_symlink-resolv load-basic_httpd load-basic_ubuntu $(RUNTIME_BIN)
 	@$(call install_runtime,$(RUNTIME),) # Clear flags.
-	@sudo tools/install_containerd.sh $*
+	@sudo -H tools/install_containerd.sh $*
 ifeq (,$(STAGED_BINARIES))
 	@$(call sudocopy,//shim:containerd-shim-runsc-v1,"$$(dirname $$(which containerd))")
 else
@@ -331,7 +343,6 @@ else
 		sudo tar -C "$$(dirname $$(which containerd))" -zxvf - containerd-shim-runsc-v1
 endif
 	@$(call sudo,test/root:root_test,--runtime=$(RUNTIME) -test.v)
-
 containerd-tests-min: containerd-test-1.4.12
 
 ##
@@ -342,26 +353,30 @@ containerd-tests-min: containerd-test-1.4.12
 ##
 containerd-tests:
 containerd-tests: containerd-test-1.4.12
-containerd-tests: containerd-test-1.5.9
-containerd-tests: containerd-test-1.6.0
+containerd-tests: containerd-test-1.5.11
+containerd-tests: containerd-test-1.6.2
 
 ##
 ## Benchmarks.
 ##
 ## Targets to run benchmarks. See //test/benchmarks for details.
+## You can list all available benchmarks using:
+##   $ bazel query 'attr("tags", ".*gvisor_benchmark.*", //test/benchmarks/...)'
 ##
-##   common arguments:
-##     BENCHMARKS_PROJECT   - BigQuery project to which to send data.
-##     BENCHMARKS_DATASET   - BigQuery dataset to which to send data.
-##     BENCHMARKS_TABLE     - BigQuery table to which to send data.
-##     BENCHMARKS_SUITE     - name of the benchmark suite. See //tools/bigquery/bigquery.go.
-##     BENCHMARKS_UPLOAD    - if true, upload benchmark data from the run.
-##     BENCHMARKS_OFFICIAL  - marks the data as official.
-##     BENCHMARKS_PLATFORMS - if set, only run the benchmarks for this
-##                            space-separated list of platform names.
-##     BENCHMARKS_FILTER    - filter to be applied to the test suite.
-##     BENCHMARKS_OPTIONS   - options to be passed to the test.
-##     BENCHMARKS_PROFILE   - profile options to be passed to the test.
+## Common arguments:
+##   BENCHMARKS_PROJECT   - BigQuery project to which to send data.
+##   BENCHMARKS_DATASET   - BigQuery dataset to which to send data.
+##   BENCHMARKS_TABLE     - BigQuery table to which to send data.
+##   BENCHMARKS_SUITE     - name of the benchmark suite. See //tools/bigquery/bigquery.go.
+##   BENCHMARKS_UPLOAD    - if true, upload benchmark data from the run.
+##   BENCHMARKS_OFFICIAL  - marks the data as official.
+##   BENCHMARKS_PLATFORMS - if set, only run the benchmarks for this
+##                          space-separated list of platform names.
+##   BENCHMARKS_RUNC      - if true, also benchmark runc performance.
+##   BENCHMARKS_FILTER    - filter to be applied to the test suite.
+##   BENCHMARKS_OPTIONS   - options to be passed to the test.
+##   BENCHMARKS_PROFILE   - profile options to be passed to the test.
+##                          Set to the empty string to avoid profiling overhead.
 ##
 BENCHMARKS_PROJECT   ?= gvisor-benchmarks
 BENCHMARKS_DATASET   ?= kokoro
@@ -369,12 +384,13 @@ BENCHMARKS_TABLE     ?= benchmarks
 BENCHMARKS_SUITE     ?= ffmpeg
 BENCHMARKS_UPLOAD    ?= false
 BENCHMARKS_OFFICIAL  ?= false
-BENCHMARKS_TARGETS   := //test/benchmarks/media:ffmpeg_test
+BENCHMARKS_TARGETS   ?= //test/benchmarks/media:ffmpeg_test
 BENCHMARKS_PLATFORMS ?=
-BENCHMARKS_FILTER    := .
-BENCHMARKS_OPTIONS   := -test.benchtime=30s
-BENCHMARKS_ARGS      := -test.v -test.bench=$(BENCHMARKS_FILTER) $(BENCHMARKS_OPTIONS)
-BENCHMARKS_PROFILE   := -pprof-dir=/tmp/profile -pprof-cpu -pprof-heap -pprof-block -pprof-mutex
+BENCHMARKS_RUNC      ?= true
+BENCHMARKS_FILTER    ?= .
+BENCHMARKS_OPTIONS   ?= -test.benchtime=30s
+BENCHMARKS_ARGS      ?= -test.v -test.bench=$(BENCHMARKS_FILTER) $(BENCHMARKS_OPTIONS)
+BENCHMARKS_PROFILE   ?= -pprof-dir=/tmp/profile -pprof-cpu -pprof-heap -pprof-block -pprof-mutex
 
 init-benchmark-table: ## Initializes a BigQuery table with the benchmark schema.
 	@$(call run,//tools/parsers:parser,init --project=$(BENCHMARKS_PROJECT) --dataset=$(BENCHMARKS_DATASET) --table=$(BENCHMARKS_TABLE))
@@ -385,6 +401,7 @@ run_benchmark = \
 	($(call header,BENCHMARK $(1)); \
 	set -euo pipefail; \
 	export T=$$(mktemp --tmpdir logs.$(1).XXXXXX); \
+	export UNSANDBOXED_RUNTIME; \
 	if test "$(1)" = "runc"; then $(call sudo,$(BENCHMARKS_TARGETS),-runtime=$(1) $(BENCHMARKS_ARGS)) | tee $$T; fi; \
 	if test "$(1)" != "runc"; then $(call sudo,$(BENCHMARKS_TARGETS),-runtime=$(1) $(BENCHMARKS_ARGS) $(BENCHMARKS_PROFILE)) | tee $$T; fi; \
 	if test "$(BENCHMARKS_UPLOAD)" = "true"; then \
@@ -406,7 +423,9 @@ benchmark-platforms: load-benchmarks $(RUNTIME_BIN) ## Runs benchmarks for runc 
 	    $(call run_benchmark,$${PLATFORM}); \
 	  done; \
 	fi
-	@$(call run_benchmark,runc)
+	@set -xe; if test "$(BENCHMARKS_RUNC)" == true; then \
+	  $(call run_benchmark,runc); \
+	fi
 .PHONY: benchmark-platforms
 
 run-benchmark: load-benchmarks ## Runs single benchmark and optionally sends data to BigQuery.

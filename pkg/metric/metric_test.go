@@ -15,55 +15,19 @@
 package metric
 
 import (
+	"bytes"
 	"fmt"
 	"math"
 	"reflect"
 	"testing"
 	"time"
 
+	"github.com/prometheus/common/expfmt"
 	"google.golang.org/protobuf/proto"
-	"gvisor.dev/gvisor/pkg/eventchannel"
 	pb "gvisor.dev/gvisor/pkg/metric/metric_go_proto"
+	"gvisor.dev/gvisor/pkg/prometheus"
 	"gvisor.dev/gvisor/pkg/sync"
 )
-
-// sliceEmitter implements eventchannel.Emitter by appending all messages to a
-// slice.
-type sliceEmitter []proto.Message
-
-// Emit implements eventchannel.Emitter.Emit.
-func (s *sliceEmitter) Emit(msg proto.Message) (bool, error) {
-	*s = append(*s, msg)
-	return false, nil
-}
-
-// Emit implements eventchannel.Emitter.Close.
-func (s *sliceEmitter) Close() error {
-	return nil
-}
-
-// Reset clears all events in s.
-func (s *sliceEmitter) Reset() {
-	*s = nil
-}
-
-// emitter is the eventchannel.Emitter used for all tests. Package eventchannel
-// doesn't allow removing Emitters, so we must use one global emitter for all
-// test cases.
-var emitter sliceEmitter
-
-func init() {
-	reset()
-
-	eventchannel.AddEmitter(&emitter)
-}
-
-// reset clears all global state in the metric package.
-func reset() {
-	initialized = false
-	allMetrics = makeMetricSet()
-	emitter.Reset()
-}
 
 const (
 	fooDescription     = "Foo!"
@@ -72,8 +36,31 @@ const (
 	distribDescription = "A distribution metric for testing"
 )
 
+// Helper method that exercises Prometheus metric exporting.
+// Ensures that current metric data, if it were to be exported and formatted as Prometheus format,
+// would be successfully parsable by the reference Prometheus implementation.
+// However, it does not verify that the data that was parsed actually matches the metric data.
+func verifyPrometheusParsing(t *testing.T) {
+	t.Helper()
+	snapshot, err := GetSnapshot(SnapshotOptions{})
+	if err != nil {
+		t.Errorf("failed to get Prometheus snapshot: %v", err)
+		return
+	}
+	var buf bytes.Buffer
+	if _, err := prometheus.Write(&buf, prometheus.ExportOptions{}, map[*prometheus.Snapshot]prometheus.SnapshotExportOptions{
+		snapshot: prometheus.SnapshotExportOptions{},
+	}); err != nil {
+		t.Errorf("failed to get Prometheus snapshot: %v", err)
+		return
+	}
+	if _, err := (&expfmt.TextParser{}).TextToMetricFamilies(&buf); err != nil {
+		t.Errorf("failed to parse Prometheus output: %v", err)
+	}
+}
+
 func TestInitialize(t *testing.T) {
-	defer reset()
+	defer resetTest()
 
 	_, err := NewUint64Metric("/foo", false, pb.MetricMetadata_UNITS_NONE, fooDescription)
 	if err != nil {
@@ -96,6 +83,7 @@ func TestInitialize(t *testing.T) {
 	if err := Initialize(); err != nil {
 		t.Fatalf("Initialize(): %s", err)
 	}
+	verifyPrometheusParsing(t)
 
 	if len(emitter) != 1 {
 		t.Fatalf("Initialize emitted %d events want 1", len(emitter))
@@ -152,11 +140,12 @@ func TestInitialize(t *testing.T) {
 		case "/distrib":
 			foundDistrib = true
 			want := &pb.MetricMetadata{
-				Name:        "/distrib",
-				Type:        pb.MetricMetadata_TYPE_DISTRIBUTION,
-				Units:       pb.MetricMetadata_UNITS_NANOSECONDS,
-				Description: distribDescription,
-				Sync:        true,
+				Name:           "/distrib",
+				PrometheusName: "distrib",
+				Type:           pb.MetricMetadata_TYPE_DISTRIBUTION,
+				Units:          pb.MetricMetadata_UNITS_NANOSECONDS,
+				Description:    distribDescription,
+				Sync:           true,
 				Fields: []*pb.MetricMetadata_Field{
 					{FieldName: "field1", AllowedValues: []string{"foo", "bar"}},
 					{FieldName: "field2", AllowedValues: []string{"baz", "quux"}},
@@ -178,10 +167,11 @@ func TestInitialize(t *testing.T) {
 	if !foundDistrib {
 		t.Errorf("/distrib not found: %+v", emitter)
 	}
+	verifyPrometheusParsing(t)
 }
 
 func TestDisable(t *testing.T) {
-	defer reset()
+	defer resetTest()
 
 	_, err := NewUint64Metric("/foo", false, pb.MetricMetadata_UNITS_NONE, fooDescription)
 	if err != nil {
@@ -217,7 +207,7 @@ func TestDisable(t *testing.T) {
 }
 
 func TestEmitMetricUpdate(t *testing.T) {
-	defer reset()
+	defer resetTest()
 
 	foo, err := NewUint64Metric("/foo", false, pb.MetricMetadata_UNITS_NONE, fooDescription)
 	if err != nil {
@@ -296,6 +286,8 @@ func TestEmitMetricUpdate(t *testing.T) {
 		t.Fatal("Aborting test so far due to earlier errors.")
 	}
 
+	verifyPrometheusParsing(t)
+
 	// Increment foo. Only it is included in the next update.
 	foo.Increment()
 	foo.Increment()
@@ -323,6 +315,7 @@ func TestEmitMetricUpdate(t *testing.T) {
 	if uv.Uint64Value != 3 {
 		t.Errorf("%v: Value got %v want %d", m, uv.Uint64Value, 3)
 	}
+	verifyPrometheusParsing(t)
 
 	// Add a few samples to the distribution metric.
 	distrib.AddSample(1, "foo", "baz")
@@ -376,6 +369,7 @@ func TestEmitMetricUpdate(t *testing.T) {
 			}
 		}
 	}
+	verifyPrometheusParsing(t)
 
 	// Add more samples to the distribution metric, check that we get the delta.
 	distrib.AddSample(3, "foo", "baz")
@@ -401,6 +395,7 @@ func TestEmitMetricUpdate(t *testing.T) {
 			t.Errorf("%+v: sample %d: got %d want %d", dv.DistributionValue, i, s, wantSamples[i])
 		}
 	}
+	verifyPrometheusParsing(t)
 
 	// Change nothing but still call EmitMetricUpdate. Verify that nothing gets sent.
 	emitter.Reset()
@@ -408,10 +403,11 @@ func TestEmitMetricUpdate(t *testing.T) {
 	if len(emitter) != 0 {
 		t.Fatalf("EmitMetricUpdate emitted %d events want %d", len(emitter), 0)
 	}
+	verifyPrometheusParsing(t)
 }
 
 func TestEmitMetricUpdateWithFields(t *testing.T) {
-	defer reset()
+	defer resetTest()
 
 	field := Field{
 		name:          "weirdness_type",
@@ -425,6 +421,7 @@ func TestEmitMetricUpdateWithFields(t *testing.T) {
 	if err := Initialize(); err != nil {
 		t.Fatalf("Initialize(): %s", err)
 	}
+	verifyPrometheusParsing(t)
 
 	// Don't care about the registration metrics.
 	emitter.Reset()
@@ -435,6 +432,7 @@ func TestEmitMetricUpdateWithFields(t *testing.T) {
 	if len(emitter) != 0 {
 		t.Fatalf("EmitMetricUpdate emitted %d events want 0", len(emitter))
 	}
+	verifyPrometheusParsing(t)
 
 	counter.IncrementBy(4, "weird1")
 	counter.Increment("weird2")
@@ -495,10 +493,12 @@ func TestEmitMetricUpdateWithFields(t *testing.T) {
 	if !foundWeird2 {
 		t.Errorf("Field value weird2 not found: %+v", emitter)
 	}
+
+	verifyPrometheusParsing(t)
 }
 
 func TestMetricUpdateStageTiming(t *testing.T) {
-	defer reset()
+	defer resetTest()
 
 	expectedTimings := map[InitStage]struct{ min, max time.Duration }{}
 	measureStage := func(stage InitStage, body func()) {
@@ -574,6 +574,7 @@ func TestMetricUpdateStageTiming(t *testing.T) {
 		checkStage(firstUpdate.StageTiming[0], "before_first_update_1")
 		checkStage(firstUpdate.StageTiming[1], "before_first_update_2")
 	}
+	verifyPrometheusParsing(t)
 
 	// Ensure re-emitting doesn't cause another event to be sent.
 	emitter.Reset()
@@ -581,6 +582,7 @@ func TestMetricUpdateStageTiming(t *testing.T) {
 	if len(emitter) != 0 {
 		t.Fatalf("EmitMetricUpdate emitted %d events want %d", len(emitter), 0)
 	}
+	verifyPrometheusParsing(t)
 
 	// Generate monitoring data, we should get an event with no stages.
 	fooMetric.Increment()
@@ -593,6 +595,7 @@ func TestMetricUpdateStageTiming(t *testing.T) {
 	} else if len(update.StageTiming) != 0 {
 		t.Errorf("unexpected stage timing information: %v", update.StageTiming)
 	}
+	verifyPrometheusParsing(t)
 
 	// Now generate new stages.
 	measureStage("foo_stage_1", func() {
@@ -615,6 +618,7 @@ func TestMetricUpdateStageTiming(t *testing.T) {
 		checkStage(update.StageTiming[0], "foo_stage_1")
 		checkStage(update.StageTiming[1], "foo_stage_2")
 	}
+	verifyPrometheusParsing(t)
 
 	// Now try generating data for both metrics and stages.
 	fooMetric.Increment()
@@ -639,10 +643,11 @@ func TestMetricUpdateStageTiming(t *testing.T) {
 		checkStage(update.StageTiming[0], "last_stage_1")
 		checkStage(update.StageTiming[1], "last_stage_2")
 	}
+	verifyPrometheusParsing(t)
 }
 
 func TestTimerMetric(t *testing.T) {
-	defer reset()
+	defer resetTest()
 	// This bucketer just has 2 finite buckets: [0, 500ms) and [500ms, 1s).
 	bucketer := NewExponentialBucketer(2, uint64((500 * time.Millisecond).Nanoseconds()), 0, 1)
 	field1 := NewField("field1", []string{"foo", "bar"})
@@ -701,6 +706,7 @@ func TestTimerMetric(t *testing.T) {
 			t.Errorf("%+v: sample %d: got %d want %d", dv.DistributionValue, i, s, wantSamples[i])
 		}
 	}
+	verifyPrometheusParsing(t)
 }
 
 func TestBucketer(t *testing.T) {
@@ -835,7 +841,7 @@ func TestBucketerPanics(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			var recovered interface{}
+			var recovered any
 			func() {
 				defer func() {
 					recovered = recover()

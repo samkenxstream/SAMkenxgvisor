@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "go_binary")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_binary(
     name = "test_app",
@@ -9,7 +12,7 @@ go_binary(
         "fds.go",
         "main.go",
     ],
-    pure = True,
+    static = True,
     visibility = ["//runsc/container:__pkg__"],
     deps = [
         "//pkg/test/testutil",

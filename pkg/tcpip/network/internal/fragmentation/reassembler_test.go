@@ -20,7 +20,7 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-	"gvisor.dev/gvisor/pkg/buffer"
+	"gvisor.dev/gvisor/pkg/bufferv2"
 	"gvisor.dev/gvisor/pkg/tcpip/faketime"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
@@ -29,7 +29,7 @@ type processParams struct {
 	first     uint16
 	last      uint16
 	more      bool
-	pkt       *stack.PacketBuffer
+	pkt       stack.PacketBufferPtr
 	wantDone  bool
 	wantError error
 }
@@ -37,16 +37,16 @@ type processParams struct {
 func TestReassemblerProcess(t *testing.T) {
 	const proto = 99
 
-	v := func(size int) []byte {
-		payload := make([]byte, size)
+	v := func(size int) *bufferv2.View {
+		payload := bufferv2.NewViewSize(size)
 		for i := 1; i < size; i++ {
-			payload[i] = uint8(i) * 3
+			payload.WriteAt([]byte{uint8(i) * 3}, i)
 		}
 		return payload
 	}
 
-	pkt := func(sizes ...int) *stack.PacketBuffer {
-		var buf buffer.Buffer
+	pkt := func(sizes ...int) stack.PacketBufferPtr {
+		var buf bufferv2.Buffer
 		for _, size := range sizes {
 			buf.Append(v(size))
 		}
@@ -59,7 +59,7 @@ func TestReassemblerProcess(t *testing.T) {
 		name    string
 		params  []processParams
 		want    []hole
-		wantPkt *stack.PacketBuffer
+		wantPkt stack.PacketBufferPtr
 	}{
 		{
 			name:   "No fragments",
@@ -191,19 +191,19 @@ func TestReassemblerProcess(t *testing.T) {
 			// reassembler will leak PacketBuffers.
 			defer func() {
 				for _, h := range r.holes {
-					if h.pkt != nil {
+					if !h.pkt.IsNil() {
 						h.pkt.DecRef()
 					}
 				}
-				if r.pkt != nil {
+				if !r.pkt.IsNil() {
 					r.pkt.DecRef()
 				}
 			}()
-			var resPkt *stack.PacketBuffer
+			var resPkt stack.PacketBufferPtr
 			var isDone bool
 			for _, param := range test.params {
 				pkt, _, done, _, err := r.process(param.first, param.last, param.more, proto, param.pkt)
-				if pkt != nil {
+				if !pkt.IsNil() {
 					defer pkt.DecRef()
 				}
 				if done != param.wantDone || err != param.wantError {
@@ -215,12 +215,12 @@ func TestReassemblerProcess(t *testing.T) {
 				}
 			}
 
-			ignorePkt := func(a, b *stack.PacketBuffer) bool { return true }
-			cmpPktData := func(a, b *stack.PacketBuffer) bool {
-				if a == nil || b == nil {
+			ignorePkt := func(a, b stack.PacketBufferPtr) bool { return true }
+			cmpPktData := func(a, b stack.PacketBufferPtr) bool {
+				if a.IsNil() || b.IsNil() {
 					return a == b
 				}
-				return bytes.Equal(a.Data().AsRange().ToOwnedView(), b.Data().AsRange().ToOwnedView())
+				return bytes.Equal(a.Data().AsRange().ToSlice(), b.Data().AsRange().ToSlice())
 			}
 
 			if isDone {
@@ -246,16 +246,16 @@ func TestReassemblerProcess(t *testing.T) {
 			}
 		})
 		for _, p := range test.params {
-			if p.pkt != nil {
+			if !p.pkt.IsNil() {
 				p.pkt.DecRef()
 			}
 		}
 		for _, w := range test.want {
-			if w.pkt != nil {
+			if !w.pkt.IsNil() {
 				w.pkt.DecRef()
 			}
 		}
-		if test.wantPkt != nil {
+		if !test.wantPkt.IsNil() {
 			test.wantPkt.DecRef()
 		}
 	}

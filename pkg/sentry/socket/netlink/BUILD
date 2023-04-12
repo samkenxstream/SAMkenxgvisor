@@ -1,15 +1,16 @@
 load("//tools:defs.bzl", "go_library", "go_test")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "netlink",
     srcs = [
         "message.go",
         "provider.go",
-        "provider_vfs2.go",
         "socket.go",
-        "socket_vfs2.go",
     ],
     visibility = ["//pkg/sentry:internal"],
     deps = [
@@ -23,8 +24,6 @@ go_library(
         "//pkg/marshal/primitive",
         "//pkg/sentry/arch",
         "//pkg/sentry/device",
-        "//pkg/sentry/fs",
-        "//pkg/sentry/fs/fsutil",
         "//pkg/sentry/fsimpl/sockfs",
         "//pkg/sentry/kernel",
         "//pkg/sentry/kernel/auth",

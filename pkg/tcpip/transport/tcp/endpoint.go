@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/bufferv2"
 	"gvisor.dev/gvisor/pkg/sleep"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -604,6 +605,12 @@ func calculateAdvertisedMSS(userMSS uint16, r *stack.Route) uint16 {
 	return maxMSS
 }
 
+// isOwnedByUser() returns true if the endpoint lock is currently
+// held by a user(syscall) goroutine.
+func (e *endpoint) isOwnedByUser() bool {
+	return e.ownedByUser.Load() == 1
+}
+
 // LockUser tries to lock e.mu and if it fails it will check if the lock is held
 // by another syscall goroutine. If yes, then it will goto sleep waiting for the
 // lock to be released, if not then it will spin till it acquires the lock or
@@ -612,10 +619,31 @@ func calculateAdvertisedMSS(userMSS uint16, r *stack.Route) uint16 {
 //
 // The assumption behind spinning here being that background packet processing
 // should not be holding the lock for long and spinning reduces latency as we
-// avoid an expensive sleep/wakeup of of the syscall goroutine).
+// avoid an expensive sleep/wakeup of the syscall goroutine).
 // +checklocksacquire:e.mu
 func (e *endpoint) LockUser() {
-	for {
+	const iterations = 5
+	for i := 0; i < iterations; i++ {
+		// Try first if the sock is locked then check if it's owned
+		// by another user goroutine if not then we spin, otherwise
+		// we just go to sleep on the Lock() and wait.
+		if !e.TryLock() {
+			// If socket is owned by the user then just go to sleep
+			// as the lock could be held for a reasonably long time.
+			if e.ownedByUser.Load() == 1 {
+				e.mu.Lock()
+				e.ownedByUser.Store(1)
+				return
+			}
+			// Spin but don't yield the processor since the lower half
+			// should yield the lock soon.
+			continue
+		}
+		e.ownedByUser.Store(1)
+		return
+	}
+
+	for i := 0; i < iterations; i++ {
 		// Try first if the sock is locked then check if it's owned
 		// by another user goroutine if not then we spin, otherwise
 		// we just go to sleep on the Lock() and wait.
@@ -635,6 +663,10 @@ func (e *endpoint) LockUser() {
 		e.ownedByUser.Store(1)
 		return
 	}
+
+	// Finally just give up and wait for the Lock.
+	e.mu.Lock()
+	e.ownedByUser.Store(1)
 }
 
 // UnlockUser will check if there are any segments already queued for processing
@@ -729,6 +761,9 @@ func (e *endpoint) setEndpointState(state EndpointState) {
 	case StateClose:
 		if oldstate == StateCloseWait || oldstate == StateEstablished {
 			e.stack.Stats().TCP.EstablishedResets.Increment()
+		}
+		if oldstate.connected() {
+			e.stack.Stats().TCP.CurrentConnected.Decrement()
 		}
 		fallthrough
 	default:
@@ -976,8 +1011,8 @@ func (e *endpoint) Abort() {
 	// Reset all connected endpoints.
 	switch state := e.EndpointState(); {
 	case state.connected():
-		e.stack.Stats().TCP.CurrentConnected.Decrement()
 		e.resetConnectionLocked(&tcpip.ErrAborted{})
+		e.waiterQueue.Notify(waiter.EventHUp | waiter.EventErr | waiter.ReadableEvents | waiter.WritableEvents)
 		return
 	}
 	e.closeLocked()
@@ -1492,7 +1527,7 @@ func (e *endpoint) isEndpointWritableLocked() (int, tcpip.Error) {
 // readFromPayloader reads a slice from the Payloader.
 // +checklocks:e.mu
 // +checklocks:e.sndQueueInfo.sndQueueMu
-func (e *endpoint) readFromPayloader(p tcpip.Payloader, opts tcpip.WriteOptions, avail int) ([]byte, tcpip.Error) {
+func (e *endpoint) readFromPayloader(p tcpip.Payloader, opts tcpip.WriteOptions, avail int) (bufferv2.Buffer, tcpip.Error) {
 	// We can release locks while copying data.
 	//
 	// This is not possible if atomic is set, because we can't allow the
@@ -1507,18 +1542,18 @@ func (e *endpoint) readFromPayloader(p tcpip.Payloader, opts tcpip.WriteOptions,
 	}
 
 	// Fetch data.
+	var payload bufferv2.Buffer
 	if l := p.Len(); l < avail {
 		avail = l
 	}
 	if avail == 0 {
-		return nil, nil
+		return payload, nil
 	}
-	v := make([]byte, avail)
-	n, err := p.Read(v)
-	if err != nil && err != io.EOF {
-		return nil, &tcpip.ErrBadBuffer{}
+	if _, err := payload.WriteFromReader(p, int64(avail)); err != nil {
+		payload.Release()
+		return bufferv2.Buffer{}, &tcpip.ErrBadBuffer{}
 	}
-	return v[:n], nil
+	return payload, nil
 }
 
 // queueSegment reads data from the payloader and returns a segment to be sent.
@@ -1533,13 +1568,13 @@ func (e *endpoint) queueSegment(p tcpip.Payloader, opts tcpip.WriteOptions) (*se
 		return nil, 0, err
 	}
 
-	v, err := e.readFromPayloader(p, opts, avail)
+	buf, err := e.readFromPayloader(p, opts, avail)
 	if err != nil {
 		return nil, 0, err
 	}
 
 	// Do not queue zero length segments.
-	if len(v) == 0 {
+	if buf.Size() == 0 {
 		return nil, 0, nil
 	}
 
@@ -1550,23 +1585,25 @@ func (e *endpoint) queueSegment(p tcpip.Payloader, opts tcpip.WriteOptions) (*se
 		avail, err := e.isEndpointWritableLocked()
 		if err != nil {
 			e.stats.WriteErrors.WriteClosed.Increment()
+			buf.Release()
 			return nil, 0, err
 		}
 
-		// Discard any excess data copied in due to avail being reduced due
-		// to a simultaneous write call to the socket.
-		if avail < len(v) {
-			v = v[:avail]
+		// A simultaneous call to write on the socket can reduce avail. Discard
+		// excess data copied if this is the case.
+		if int64(avail) < buf.Size() {
+			buf.Truncate(int64(avail))
 		}
 	}
 
 	// Add data to the send queue.
-	s := newOutgoingSegment(e.TransportEndpointInfo.ID, e.stack.Clock(), v)
-	e.sndQueueInfo.SndBufUsed += len(v)
+	size := int(buf.Size())
+	s := newOutgoingSegment(e.TransportEndpointInfo.ID, e.stack.Clock(), buf)
+	e.sndQueueInfo.SndBufUsed += size
 	s.IncRef()
 	e.snd.writeList.PushBack(s)
 
-	return s, len(v), nil
+	return s, size, nil
 }
 
 // Write writes data to the endpoint's peer.
@@ -2349,7 +2386,7 @@ func (e *endpoint) connect(addr tcpip.FullAddress, handshake bool) tcpip.Error {
 		}
 
 		if nicID != 0 && nicID != e.boundNICID {
-			return &tcpip.ErrNoRoute{}
+			return &tcpip.ErrHostUnreachable{}
 		}
 
 		nicID = e.boundNICID
@@ -2489,7 +2526,7 @@ func (e *endpoint) shutdownLocked(flags tcpip.ShutdownFlags) tcpip.Error {
 			}
 
 			// Queue fin segment.
-			s := newOutgoingSegment(e.TransportEndpointInfo.ID, e.stack.Clock(), nil)
+			s := newOutgoingSegment(e.TransportEndpointInfo.ID, e.stack.Clock(), bufferv2.Buffer{})
 			e.snd.writeList.PushBack(s)
 			// Mark endpoint as closed.
 			e.sndQueueInfo.SndClosed = true
@@ -2771,7 +2808,7 @@ func (e *endpoint) getRemoteAddress() tcpip.FullAddress {
 	}
 }
 
-func (*endpoint) HandlePacket(stack.TransportEndpointID, *stack.PacketBuffer) {
+func (*endpoint) HandlePacket(stack.TransportEndpointID, stack.PacketBufferPtr) {
 	// TCP HandlePacket is not required anymore as inbound packets first
 	// land at the Dispatcher which then can either deliver using the
 	// worker go routine or directly do the invoke the tcp processing inline
@@ -2789,7 +2826,7 @@ func (e *endpoint) enqueueSegment(s *segment) bool {
 	return true
 }
 
-func (e *endpoint) onICMPError(err tcpip.Error, transErr stack.TransportError, pkt *stack.PacketBuffer) {
+func (e *endpoint) onICMPError(err tcpip.Error, transErr stack.TransportError, pkt stack.PacketBufferPtr) {
 	// Update last error first.
 	e.lastErrorMu.Lock()
 	e.lastError = err
@@ -2811,7 +2848,7 @@ func (e *endpoint) onICMPError(err tcpip.Error, transErr stack.TransportError, p
 			Cause: transErr,
 			// Linux passes the payload with the TCP header. We don't know if the TCP
 			// header even exists, it may not for fragmented packets.
-			Payload: pkt.Data().AsRange().ToOwnedView(),
+			Payload: pkt.Data().AsRange().ToView(),
 			Dst: tcpip.FullAddress{
 				NIC:  pkt.NICID,
 				Addr: e.TransportEndpointInfo.ID.RemoteAddress,
@@ -2846,7 +2883,7 @@ func (e *endpoint) onICMPError(err tcpip.Error, transErr stack.TransportError, p
 }
 
 // HandleError implements stack.TransportEndpoint.
-func (e *endpoint) HandleError(transErr stack.TransportError, pkt *stack.PacketBuffer) {
+func (e *endpoint) HandleError(transErr stack.TransportError, pkt stack.PacketBufferPtr) {
 	handlePacketTooBig := func(mtu uint32) {
 		e.sndQueueInfo.sndQueueMu.Lock()
 		update := false
@@ -2870,9 +2907,19 @@ func (e *endpoint) HandleError(transErr stack.TransportError, pkt *stack.PacketB
 	case stack.PacketTooBigTransportError:
 		handlePacketTooBig(transErr.Info())
 	case stack.DestinationHostUnreachableTransportError:
-		e.onICMPError(&tcpip.ErrNoRoute{}, transErr, pkt)
+		e.onICMPError(&tcpip.ErrHostUnreachable{}, transErr, pkt)
 	case stack.DestinationNetworkUnreachableTransportError:
 		e.onICMPError(&tcpip.ErrNetworkUnreachable{}, transErr, pkt)
+	case stack.DestinationPortUnreachableTransportError:
+		e.onICMPError(&tcpip.ErrConnectionRefused{}, transErr, pkt)
+	case stack.DestinationProtoUnreachableTransportError:
+		e.onICMPError(&tcpip.ErrUnknownProtocolOption{}, transErr, pkt)
+	case stack.SourceRouteFailedTransportError:
+		e.onICMPError(&tcpip.ErrNotSupported{}, transErr, pkt)
+	case stack.SourceHostIsolatedTransportError:
+		e.onICMPError(&tcpip.ErrNoNet{}, transErr, pkt)
+	case stack.DestinationHostDownTransportError:
+		e.onICMPError(&tcpip.ErrHostDown{}, transErr, pkt)
 	}
 }
 

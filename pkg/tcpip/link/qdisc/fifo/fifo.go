@@ -28,9 +28,11 @@ import (
 var _ stack.QueueingDiscipline = (*discipline)(nil)
 
 const (
-	// BatchSize represents the number of packets written to the
-	// lower link endpoint during calls to WritePackets.
-	BatchSize   = 32
+	// BatchSize is the number of packets to write in each syscall. It is 47
+	// because when GvisorGSO is in use then a single 65KB TCP segment can get
+	// split into 46 segments of 1420 bytes and a single 216 byte segment.
+	BatchSize = 47
+
 	qDiscClosed = 1
 )
 
@@ -60,7 +62,7 @@ type queueDispatcher struct {
 	closeWaker     sleep.Waker
 }
 
-// New creates a new fifo queuing discipline  with the n queues with maximum
+// New creates a new fifo queuing discipline with the n queues with maximum
 // capacity of queueLen.
 //
 // +checklocksignore: we don't have to hold locks during initialization.
@@ -95,7 +97,7 @@ func (qd *queueDispatcher) dispatchLoop() {
 		case &qd.newPacketWaker:
 		case &qd.closeWaker:
 			qd.mu.Lock()
-			for p := qd.queue.removeFront(); p != nil; p = qd.queue.removeFront() {
+			for p := qd.queue.removeFront(); !p.IsNil(); p = qd.queue.removeFront() {
 				p.DecRef()
 			}
 			qd.queue.decRef()
@@ -105,7 +107,7 @@ func (qd *queueDispatcher) dispatchLoop() {
 			panic("unknown waker")
 		}
 		qd.mu.Lock()
-		for pkt := qd.queue.removeFront(); pkt != nil; pkt = qd.queue.removeFront() {
+		for pkt := qd.queue.removeFront(); !pkt.IsNil(); pkt = qd.queue.removeFront() {
 			batch.PushBack(pkt)
 			if batch.Len() < BatchSize && !qd.queue.isEmpty() {
 				continue
@@ -125,7 +127,7 @@ func (qd *queueDispatcher) dispatchLoop() {
 //   - pkt.EgressRoute
 //   - pkt.GSOOptions
 //   - pkt.NetworkProtocolNumber
-func (d *discipline) WritePacket(pkt *stack.PacketBuffer) tcpip.Error {
+func (d *discipline) WritePacket(pkt stack.PacketBufferPtr) tcpip.Error {
 	if d.closed.Load() == qDiscClosed {
 		return &tcpip.ErrClosedForSend{}
 	}

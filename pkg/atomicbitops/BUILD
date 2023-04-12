@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "go_library", "go_test")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "atomicbitops",
@@ -14,11 +17,13 @@ go_library(
         "atomicbitops_arm64.go",
         "atomicbitops_arm64.s",
         "atomicbitops_noasm.go",
+        "bool.go",
     ],
     visibility = ["//:sandbox"],
     deps = [
         "//pkg/cpuid",
         "//pkg/sync",
+        "@org_golang_x_sys//cpu:go_default_library",
     ],
 )
 

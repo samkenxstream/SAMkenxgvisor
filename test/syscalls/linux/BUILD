@@ -1,6 +1,8 @@
-load("//tools:defs.bzl", "cc_binary", "cc_library", "gbenchmark", "gtest", "select_arch", "select_system")
+load("//tools:arch.bzl", "select_arch")
+load("//tools:defs.bzl", "cc_binary", "cc_library", "gbenchmark", "gtest", "select_system")
 
 package(
+    default_applicable_licenses = ["//:license"],
     default_visibility = ["//:sandbox"],
     licenses = ["notice"],
 )
@@ -316,9 +318,6 @@ cc_binary(
     testonly = 1,
     srcs = ["bad.cc"],
     linkstatic = 1,
-    visibility = [
-        "//:sandbox",
-    ],
     deps = [
         gtest,
         "//test/util:test_main",
@@ -540,6 +539,21 @@ cc_binary(
 )
 
 cc_binary(
+    name = "bind_external_test",
+    testonly = 1,
+    srcs = ["bind_external.cc"],
+    linkstatic = 1,
+    deps = [
+        "//test/util:file_descriptor",
+        "//test/util:fs_util",
+        "//test/util:socket_util",
+        gtest,
+        "//test/util:test_main",
+        "//test/util:test_util",
+    ],
+)
+
+cc_binary(
     name = "connect_external_test",
     testonly = 1,
     srcs = ["connect_external.cc"],
@@ -548,6 +562,20 @@ cc_binary(
         "//test/util:file_descriptor",
         "//test/util:fs_util",
         "//test/util:socket_util",
+        gtest,
+        "//test/util:test_main",
+        "//test/util:test_util",
+    ],
+)
+
+cc_binary(
+    name = "pipe_external_test",
+    testonly = 1,
+    srcs = ["pipe_external.cc"],
+    linkstatic = 1,
+    deps = [
+        "//test/util:file_descriptor",
+        "//test/util:fs_util",
         gtest,
         "//test/util:test_main",
         "//test/util:test_util",
@@ -1041,6 +1069,28 @@ cc_binary(
         "//test/util:signal_util",
         "//test/util:test_main",
         "//test/util:test_util",
+    ],
+)
+
+cc_binary(
+    name = "iouring_test",
+    testonly = 1,
+    srcs = ["io_uring.cc"],
+    linkstatic = 1,
+    deps = [
+        "//test/util:capability_util",
+        "//test/util:file_descriptor",
+        "//test/util:fs_util",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/time",
+        gtest,
+        "//test/util:io_uring_util",
+        "//test/util:memory_util",
+        "//test/util:multiprocess_util",
+        "//test/util:temp_path",
+        "//test/util:test_main",
+        "//test/util:test_util",
+        "//test/util:thread_util",
     ],
 )
 
@@ -1611,6 +1661,9 @@ cc_binary(
     name = "poll_test",
     testonly = 1,
     srcs = ["poll.cc"],
+    copts = [
+        "-Wno-unknown-warning-option",
+    ],
     linkstatic = 1,
     deps = [
         ":base_poll_test",
@@ -1771,6 +1824,7 @@ cc_binary(
         "//test/util:file_descriptor",
         "//test/util:fs_util",
         "//test/util:mount_util",
+        "@com_google_absl//absl/algorithm:container",
         "@com_google_absl//absl/container:node_hash_set",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
@@ -1846,7 +1900,6 @@ cc_binary(
         "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
-        "@com_google_absl//absl/types:optional",
         gtest,
         "//test/util:memory_util",
         "//test/util:posix_error",
@@ -2104,9 +2157,12 @@ cc_binary(
     linkstatic = 1,
     deps = [
         "//test/util:capability_util",
+        "//test/util:proc_util",
         "//test/util:test_main",
         "//test/util:test_util",
         "//test/util:thread_util",
+        "@com_google_absl//absl/algorithm:container",
+        "@com_google_absl//absl/strings",
     ],
 )
 
@@ -3263,6 +3319,7 @@ cc_binary(
         ":socket_netlink_util",
         "//test/util:socket_util",
         gtest,
+        "//test/util:capability_util",
         "//test/util:test_main",
         "//test/util:test_util",
         "@com_google_absl//absl/time",
@@ -3764,6 +3821,7 @@ cc_binary(
         "//test/util:file_descriptor",
         "@com_google_absl//absl/strings",
         gtest,
+        "//test/util:fs_util",
         "//test/util:posix_error",
         "//test/util:temp_path",
         "//test/util:test_main",
@@ -3849,6 +3907,7 @@ cc_binary(
     deps = [
         "//test/util:file_descriptor",
         "//test/util:socket_util",
+        "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/time",
         gtest,
         "//test/util:posix_error",
@@ -4023,6 +4082,9 @@ cc_binary(
     name = "uidgid_test",
     testonly = 1,
     srcs = ["uidgid.cc"],
+    copts = [
+        "-Wno-unknown-warning-option",
+    ],
     linkstatic = 1,
     deps = [
         "//test/util:capability_util",
@@ -4108,6 +4170,7 @@ cc_binary(
     linkstatic = 1,
     deps = [
         "//test/util:fs_util",
+        "@com_google_absl//absl/algorithm:container",
         gtest,
         "//test/util:posix_error",
         "//test/util:proc_util",
@@ -4472,5 +4535,46 @@ cc_binary(
         "//test/util:test_main",
         "//test/util:test_util",
         "//test/util:thread_util",
+    ],
+)
+
+cc_binary(
+    name = "fuse_test",
+    testonly = 1,
+    srcs = ["fuse.cc"],
+    linkstatic = 1,
+    # We require additional UIDs for this test, so don't include the bazel
+    # sandbox as standard.
+    deps = [
+        "//test/util:capability_util",
+        "//test/util:file_descriptor",
+        "//test/util:fs_util",
+        "//test/util:mount_util",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/synchronization",
+        gtest,
+        "//test/util:posix_error",
+        "//test/util:temp_path",
+        "//test/util:test_main",
+        "//test/util:test_util",
+        "//test/util:thread_util",
+        "@com_google_absl//absl/strings:str_format",
+    ],
+)
+
+cc_binary(
+    name = "process_vm_read_write",
+    testonly = 1,
+    srcs = ["process_vm_read_write.cc"],
+    linkstatic = 1,
+    deps = [
+        gtest,
+        "//test/util:capability_util",
+        "//test/util:logging",
+        "//test/util:multiprocess_util",
+        "//test/util:posix_error",
+        "//test/util:test_main",
+        "//test/util:test_util",
+        "@com_google_absl//absl/strings",
     ],
 )

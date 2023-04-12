@@ -24,7 +24,6 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safemem"
-	"gvisor.dev/gvisor/pkg/sentry/fsbridge"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -272,9 +271,6 @@ func (fs *filesystem) newComm(ctx context.Context, task *kernel.Task, ino uint64
 func (i *commInode) CheckPermissions(ctx context.Context, creds *auth.Credentials, ats vfs.AccessTypes) error {
 	// This file can always be read or written by members of the same thread
 	// group. See fs/proc/base.c:proc_tid_comm_permission.
-	//
-	// N.B. This check is currently a no-op as we don't yet support writing and
-	// this file is world-readable anyways.
 	t := kernel.TaskFromContext(ctx)
 	if t != nil && t.ThreadGroup() == i.task.ThreadGroup() && !ats.MayExec() {
 		return nil
@@ -283,7 +279,7 @@ func (i *commInode) CheckPermissions(ctx context.Context, creds *auth.Credential
 	return i.DynamicBytesFile.CheckPermissions(ctx, creds, ats)
 }
 
-// commData implements vfs.DynamicBytesSource for /proc/[pid]/comm.
+// commData implements vfs.WritableDynamicBytesSource for /proc/[pid]/comm.
 //
 // +stateify savable
 type commData struct {
@@ -293,12 +289,34 @@ type commData struct {
 }
 
 var _ dynamicInode = (*commData)(nil)
+var _ vfs.WritableDynamicBytesSource = (*commData)(nil)
 
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (d *commData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	buf.WriteString(d.task.Name())
 	buf.WriteString("\n")
 	return nil
+}
+
+// Write implements vfs.WritableDynamicBytesSource.Write.
+func (d *commData) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
+	srclen := src.NumBytes()
+	name := make([]byte, srclen)
+	if _, err := src.CopyIn(ctx, name); err != nil {
+		return 0, err
+	}
+
+	// Only allow writes from the same thread group, otherwise return
+	// EINVAL. See fs/proc/base.c:comm_write.
+	//
+	// Note that this check exists in addition to the same-thread-group
+	// check in CheckPermissions.
+	t := kernel.TaskFromContext(ctx)
+	if t == nil || t.ThreadGroup() != d.task.ThreadGroup() {
+		return 0, linuxerr.EINVAL
+	}
+	d.task.SetName(string(name))
+	return int64(srclen), nil
 }
 
 // idMapData implements vfs.WritableDynamicBytesSource for
@@ -394,6 +412,7 @@ type memInode struct {
 	kernfs.InodeNoopRefCount
 	kernfs.InodeNotDirectory
 	kernfs.InodeNotSymlink
+	kernfs.InodeWatches
 
 	task  *kernel.Task
 	locks vfs.FileLocks
@@ -529,6 +548,44 @@ func (fd *memFD) SetStat(context.Context, vfs.SetStatOptions) error {
 // Release implements vfs.FileDescriptionImpl.Release.
 func (fd *memFD) Release(context.Context) {}
 
+// limitsData implements vfs.DynamicBytesSource for /proc/[pid]/limits.
+//
+// +stateify savable
+type limitsData struct {
+	kernfs.DynamicBytesFile
+
+	task *kernel.Task
+}
+
+func (d *limitsData) Generate(ctx context.Context, buf *bytes.Buffer) error {
+	taskLimits := d.task.Limits()
+	// formatting matches the kernel output from linux/fs/proc/base.c:proc_pid_limits()
+	fmt.Fprintf(buf, "Limit                     Soft Limit           Hard Limit           Units     \n")
+	for _, lt := range limits.AllLimitTypes {
+		fmt.Fprintf(buf, "%-25s ", lt.Name())
+
+		l := taskLimits.Get(lt)
+		if l.Cur == limits.Infinity {
+			fmt.Fprintf(buf, "%-20s ", "unlimited")
+		} else {
+			fmt.Fprintf(buf, "%-20d ", l.Cur)
+		}
+
+		if l.Max == limits.Infinity {
+			fmt.Fprintf(buf, "%-20s ", "unlimited")
+		} else {
+			fmt.Fprintf(buf, "%-20d ", l.Max)
+		}
+
+		if u := lt.Unit(); u != "" {
+			fmt.Fprintf(buf, "%-10s", u)
+		}
+
+		buf.WriteByte('\n')
+	}
+	return nil
+}
+
 // mapsData implements vfs.DynamicBytesSource for /proc/[pid]/maps.
 //
 // +stateify savable
@@ -543,7 +600,7 @@ var _ dynamicInode = (*mapsData)(nil)
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (d *mapsData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	if mm := getMM(d.task); mm != nil {
-		mm.ReadMapsDataInto(ctx, buf)
+		mm.ReadMapsDataInto(ctx, mm.MapsCallbackFuncForBuffer(buf))
 	}
 	return nil
 }
@@ -675,6 +732,7 @@ type statusInode struct {
 	kernfs.InodeNoopRefCount
 	kernfs.InodeNotDirectory
 	kernfs.InodeNotSymlink
+	kernfs.InodeWatches
 
 	task  *kernel.Task
 	pidns *kernel.PIDNamespace
@@ -796,7 +854,7 @@ func (s *statusFD) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	fmt.Fprintf(buf, "Uid:\t%d\t%d\t%d\t%d\n", ruid, euid, suid, euid)
 	fmt.Fprintf(buf, "Gid:\t%d\t%d\t%d\t%d\n", rgid, egid, sgid, egid)
 	fmt.Fprintf(buf, "FDSize:\t%d\n", fds)
-	buf.WriteString("Groups:\t ")
+	buf.WriteString("Groups:\t")
 	// There is a space between each pair of supplemental GIDs, as well as an
 	// unconditional trailing space that some applications actually depend on.
 	var sep string
@@ -906,6 +964,7 @@ type exeSymlink struct {
 	kernfs.InodeAttrs
 	kernfs.InodeNoopRefCount
 	kernfs.InodeSymlink
+	kernfs.InodeWatches
 
 	fs   *filesystem
 	task *kernel.Task
@@ -932,8 +991,7 @@ func (s *exeSymlink) Readlink(ctx context.Context, _ *vfs.Mount) (string, error)
 
 	root := vfs.RootFromContext(ctx)
 	if !root.Ok() {
-		// It could have raced with process deletion.
-		return "", linuxerr.ESRCH
+		panic("procfs Readlink requires context with root value")
 	}
 	defer s.fs.SafeDecRef(ctx, root)
 
@@ -965,7 +1023,7 @@ func (s *exeSymlink) Getlink(ctx context.Context, _ *vfs.Mount) (vfs.VirtualDent
 	}
 	defer exec.DecRef(ctx)
 
-	vd := exec.(*fsbridge.VFSFile).FileDescription().VirtualDentry()
+	vd := exec.VirtualDentry()
 	vd.IncRef()
 	return vd, "", nil
 }
@@ -978,6 +1036,7 @@ type cwdSymlink struct {
 	kernfs.InodeAttrs
 	kernfs.InodeNoopRefCount
 	kernfs.InodeSymlink
+	kernfs.InodeWatches
 
 	fs   *filesystem
 	task *kernel.Task
@@ -1004,8 +1063,7 @@ func (s *cwdSymlink) Readlink(ctx context.Context, _ *vfs.Mount) (string, error)
 
 	root := vfs.RootFromContext(ctx)
 	if !root.Ok() {
-		// It could have raced with process deletion.
-		return "", linuxerr.ESRCH
+		panic("procfs Readlink requires context with root value")
 	}
 	defer s.fs.SafeDecRef(ctx, root)
 
@@ -1022,13 +1080,74 @@ func (s *cwdSymlink) Getlink(ctx context.Context, _ *vfs.Mount) (vfs.VirtualDent
 	if err := checkTaskState(s.task); err != nil {
 		return vfs.VirtualDentry{}, "", err
 	}
-	cwd := s.task.FSContext().WorkingDirectoryVFS2()
+	cwd := s.task.FSContext().WorkingDirectory()
 	if !cwd.Ok() {
 		// It could have raced with process deletion.
 		return vfs.VirtualDentry{}, "", linuxerr.ESRCH
 	}
 	// The reference is transferred to the caller.
 	return cwd, "", nil
+}
+
+// rootSymlink is an symlink for the /proc/[pid]/root file.
+//
+// +stateify savable
+type rootSymlink struct {
+	implStatFS
+	kernfs.InodeAttrs
+	kernfs.InodeNoopRefCount
+	kernfs.InodeSymlink
+	kernfs.InodeWatches
+
+	fs   *filesystem
+	task *kernel.Task
+}
+
+var _ kernfs.Inode = (*rootSymlink)(nil)
+
+func (fs *filesystem) newRootSymlink(ctx context.Context, task *kernel.Task, ino uint64) kernfs.Inode {
+	inode := &rootSymlink{
+		fs:   fs,
+		task: task,
+	}
+	inode.Init(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeSymlink|0777)
+	return inode
+}
+
+// Readlink implements kernfs.Inode.Readlink.
+func (s *rootSymlink) Readlink(ctx context.Context, _ *vfs.Mount) (string, error) {
+	root, _, err := s.Getlink(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer s.fs.SafeDecRef(ctx, root)
+
+	vfsRoot := vfs.RootFromContext(ctx)
+	if !vfsRoot.Ok() {
+		panic("procfs Readlink requires context with root value")
+	}
+	defer s.fs.SafeDecRef(ctx, vfsRoot)
+
+	vfsObj := root.Mount().Filesystem().VirtualFilesystem()
+	name, _ := vfsObj.PathnameWithDeleted(ctx, vfsRoot, root)
+	return name, nil
+}
+
+// Getlink implements kernfs.Inode.Getlink.
+func (s *rootSymlink) Getlink(ctx context.Context, _ *vfs.Mount) (vfs.VirtualDentry, string, error) {
+	if !kernel.ContextCanTrace(ctx, s.task, false) {
+		return vfs.VirtualDentry{}, "", linuxerr.EACCES
+	}
+	if err := checkTaskState(s.task); err != nil {
+		return vfs.VirtualDentry{}, "", err
+	}
+	root := s.task.FSContext().RootDirectory()
+	if !root.Ok() {
+		// It could have raced with process deletion.
+		return vfs.VirtualDentry{}, "", linuxerr.ESRCH
+	}
+	// The reference is transferred to the caller.
+	return root, "", nil
 }
 
 // mountInfoData is used to implement /proc/[pid]/mountinfo.
@@ -1053,7 +1172,7 @@ func (i *mountInfoData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 		// The task has been destroyed. Nothing to show here.
 		return nil
 	}
-	rootDir := fsctx.RootDirectoryVFS2()
+	rootDir := fsctx.RootDirectory()
 	if !rootDir.Ok() {
 		// Root has been destroyed. Don't try to read mounts.
 		return nil
@@ -1085,7 +1204,7 @@ func (i *mountsData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 		// The task has been destroyed. Nothing to show here.
 		return nil
 	}
-	rootDir := fsctx.RootDirectoryVFS2()
+	rootDir := fsctx.RootDirectory()
 	if !rootDir.Ok() {
 		// Root has been destroyed. Don't try to read mounts.
 		return nil
@@ -1152,6 +1271,7 @@ type namespaceInode struct {
 	kernfs.InodeNoopRefCount
 	kernfs.InodeNotDirectory
 	kernfs.InodeNotSymlink
+	kernfs.InodeWatches
 
 	locks vfs.FileLocks
 }

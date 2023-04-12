@@ -1,6 +1,7 @@
 load("//website:defs.bzl", "doc")
 
 package(
+    default_applicable_licenses = ["//:license"],
     default_visibility = ["//website:__pkg__"],
     licenses = ["notice"],
 )
@@ -34,6 +35,15 @@ doc(
     permalink = "/docs/tutorials/kubernetes/",
     subcategory = "Tutorials",
     weight = "30",
+)
+
+doc(
+    name = "falco",
+    src = "falco.md",
+    category = "User Guide",
+    permalink = "/docs/tutorials/falco/",
+    subcategory = "Tutorials",
+    weight = "35",
 )
 
 doc(

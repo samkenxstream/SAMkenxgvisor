@@ -25,7 +25,6 @@ import (
 	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/memutil"
-	"gvisor.dev/gvisor/pkg/sentry/fsbridge"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -35,6 +34,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
+	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 
@@ -50,6 +50,9 @@ var (
 
 // Boot initializes a new bare bones kernel for test.
 func Boot() (*kernel.Kernel, error) {
+	cpuid.Initialize()
+	seccheck.Initialize()
+
 	platformCtr, err := platform.Lookup(*platformFlag)
 	if err != nil {
 		return nil, fmt.Errorf("platform not found: %v", err)
@@ -63,7 +66,6 @@ func Boot() (*kernel.Kernel, error) {
 		return nil, fmt.Errorf("creating platform: %v", err)
 	}
 
-	kernel.VFS2Enabled = true
 	k := &kernel.Kernel{
 		Platform: plat,
 	}
@@ -111,7 +113,7 @@ func Boot() (*kernel.Kernel, error) {
 	if err != nil {
 		return nil, err
 	}
-	tg := k.NewThreadGroup(nil, k.RootPIDNamespace(), kernel.NewSignalHandlers(), linux.SIGCHLD, ls)
+	tg := k.NewThreadGroup(k.RootPIDNamespace(), kernel.NewSignalHandlers(), linux.SIGCHLD, ls)
 	k.TestOnlySetGlobalInit(tg)
 
 	return k, nil
@@ -129,7 +131,7 @@ func CreateTask(ctx context.Context, name string, tc *kernel.ThreadGroup, mntns 
 		return nil, err
 	}
 	m := mm.NewMemoryManager(k, k, k.SleepForAddressSpaceActivation)
-	m.SetExecutable(ctx, fsbridge.NewVFSFile(exe))
+	m.SetExecutable(ctx, exe)
 
 	creds := auth.CredentialsFromContext(ctx)
 	config := &kernel.TaskConfig{
@@ -142,8 +144,8 @@ func CreateTask(ctx context.Context, name string, tc *kernel.ThreadGroup, mntns 
 		UTSNamespace:            kernel.UTSNamespaceFromContext(ctx),
 		IPCNamespace:            kernel.IPCNamespaceFromContext(ctx),
 		AbstractSocketNamespace: kernel.NewAbstractSocketNamespace(),
-		MountNamespaceVFS2:      mntns,
-		FSContext:               kernel.NewFSContextVFS2(root, cwd, 0022),
+		MountNamespace:          mntns,
+		FSContext:               kernel.NewFSContext(root, cwd, 0022),
 		FDTable:                 k.NewFDTable(),
 		UserCounters:            k.GetUserCounters(creds.RealKUID),
 	}

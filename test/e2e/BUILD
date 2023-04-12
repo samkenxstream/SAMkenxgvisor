@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "go_library", "go_test")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_test(
     name = "integration_test",
@@ -42,7 +45,9 @@ go_test(
     deps = [
         "//pkg/test/dockerutil",
         "//pkg/test/testutil",
+        "//runsc/boot",
         "@com_github_docker_docker//api/types/mount:go_default_library",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )
 

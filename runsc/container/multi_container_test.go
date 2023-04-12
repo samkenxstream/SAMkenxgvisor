@@ -21,6 +21,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -1085,7 +1086,7 @@ func TestMultiContainerDifferentFilesystems(t *testing.T) {
 
 	// Make sure overlay is enabled, and none of the root filesystems are
 	// read-only, otherwise we won't be able to create the file.
-	conf.Overlay = true
+	conf.Overlay2 = config.Overlay2{RootMount: true, SubMounts: true, Medium: "memory"}
 	specs, ids := createSpecs(cmdRoot, cmd, cmd)
 	for _, s := range specs {
 		s.Root.Readonly = false
@@ -1816,7 +1817,7 @@ func TestMultiContainerLoadSandbox(t *testing.T) {
 
 	// Load the sandbox and check that the correct containers were returned.
 	id := wants[0].Sandbox.ID
-	gots, err := loadSandbox(conf.RootDir, id)
+	gots, err := LoadSandbox(conf.RootDir, id, LoadOpts{})
 	if err != nil {
 		t.Fatalf("loadSandbox()=%v", err)
 	}
@@ -2204,11 +2205,230 @@ func TestMultiContainerShm(t *testing.T) {
 	}
 
 	// Check that file can be found in the other container.
-	out, err := executeCombinedOutput(conf, containers[1], "/bin/cat", output)
+	out, err := executeCombinedOutput(conf, containers[1], nil, "/bin/cat", output)
 	if err != nil {
 		t.Fatalf("exec failed: %v", err)
 	}
 	if want := "123\n"; string(out) != want {
 		t.Fatalf("wrong output, want: %q, got: %v", want, out)
+	}
+}
+
+// Test that using file-backed overlay does not lead to memory leak or leaks
+// in the host-file backing the overlay.
+func TestMultiContainerOverlayLeaks(t *testing.T) {
+	conf := testutil.TestConfig(t)
+	app, err := testutil.FindFile("test/cmd/test_app/test_app")
+	if err != nil {
+		t.Fatal("error finding test_app:", err)
+	}
+
+	rootDir, cleanup, err := testutil.SetupRootDir()
+	if err != nil {
+		t.Fatalf("error creating root dir: %v", err)
+	}
+	defer cleanup()
+	conf.RootDir = rootDir
+
+	// Configure root overlay backed by rootfs itself.
+	conf.Overlay2 = config.Overlay2{
+		RootMount: true,
+		Medium:    "self",
+	}
+
+	// Root container will just sleep.
+	sleep := []string{"sleep", "100"}
+	// Since all containers share the same conf.RootDir, and root filesystems
+	// have overlay enabled, the root directory should never be modified. Hence,
+	// creating files at the same locations should not lead to EEXIST error.
+	createFsTree := []string{"/app", "fsTreeCreate", "--depth=10", "--file-per-level=10", "--file-size=4096"}
+	testSpecs, ids := createSpecs(sleep, createFsTree, createFsTree, createFsTree)
+	for i, s := range testSpecs {
+		if i == 0 {
+			// Root container just sleeps, so should be fine.
+			continue
+		}
+		// For subcontainers, make sure the root filesystems is writable because
+		// the app will create files in it.
+		s.Root.Readonly = false
+		// createSpecs assigns the host's root as the container's root. But self
+		// overlay2 medium creates the filestore file inside container's root. That
+		// will fail. So create a temporary writable directory to represent the
+		// container's root filesystem and copy the app binary there.
+		contRoot, rootfsCU, err := testutil.SetupRootDir()
+		if err != nil {
+			t.Fatalf("error creating container's root filesystem: %v", err)
+		}
+		defer rootfsCU()
+		s.Root.Path = contRoot
+		appDst := path.Join(contRoot, "app")
+		if err := copyFile(app, appDst); err != nil {
+			t.Fatalf("error copying app binary from %q to %q: %v", app, appDst, err)
+		}
+	}
+
+	// Start the containers.
+	conts, cleanup, err := startContainers(conf, testSpecs, ids)
+	if err != nil {
+		t.Fatalf("error starting containers: %v", err)
+	}
+	defer cleanup()
+
+	sandboxID := conts[0].Sandbox.ID
+	for i, c := range conts {
+		if i == 0 {
+			// Don't wait for the root container which just sleeps.
+			continue
+		}
+		// Wait for the sub-container to stop.
+		if ws, err := c.Wait(); err != nil {
+			t.Errorf("failed to wait for subcontainer number %d: %v", i, err)
+		} else if es := ws.ExitStatus(); es != 0 {
+			t.Errorf("subcontainer number %d exited with non-zero status %d", i, es)
+		}
+	}
+
+	// Give the reclaimer goroutine some time to reclaim.
+	time.Sleep(3 * time.Second)
+
+	for i, s := range testSpecs {
+		if i == 0 {
+			continue
+		}
+
+		// Stat filestoreFile to see its usage. It should have been cleaned up.
+		filestoreFile := boot.SelfOverlayFilestorePath(s.Root.Path, sandboxID)
+		var stat unix.Stat_t
+		if err := unix.Stat(filestoreFile, &stat); err != nil {
+			t.Errorf("unix.Stat(%q) failed for rootfs filestore: %v", filestoreFile, err)
+			continue
+		}
+		if stat.Blocks > 0 {
+			t.Errorf("rootfs filestore file %q for sub container %d is not cleaned up, has %d blocks", filestoreFile, i, stat.Blocks)
+		}
+	}
+}
+
+func copyFile(src, dst string) error {
+	bytesRead, err := ioutil.ReadFile(src)
+	if err != nil {
+		return err
+	}
+
+	return ioutil.WriteFile(dst, bytesRead, 0755)
+}
+
+// Test that spawning many subcontainers that do a lot of filesystem operations
+// does not lead to memory leaks.
+func TestMultiContainerMemoryLeakStress(t *testing.T) {
+	conf := testutil.TestConfig(t)
+	app, err := testutil.FindFile("test/cmd/test_app/test_app")
+	if err != nil {
+		t.Fatal("error finding test_app:", err)
+	}
+
+	rootDir, cleanup, err := testutil.SetupRootDir()
+	if err != nil {
+		t.Fatalf("error creating root dir: %v", err)
+	}
+	defer cleanup()
+	conf.RootDir = rootDir
+
+	// Configure root overlay (backed by memory) so that containers can create
+	// files in the root directory.
+	conf.Overlay2 = config.Overlay2{
+		RootMount: true,
+		Medium:    "memory",
+	}
+
+	// Root container will just sleep.
+	sleep := []string{"sleep", "1000"}
+
+	// Subcontainers will do a lot of filesystem work. Create a lot of them.
+	createFsTree := []string{app, "fsTreeCreate", "--depth=10", "--file-per-level=10", "--file-size=1048576"}
+	const warmupContainers = 5
+	const stressContainers = 45
+	cmds := make([][]string, 0, warmupContainers+stressContainers+1)
+	cmds = append(cmds, sleep)
+	for i := 0; i < warmupContainers+stressContainers; i++ {
+		cmds = append(cmds, createFsTree)
+	}
+	testSpecs, ids := createSpecs(cmds...)
+	// Make sure none of the root filesystems are read-only, otherwise we won't
+	// be able to create the file.
+	for _, s := range testSpecs {
+		s.Root.Readonly = false
+	}
+
+	// Start the root container.
+	rootCont, cleanup, err := startContainers(conf, testSpecs[:1], ids[:1])
+	if err != nil {
+		t.Fatalf("error starting containers: %v", err)
+	}
+	defer cleanup()
+
+	// Warm up the sandbox.
+	warmUpContainers, cleanUp2, err := startContainers(conf, testSpecs[1:1+warmupContainers], ids[1:1+warmupContainers])
+	if err != nil {
+		t.Fatalf("error starting containers: %v", err)
+	}
+	defer cleanUp2()
+	// Wait for all warm up subcontainers to stop.
+	for i, c := range warmUpContainers {
+		// Wait for the sub-container to stop.
+		if ws, err := c.Wait(); err != nil {
+			t.Errorf("failed to wait for warm up subcontainer number %d: %v", i, err)
+		} else if es := ws.ExitStatus(); es != 0 {
+			t.Errorf("warm up subcontainer number %d exited with non-zero status %d", i, es)
+		}
+	}
+
+	// Give the reclaimer goroutine some time to reclaim.
+	time.Sleep(3 * time.Second)
+
+	// Measure the memory usage after the warm up.
+	oldUsage, err := rootCont[0].Sandbox.Usage(true /* Full */)
+	if err != nil {
+		t.Fatalf("sandbox.Usage failed: %v", err)
+	}
+
+	// Hammer the sandbox with sub containers.
+	subConts, cleanup3, err := startContainers(conf, testSpecs[1+warmupContainers:1+warmupContainers+stressContainers], ids[1+warmupContainers:1+warmupContainers+stressContainers])
+	if err != nil {
+		t.Fatalf("error starting containers: %v", err)
+	}
+	defer cleanup3()
+	// Wait for all subcontainers to stop.
+	for i, c := range subConts {
+		if ws, err := c.Wait(); err != nil {
+			t.Errorf("failed to wait for subcontainer number %d: %v", i, err)
+		} else if es := ws.ExitStatus(); es != 0 {
+			t.Errorf("subcontainer number %d exited with non-zero status %d", i, es)
+		}
+	}
+
+	// Give the reclaimer goroutine some time to reclaim.
+	time.Sleep(3 * time.Second)
+
+	// Compare memory usage.
+	newUsage, err := rootCont[0].Sandbox.Usage(true /* Full */)
+	if err != nil {
+		t.Fatalf("sandbox.Usage failed: %v", err)
+	}
+	// Note that all fields of control.MemoryUsage are exported and uint64.
+	oldUsageV := reflect.ValueOf(oldUsage)
+	newUsageV := reflect.ValueOf(newUsage)
+	numFields := oldUsageV.NumField()
+	for i := 0; i < numFields; i++ {
+		name := oldUsageV.Type().Field(i).Name
+		oldVal := oldUsageV.Field(i).Interface().(uint64)
+		newVal := newUsageV.Field(i).Interface().(uint64)
+		if newVal <= oldVal {
+			continue
+		}
+
+		if ((newVal-oldVal)*100)/oldVal > 5 {
+			t.Errorf("%s usage increased by more than 5%%: old=%d, new=%d", name, oldVal, newVal)
+		}
 	}
 }

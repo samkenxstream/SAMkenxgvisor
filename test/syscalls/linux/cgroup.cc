@@ -19,6 +19,8 @@
 #include <sys/mount.h>
 #include <unistd.h>
 
+#include <cstdint>
+
 #include "gtest/gtest.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
@@ -857,17 +859,17 @@ PosixErrorOr<std::vector<bool>> ParseBitmap(std::string s) {
   for (const std::string_view& t : absl::StrSplit(s, ',')) {
     std::vector<std::string> parts = absl::StrSplit(t, absl::MaxSplits('-', 2));
     if (parts.size() == 2) {
-      ASSIGN_OR_RETURN_ERRNO(int64_t start, Atoi<int64_t>(parts[0]));
-      ASSIGN_OR_RETURN_ERRNO(int64_t end, Atoi<int64_t>(parts[1]));
+      ASSIGN_OR_RETURN_ERRNO(uint64_t start, Atoi<uint64_t>(parts[0]));
+      ASSIGN_OR_RETURN_ERRNO(uint64_t end, Atoi<uint64_t>(parts[1]));
       // Note: start and end are indices into bitmap.
       if (end >= bitmap.size()) {
         bitmap.resize(end + 1, false);
       }
-      for (int i = start; i <= end; ++i) {
+      for (uint64_t i = start; i <= end; ++i) {
         bitmap[i] = true;
       }
     } else {  // parts.size() == 1, 0 not possible.
-      ASSIGN_OR_RETURN_ERRNO(int64_t i, Atoi<int64_t>(parts[0]));
+      ASSIGN_OR_RETURN_ERRNO(uint64_t i, Atoi<uint64_t>(parts[0]));
       if (i >= bitmap.size()) {
         bitmap.resize(i + 1, false);
       }
@@ -1364,6 +1366,49 @@ TEST(PIDsCgroup, LimitEnforced) {
   NoopThreads t3(1);
   EXPECT_THAT(child.ReadIntegerControlFile("pids.current"),
               IsPosixErrorOkAndHolds(baseline + 2));
+}
+
+// Regression test for b/231312320.
+TEST(PIDsCgroup, RaceFSDestructionChargeUncharge) {
+  SKIP_IF(!CgroupsAvailable());
+
+  const TempPath mountpoint = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+
+  // The goal of this test is to recreate the hierarchy containing the pids
+  // controller between when a pending charge is added for a new thread, and
+  // when the pending charge is removed due to a clone failure.
+
+  // Attempt to change the hierachy mid charge/uncharge by repeatedly creating
+  // new cgroupfs filesystems.
+  ScopedThread mounter_unmounter([&mountpoint] {
+    const DisableSave ds;  // Too many syscalls.
+
+    for (int i = 0; i < 1000; ++i) {
+      mount("none", mountpoint.path().c_str(), "cgroup", 0, 0);
+      umount(mountpoint.path().c_str());
+    }
+  });
+
+  // Trigger thread creation failure by having the parent of a clone syscall
+  // segfault intentionally.
+  ScopedThread cloner_root([] {
+    const DisableSave ds;  // Too many syscalls.
+
+    for (int i = 0; i < 50; ++i) {
+      ScopedThread cloner([] {
+        // Asynchronously spawn threads.
+        ScopedThread noop_threads([] {
+          for (int i = 0; i < 100; ++i) {
+            ScopedThread([] { getpid(); });
+          }
+        });
+
+        // Intentionally bad syscall that will cause the calling thread to be
+        // aborted with a SIGSEGV.
+        rename(0, 0);
+      });
+    }
+  });
 }
 
 }  // namespace

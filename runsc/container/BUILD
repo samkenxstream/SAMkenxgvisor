@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "default_platform", "go_library", "go_test", "more_shards", "platforms")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "container",
@@ -19,6 +22,7 @@ go_library(
         "//pkg/cleanup",
         "//pkg/log",
         "//pkg/sentry/control",
+        "//pkg/sentry/pgalloc",
         "//pkg/sighandling",
         "//pkg/sync",
         "//runsc/boot",
@@ -41,6 +45,7 @@ go_test(
     srcs = [
         "console_test.go",
         "container_test.go",
+        "metric_server_test.go",
         "multi_container_test.go",
         "shared_volume_test.go",
         "trace_test.go",
@@ -73,17 +78,19 @@ go_test(
         "//pkg/sentry/limits",
         "//pkg/sentry/platform",
         "//pkg/sentry/seccheck",
-        "//pkg/sentry/seccheck/checkers/remote/test",
         "//pkg/sentry/seccheck/points:points_go_proto",
+        "//pkg/sentry/seccheck/sinks/remote/test",
         "//pkg/sync",
         "//pkg/test/testutil",
         "//pkg/unet",
-        "//pkg/urpc",
         "//runsc/boot",
+        "//runsc/cgroup",
         "//runsc/config",
         "//runsc/flag",
         "//runsc/specutils",
+        "//test/metricclient",
         "@com_github_cenkalti_backoff//:go_default_library",
+        "@com_github_google_go_cmp//cmp:go_default_library",
         "@com_github_kr_pty//:go_default_library",
         "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
         "@org_golang_google_protobuf//proto:go_default_library",

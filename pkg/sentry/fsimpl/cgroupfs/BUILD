@@ -2,6 +2,8 @@ load("//tools:defs.bzl", "go_library", "go_test")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
 load("//pkg/sync/locking:locking.bzl", "declare_mutex", "declare_rwmutex")
 
+package(default_applicable_licenses = ["//:license"])
+
 licenses(["notice"])
 
 declare_mutex(
@@ -23,7 +25,7 @@ go_template_instance(
     out = "dir_refs.go",
     package = "cgroupfs",
     prefix = "dir",
-    template = "//pkg/refsvfs2:refs_template",
+    template = "//pkg/refs:refs_template",
     types = {
         "T": "dir",
     },
@@ -57,7 +59,6 @@ go_library(
         "//pkg/hostarch",
         "//pkg/log",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/sentry/arch",
         "//pkg/sentry/fsimpl/kernfs",
         "//pkg/sentry/kernel",

@@ -20,7 +20,6 @@ import (
 	"time"
 
 	"gvisor.dev/gvisor/pkg/refs"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/checker"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -137,8 +136,9 @@ func TestForwarderFailedConnect(t *testing.T) {
 
 	// Receive the SYN-ACK reply. Make sure MSS and other expected options
 	// are present.
-	b := c.GetPacket()
-	tcp := header.TCP(header.IPv4(b).Payload())
+	v := c.GetPacket()
+	defer v.Release()
+	tcp := header.TCP(header.IPv4(v.AsSlice()).Payload())
 	c.IRS = seqnum.Value(tcp.SequenceNumber())
 
 	tcpCheckers := []checker.TransportChecker{
@@ -147,7 +147,7 @@ func TestForwarderFailedConnect(t *testing.T) {
 		checker.TCPFlags(header.TCPFlagAck | header.TCPFlagSyn),
 		checker.TCPAckNum(uint32(iss) + 1),
 	}
-	checker.IPv4(t, b, checker.TCP(tcpCheckers...))
+	checker.IPv4(t, v, checker.TCP(tcpCheckers...))
 
 	// Now send an active RST to abort the handshake.
 	c.SendPacket(nil, &context.Headers{
@@ -175,6 +175,6 @@ func TestMain(m *testing.M) {
 	// Allow TCP async work to complete to avoid false reports of leaks.
 	// TODO(gvisor.dev/issue/5940): Use fake clock in tests.
 	time.Sleep(1 * time.Second)
-	refsvfs2.DoLeakCheck()
+	refs.DoLeakCheck()
 	os.Exit(code)
 }

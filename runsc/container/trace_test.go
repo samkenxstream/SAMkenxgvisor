@@ -17,6 +17,7 @@ package container
 import (
 	"encoding/json"
 	"io/ioutil"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -27,8 +28,8 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
-	"gvisor.dev/gvisor/pkg/sentry/seccheck/checkers/remote/test"
 	pb "gvisor.dev/gvisor/pkg/sentry/seccheck/points/points_go_proto"
+	"gvisor.dev/gvisor/pkg/sentry/seccheck/sinks/remote/test"
 	"gvisor.dev/gvisor/pkg/test/testutil"
 	"gvisor.dev/gvisor/runsc/boot"
 )
@@ -36,7 +37,7 @@ import (
 func remoteSinkConfig(endpoint string) seccheck.SinkConfig {
 	return seccheck.SinkConfig{
 		Name: "remote",
-		Config: map[string]interface{}{
+		Config: map[string]any{
 			"endpoint": endpoint,
 		},
 	}
@@ -375,7 +376,15 @@ func TestProcfsDump(t *testing.T) {
 	if len(procfsDump[0].FDs) < 3 {
 		t.Errorf("expected at least 3 FDs for the sleep process, got %+v", procfsDump[0].FDs)
 	} else {
-		modes := []uint16{unix.S_IFCHR, unix.S_IFIFO, unix.S_IFREG}
+		modes := [3]uint32{}
+		for i, _ := range []*os.File{os.Stdin, os.Stdout, os.Stderr} {
+			stat := unix.Stat_t{}
+			err := unix.Fstat(i, &stat)
+			if err != nil {
+				t.Fatalf("unix.Fatat(i) failed: %s", err)
+			}
+			modes[i] = stat.Mode & unix.S_IFMT
+		}
 		for i, fd := range procfsDump[0].FDs[:3] {
 			if want := int32(i); fd.Number != want {
 				t.Errorf("expected FD number %d, got %d", want, fd.Number)
@@ -438,5 +447,15 @@ func TestProcfsDump(t *testing.T) {
 	}
 	if procfsDump[0].Status.VMRSS == 0 {
 		t.Errorf("expected VMSize to be set")
+	}
+	if len(procfsDump[0].Maps) <= 0 {
+		t.Errorf("no region mapped for pid:%v", procfsDump[0].Status.PID)
+	}
+
+	maps := procfsDump[0].Maps
+	for i := 0; i < len(procfsDump[0].Maps)-1; i++ {
+		if maps[i].Address.Overlaps(maps[i+1].Address) {
+			t.Errorf("overlapped addresses for pid:%v", procfsDump[0].Status.PID)
+		}
 	}
 }

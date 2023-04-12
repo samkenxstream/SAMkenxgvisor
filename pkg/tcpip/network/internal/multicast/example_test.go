@@ -20,9 +20,8 @@ import (
 	"testing"
 	"time"
 
-	"gvisor.dev/gvisor/pkg/buffer"
+	"gvisor.dev/gvisor/pkg/bufferv2"
 	"gvisor.dev/gvisor/pkg/refs"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/faketime"
 	"gvisor.dev/gvisor/pkg/tcpip/network/internal/multicast"
@@ -115,7 +114,7 @@ func Example() {
 	// Last used timestamp: 10000000000
 }
 
-func forwardPkt(*stack.PacketBuffer, *multicast.InstalledRoute) {
+func forwardPkt(stack.PacketBufferPtr, *multicast.InstalledRoute) {
 	fmt.Println("forwardPkt")
 }
 
@@ -123,19 +122,19 @@ func emitMissingRouteEvent(stack.UnicastSourceAndMulticastDestination) {
 	fmt.Println("emitMissingRouteEvent")
 }
 
-func deliverPktLocally(*stack.PacketBuffer) {
+func deliverPktLocally(stack.PacketBufferPtr) {
 	fmt.Println("deliverPktLocally")
 }
 
-func newPacketBuffer(body string) *stack.PacketBuffer {
+func newPacketBuffer(body string) stack.PacketBufferPtr {
 	return stack.NewPacketBuffer(stack.PacketBufferOptions{
-		Payload: buffer.NewWithData([]byte(body)),
+		Payload: bufferv2.MakeWithData([]byte(body)),
 	})
 }
 
 func TestMain(m *testing.M) {
 	refs.SetLeakMode(refs.LeaksPanic)
 	code := m.Run()
-	refsvfs2.DoLeakCheck()
+	refs.DoLeakCheck()
 	os.Exit(code)
 }

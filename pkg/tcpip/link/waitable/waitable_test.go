@@ -19,7 +19,6 @@ import (
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/refs"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -40,11 +39,11 @@ type countedEndpoint struct {
 	dispatcher stack.NetworkDispatcher
 }
 
-func (e *countedEndpoint) DeliverNetworkPacket(protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
+func (e *countedEndpoint) DeliverNetworkPacket(protocol tcpip.NetworkProtocolNumber, pkt stack.PacketBufferPtr) {
 	e.dispatchCount++
 }
 
-func (*countedEndpoint) DeliverLinkPacket(tcpip.NetworkProtocolNumber, *stack.PacketBuffer, bool) {
+func (*countedEndpoint) DeliverLinkPacket(tcpip.NetworkProtocolNumber, stack.PacketBufferPtr) {
 	panic("not implemented")
 }
 
@@ -89,7 +88,7 @@ func (*countedEndpoint) ARPHardwareType() header.ARPHardwareType {
 func (*countedEndpoint) Wait() {}
 
 // AddHeader implements stack.LinkEndpoint.AddHeader.
-func (*countedEndpoint) AddHeader(*stack.PacketBuffer) {
+func (*countedEndpoint) AddHeader(stack.PacketBufferPtr) {
 	panic("unimplemented")
 }
 
@@ -221,6 +220,6 @@ func TestOtherMethods(t *testing.T) {
 func TestMain(m *testing.M) {
 	refs.SetLeakMode(refs.LeaksPanic)
 	code := m.Run()
-	refsvfs2.DoLeakCheck()
+	refs.DoLeakCheck()
 	os.Exit(code)
 }

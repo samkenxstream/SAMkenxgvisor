@@ -2,11 +2,18 @@ load("//tools:defs.bzl", "go_library")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
 load("//pkg/sync/locking:locking.bzl", "declare_mutex", "declare_rwmutex")
 
+package(default_applicable_licenses = ["//:license"])
+
 licenses(["notice"])
 
 declare_mutex(
     name = "dir_mutex",
     out = "dir_mutex.go",
+    nested_lock_names = [
+        "new",
+        "replaced",
+        "child",
+    ],
     package = "overlay",
     prefix = "dir",
 )
@@ -100,9 +107,8 @@ go_library(
         "//pkg/hostarch",
         "//pkg/log",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/sentry/arch",
-        "//pkg/sentry/fs/lock",
+        "//pkg/sentry/fsimpl/lock",
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/memmap",
         "//pkg/sentry/socket/unix/transport",

@@ -44,11 +44,14 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	"gvisor.dev/gvisor/pkg/sentry/fsbridge"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
+
+// MapsCallbackFunc has all the parameters required for populating an entry of /proc/[pid]/maps.
+type MapsCallbackFunc func(start, end hostarch.Addr, permissions hostarch.AccessType, private string, offset uint64, devMajor, devMinor uint32, inode uint64, path string)
 
 // MemoryManager implements a virtual address space.
 //
@@ -223,7 +226,7 @@ type MemoryManager struct {
 	// is not nil, it holds a reference on the Dirent.
 	//
 	// executable is protected by metadataMu.
-	executable fsbridge.File
+	executable *vfs.FileDescription
 
 	// aioManager keeps track of AIOContexts used for async IOs. AIOManager
 	// must be cloned when CLONE_VM is used.

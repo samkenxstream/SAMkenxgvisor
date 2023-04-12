@@ -1,7 +1,10 @@
 load("//tools:defs.bzl", "go_library", "go_test")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_template_instance(
     name = "tcp_segment_list",
@@ -20,7 +23,7 @@ go_template_instance(
     out = "tcp_segment_refs.go",
     package = "tcp",
     prefix = "segment",
-    template = "//pkg/refsvfs2:refs_template",
+    template = "//pkg/refs:refs_template",
     types = {
         "T": "segment",
     },
@@ -71,13 +74,14 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/atomicbitops",
-        "//pkg/buffer",
+        "//pkg/bufferv2",
         "//pkg/log",
         "//pkg/rand",
-        "//pkg/refsvfs2",
+        "//pkg/refs",
         "//pkg/sleep",
         "//pkg/sync",
         "//pkg/tcpip",
+        "//pkg/tcpip/checksum",
         "//pkg/tcpip/hash/jenkins",
         "//pkg/tcpip/header",
         "//pkg/tcpip/header/parse",
@@ -101,8 +105,8 @@ go_test(
     ],
     library = ":tcp",
     deps = [
+        "//pkg/bufferv2",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/sleep",
         "//pkg/tcpip/faketime",
         "//pkg/tcpip/stack",

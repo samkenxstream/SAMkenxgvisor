@@ -27,7 +27,7 @@ import (
 	"fmt"
 
 	"gvisor.dev/gvisor/pkg/atomicbitops"
-	"gvisor.dev/gvisor/pkg/buffer"
+	"gvisor.dev/gvisor/pkg/bufferv2"
 	"gvisor.dev/gvisor/pkg/eventfd"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sync"
@@ -191,6 +191,9 @@ type endpoint struct {
 
 // New creates a new shared-memory-based endpoint. Buffers will be broken up
 // into buffers of "bufferSize" bytes.
+//
+// In order to release all resources held by the returned endpoint, Close()
+// must be called followed by Wait().
 func New(opts Options) (stack.LinkEndpoint, error) {
 	e := &endpoint{
 		mtu:                     opts.MTU,
@@ -231,7 +234,8 @@ func New(opts Options) (stack.LinkEndpoint, error) {
 	return e, nil
 }
 
-// Close frees all resources associated with the endpoint.
+// Close frees most resources associated with the endpoint. Wait() must be
+// called after Close() in order to free the rest.
 func (e *endpoint) Close() {
 	// Tell dispatch goroutine to stop, then write to the eventfd so that
 	// it wakes up in case it's sleeping.
@@ -254,11 +258,16 @@ func (e *endpoint) Close() {
 // stopped after a Close() call.
 func (e *endpoint) Wait() {
 	e.completed.Wait()
+	e.rx.eventFD.Close()
 }
 
 // Attach implements stack.LinkEndpoint.Attach. It launches the goroutine that
 // reads packets from the rx queue.
 func (e *endpoint) Attach(dispatcher stack.NetworkDispatcher) {
+	if dispatcher == nil {
+		e.Close()
+		return
+	}
 	e.mu.Lock()
 	if !e.workerStarted && e.stopRequested.Load() == 0 {
 		e.workerStarted = true
@@ -318,7 +327,7 @@ func (e *endpoint) LinkAddress() tcpip.LinkAddress {
 }
 
 // AddHeader implements stack.LinkEndpoint.AddHeader.
-func (e *endpoint) AddHeader(pkt *stack.PacketBuffer) {
+func (e *endpoint) AddHeader(pkt stack.PacketBufferPtr) {
 	// Add ethernet header if needed.
 	if len(e.addr) == 0 {
 		return
@@ -332,22 +341,21 @@ func (e *endpoint) AddHeader(pkt *stack.PacketBuffer) {
 	})
 }
 
-func (e *endpoint) AddVirtioNetHeader(pkt *stack.PacketBuffer) {
+func (e *endpoint) AddVirtioNetHeader(pkt stack.PacketBufferPtr) {
 	virtio := header.VirtioNetHeader(pkt.VirtioNetHeader().Push(header.VirtioNetHeaderSize))
 	virtio.Encode(&header.VirtioNetHeaderFields{})
 }
 
 // +checklocks:e.mu
-func (e *endpoint) writePacketLocked(r stack.RouteInfo, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) tcpip.Error {
+func (e *endpoint) writePacketLocked(r stack.RouteInfo, protocol tcpip.NetworkProtocolNumber, pkt stack.PacketBufferPtr) tcpip.Error {
 	if e.virtioNetHeaderRequired {
 		e.AddVirtioNetHeader(pkt)
 	}
 
-	views := pkt.Slices()
 	// Transmit the packet.
-	// TODO(b/231582970): Change transmit() to take a buffer.Buffer instead of a
-	// collection of slices.
-	ok := e.tx.transmit(views...)
+	b := pkt.ToBuffer()
+	defer b.Release()
+	ok := e.tx.transmit(b)
 	if !ok {
 		return &tcpip.ErrWouldBlock{}
 	}
@@ -403,17 +411,18 @@ func (e *endpoint) dispatchLoop(d stack.NetworkDispatcher) {
 
 		// Copy data from the shared area to its own buffer, then
 		// prepare to repost the buffer.
-		b := make([]byte, n)
+		v := bufferv2.NewView(int(n))
+		v.Grow(int(n))
 		offset := uint32(0)
 		for i := range rxb {
-			copy(b[offset:], e.rx.data[rxb[i].Offset:][:rxb[i].Size])
+			v.WriteAt(e.rx.data[rxb[i].Offset:][:rxb[i].Size], int(offset))
 			offset += rxb[i].Size
 
 			rxb[i].Size = e.bufferSize
 		}
 
 		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-			Payload: buffer.NewWithData(b),
+			Payload: bufferv2.MakeWithView(v),
 		})
 
 		if e.virtioNetHeaderRequired {

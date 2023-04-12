@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "go_library", "go_test")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "multicast",
@@ -20,9 +23,8 @@ go_test(
     srcs = ["route_table_test.go"],
     library = ":multicast",
     deps = [
-        "//pkg/buffer",
+        "//pkg/bufferv2",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/tcpip",
         "//pkg/tcpip/faketime",
         "//pkg/tcpip/stack",
@@ -38,9 +40,8 @@ go_test(
     srcs = ["example_test.go"],
     deps = [
         ":multicast",
-        "//pkg/buffer",
+        "//pkg/bufferv2",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/tcpip",
         "//pkg/tcpip/faketime",
         "//pkg/tcpip/stack",

@@ -23,8 +23,8 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"golang.org/x/time/rate"
-	"gvisor.dev/gvisor/pkg/buffer"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
+	"gvisor.dev/gvisor/pkg/bufferv2"
+	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/checker"
 	"gvisor.dev/gvisor/pkg/tcpip/faketime"
@@ -156,7 +156,9 @@ func (c *Context) Cleanup() {
 	if c.EP != nil {
 		c.EP.Close()
 	}
-	refsvfs2.DoRepeatedLeakCheck()
+	c.Stack.Destroy()
+	c.Stack = nil
+	refs.DoRepeatedLeakCheck()
 }
 
 // CreateEndpoint creates the Context's Endpoint.
@@ -221,7 +223,7 @@ func (c *Context) CheckEndpointWriteStats(incr uint64, want *tcpip.TransportEndp
 		want.WriteErrors.WriteClosed.IncrementBy(incr)
 	case *tcpip.ErrInvalidEndpointState:
 		want.WriteErrors.InvalidEndpointState.IncrementBy(incr)
-	case *tcpip.ErrNoRoute, *tcpip.ErrBroadcastDisabled, *tcpip.ErrNetworkUnreachable:
+	case *tcpip.ErrHostUnreachable, *tcpip.ErrBroadcastDisabled, *tcpip.ErrNetworkUnreachable:
 		want.SendErrors.NoRoute.IncrementBy(incr)
 	default:
 		want.SendErrors.SendToNetworkFailed.IncrementBy(incr)
@@ -253,7 +255,7 @@ func (c *Context) CheckEndpointReadStats(incr uint64, want *tcpip.TransportEndpo
 // InjectPacket injects a packet into the context's link endpoint.
 func (c *Context) InjectPacket(netProto tcpip.NetworkProtocolNumber, buf []byte) {
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-		Payload: buffer.NewWithData(buf),
+		Payload: bufferv2.MakeWithData(buf),
 	})
 	defer pkt.DecRef()
 	c.LinkEP.InjectInbound(netProto, pkt)

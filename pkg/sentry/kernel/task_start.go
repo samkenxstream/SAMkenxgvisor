@@ -19,7 +19,6 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
-	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -85,8 +84,8 @@ type TaskConfig struct {
 	// AbstractSocketNamespace is the AbstractSocketNamespace of the new task.
 	AbstractSocketNamespace *AbstractSocketNamespace
 
-	// MountNamespaceVFS2 is the MountNamespace of the new task.
-	MountNamespaceVFS2 *vfs.MountNamespace
+	// MountNamespace is the MountNamespace of the new task.
+	MountNamespace *vfs.MountNamespace
 
 	// RSeqAddr is a pointer to the the userspace linux.RSeq structure.
 	RSeqAddr hostarch.Addr
@@ -116,8 +115,8 @@ func (ts *TaskSet) NewTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 		cfg.FDTable.DecRef(ctx)
 		cfg.IPCNamespace.DecRef(ctx)
 		cfg.NetworkNamespace.DecRef()
-		if cfg.MountNamespaceVFS2 != nil {
-			cfg.MountNamespaceVFS2.DecRef(ctx)
+		if cfg.MountNamespace != nil {
+			cfg.MountNamespace.DecRef(ctx)
 		}
 	}
 	if err := cfg.UserCounters.incRLimitNProc(ctx); err != nil {
@@ -145,29 +144,29 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 			parent:   cfg.Parent,
 			children: make(map[*Task]struct{}),
 		},
-		runState:           (*runApp)(nil),
-		interruptChan:      make(chan struct{}, 1),
-		signalMask:         atomicbitops.FromUint64(uint64(cfg.SignalMask)),
-		signalStack:        linux.SignalStack{Flags: linux.SS_DISABLE},
-		image:              *image,
-		fsContext:          cfg.FSContext,
-		fdTable:            cfg.FDTable,
-		k:                  cfg.Kernel,
-		ptraceTracees:      make(map[*Task]struct{}),
-		allowedCPUMask:     cfg.AllowedCPUMask.Copy(),
-		ioUsage:            &usage.IO{},
-		niceness:           cfg.Niceness,
-		utsns:              cfg.UTSNamespace,
-		ipcns:              cfg.IPCNamespace,
-		abstractSockets:    cfg.AbstractSocketNamespace,
-		mountNamespaceVFS2: cfg.MountNamespaceVFS2,
-		rseqCPU:            -1,
-		rseqAddr:           cfg.RSeqAddr,
-		rseqSignature:      cfg.RSeqSignature,
-		futexWaiter:        futex.NewWaiter(),
-		containerID:        cfg.ContainerID,
-		cgroups:            make(map[Cgroup]struct{}),
-		userCounters:       cfg.UserCounters,
+		runState:        (*runApp)(nil),
+		interruptChan:   make(chan struct{}, 1),
+		signalMask:      atomicbitops.FromUint64(uint64(cfg.SignalMask)),
+		signalStack:     linux.SignalStack{Flags: linux.SS_DISABLE},
+		image:           *image,
+		fsContext:       cfg.FSContext,
+		fdTable:         cfg.FDTable,
+		k:               cfg.Kernel,
+		ptraceTracees:   make(map[*Task]struct{}),
+		allowedCPUMask:  cfg.AllowedCPUMask.Copy(),
+		ioUsage:         &usage.IO{},
+		niceness:        cfg.Niceness,
+		utsns:           cfg.UTSNamespace,
+		ipcns:           cfg.IPCNamespace,
+		abstractSockets: cfg.AbstractSocketNamespace,
+		mountNamespace:  cfg.MountNamespace,
+		rseqCPU:         -1,
+		rseqAddr:        cfg.RSeqAddr,
+		rseqSignature:   cfg.RSeqSignature,
+		futexWaiter:     futex.NewWaiter(),
+		containerID:     cfg.ContainerID,
+		cgroups:         make(map[Cgroup]struct{}),
+		userCounters:    cfg.UserCounters,
 	}
 	t.netns.Store(cfg.NetworkNamespace)
 	t.creds.Store(cfg.Credentials)
@@ -176,8 +175,10 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 	// We don't construct t.blockingTimer until Task.run(); see that function
 	// for justification.
 
-	var cu cleanup.Cleanup
-	defer cu.Clean()
+	var (
+		cg                 Cgroup
+		charged, committed bool
+	)
 
 	// Reserve cgroup PIDs controller charge. This is either commited when the
 	// new task enters the cgroup below, or rolled back on failure.
@@ -187,14 +188,22 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 	// we skip charging the pids controller, as non-userspace task creation
 	// bypasses pid limits.
 	if srcT != nil {
-		if err := srcT.ChargeFor(t, CgroupControllerPIDs, CgroupResourcePID, 1); err != nil {
+		var err error
+		if charged, cg, err = srcT.ChargeFor(t, CgroupControllerPIDs, CgroupResourcePID, 1); err != nil {
 			return nil, err
 		}
-		cu.Add(func() {
-			if err := srcT.ChargeFor(t, CgroupControllerPIDs, CgroupResourcePID, -1); err != nil {
-				panic(fmt.Sprintf("Failed to clean up PIDs charge on task creation failure: %v", err))
-			}
-		})
+		if charged {
+			defer func() {
+				if !committed {
+					if err := cg.Charge(t, cg.Dentry, CgroupControllerPIDs, CgroupResourcePID, -1); err != nil {
+						panic(fmt.Sprintf("Failed to clean up PIDs charge on task creation failure: %v", err))
+					}
+				}
+				// Ref from ChargeFor. Note that we need to drop this outside of
+				// TaskSet.mu critical sections.
+				cg.DecRef(ctx)
+			}()
+		}
 	}
 
 	// Make the new task (and possibly thread group) visible to the rest of
@@ -228,10 +237,9 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 		t.parent.children[t] = struct{}{}
 	}
 
-	if VFS2Enabled {
-		// srcT may be nil, in which case we default to root cgroups.
-		t.EnterInitialCgroups(srcT)
-	}
+	// srcT may be nil, in which case we default to root cgroups.
+	t.EnterInitialCgroups(srcT)
+	committed = true
 
 	if tg.leader == nil {
 		// New thread group.
@@ -264,7 +272,6 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 	// other pieces to be initialized as the task is used the context.
 	t.p = cfg.Kernel.Platform.NewContext(t.AsyncContext())
 
-	cu.Release()
 	return t, nil
 }
 

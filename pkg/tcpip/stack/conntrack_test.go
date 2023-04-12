@@ -17,7 +17,7 @@ package stack
 import (
 	"testing"
 
-	"gvisor.dev/gvisor/pkg/buffer"
+	"gvisor.dev/gvisor/pkg/bufferv2"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/faketime"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -280,7 +280,7 @@ type genTCPOpts struct {
 }
 
 // genTCPPacket returns an initialized IPv4 TCP packet.
-func genTCPPacket(opts genTCPOpts) *PacketBuffer {
+func genTCPPacket(opts genTCPOpts) PacketBufferPtr {
 	// Get values from opts.
 	windowSize := uint16(50000)
 	if opts.windowSize != nil {
@@ -323,7 +323,7 @@ func genTCPPacket(opts genTCPOpts) *PacketBuffer {
 	packetLen := header.IPv4MinimumSize + uint16(tcpHdrSize)
 	pkt := NewPacketBuffer(PacketBufferOptions{
 		ReserveHeaderBytes: int(packetLen),
-		Payload:            buffer.NewWithData(opts.data),
+		Payload:            bufferv2.MakeWithData(opts.data),
 	})
 	pkt.NetworkProtocolNumber = header.IPv4ProtocolNumber
 	pkt.TransportProtocolNumber = header.TCPProtocolNumber

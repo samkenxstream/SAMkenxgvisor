@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "go_library")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "fasync",
@@ -9,7 +12,6 @@ go_library(
     deps = [
         "//pkg/abi/linux",
         "//pkg/errors/linuxerr",
-        "//pkg/sentry/fs",
         "//pkg/sentry/kernel",
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/vfs",

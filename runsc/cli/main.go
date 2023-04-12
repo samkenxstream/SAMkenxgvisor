@@ -30,14 +30,15 @@ import (
 	"gvisor.dev/gvisor/pkg/coverage"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/refs"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
+	"gvisor.dev/gvisor/pkg/sentry/syscalls/linux"
 	"gvisor.dev/gvisor/runsc/cmd"
 	"gvisor.dev/gvisor/runsc/cmd/trace"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/specutils"
+	"gvisor.dev/gvisor/runsc/version"
 )
 
 var (
@@ -56,7 +57,7 @@ var (
 )
 
 // Main is the main entrypoint.
-func Main(version string) {
+func Main() {
 	// Help and flags commands are generated automatically.
 	help := cmd.NewHelp(subcommands.DefaultCommander)
 	help.Register(new(cmd.Platforms))
@@ -75,6 +76,7 @@ func Main(version string) {
 	subcommands.Register(new(cmd.List), "")
 	subcommands.Register(new(cmd.PS), "")
 	subcommands.Register(new(cmd.Pause), "")
+	subcommands.Register(new(cmd.PortForward), "")
 	subcommands.Register(new(cmd.Restore), "")
 	subcommands.Register(new(cmd.Resume), "")
 	subcommands.Register(new(cmd.Run), "")
@@ -94,11 +96,20 @@ func Main(version string) {
 	subcommands.Register(new(cmd.Debug), debugGroup)
 	subcommands.Register(new(cmd.Statefile), debugGroup)
 	subcommands.Register(new(cmd.Symbolize), debugGroup)
+	subcommands.Register(new(cmd.Usage), debugGroup)
+	subcommands.Register(new(cmd.ReadControl), debugGroup)
+	subcommands.Register(new(cmd.WriteControl), debugGroup)
+
+	const metricGroup = "metrics"
+	subcommands.Register(new(cmd.MetricMetadata), metricGroup)
+	subcommands.Register(new(cmd.MetricExport), metricGroup)
+	subcommands.Register(new(cmd.MetricServer), metricGroup)
 
 	// Internal commands.
 	const internalGroup = "internal use only"
 	subcommands.Register(new(cmd.Boot), internalGroup)
 	subcommands.Register(new(cmd.Gofer), internalGroup)
+	subcommands.Register(new(cmd.Umount), internalGroup)
 
 	// Register with the main command line.
 	config.RegisterFlags(flag.CommandLine)
@@ -109,7 +120,7 @@ func Main(version string) {
 	// Are we showing the version?
 	if *showVersion {
 		// The format here is the same as runc.
-		fmt.Fprintf(os.Stdout, "runsc version %s\n", version)
+		fmt.Fprintf(os.Stdout, "runsc version %s\n", version.Version())
 		fmt.Fprintf(os.Stdout, "spec: %s\n", specutils.Version)
 		os.Exit(0)
 	}
@@ -144,8 +155,10 @@ func Main(version string) {
 	// propagate it to child processes.
 	refs.SetLeakMode(conf.ReferenceLeak)
 
+	subcommand := flag.CommandLine.Arg(0)
+
 	// Set up logging.
-	if conf.Debug {
+	if conf.Debug && specutils.IsDebugCommand(conf, subcommand) {
 		log.SetLevel(log.Debug)
 	}
 
@@ -161,15 +174,13 @@ func Main(version string) {
 	// case that does not occur.
 	_ = time.Local.String()
 
-	subcommand := flag.CommandLine.Arg(0)
-
 	var e log.Emitter
 	if *debugLogFD > -1 {
 		f := os.NewFile(uintptr(*debugLogFD), "debug log file")
 
 		e = newEmitter(conf.DebugLogFormat, f)
 
-	} else if conf.DebugLog != "" {
+	} else if len(conf.DebugLog) > 0 && specutils.IsDebugCommand(conf, subcommand) {
 		f, err := specutils.DebugLogFile(conf.DebugLog, subcommand, "" /* name */)
 		if err != nil {
 			util.Fatalf("error opening debug log file in %q: %v", conf.DebugLog, err)
@@ -212,7 +223,7 @@ func Main(version string) {
 
 	log.Infof("***************************")
 	log.Infof("Args: %s", os.Args)
-	log.Infof("Version %s", version)
+	log.Infof("Version %s", version.Version())
 	log.Infof("GOOS: %s", runtime.GOOS)
 	log.Infof("GOARCH: %s", runtime.GOARCH)
 	log.Infof("PID: %d", os.Getpid())
@@ -220,10 +231,13 @@ func Main(version string) {
 	log.Infof("Configuration:")
 	log.Infof("\t\tRootDir: %s", conf.RootDir)
 	log.Infof("\t\tPlatform: %v", conf.Platform)
-	log.Infof("\t\tFileAccess: %v, overlay: %t", conf.FileAccess, conf.Overlay)
+	log.Infof("\t\tFileAccess: %v", conf.FileAccess)
+	log.Infof("\t\tDirectfs: %t", conf.DirectFS)
+	overlay2 := conf.GetOverlay2()
+	log.Infof("\t\tOverlay: Root=%t, SubMounts=%t, Medium=%q", overlay2.RootMount, overlay2.SubMounts, overlay2.Medium)
 	log.Infof("\t\tNetwork: %v, logging: %t", conf.Network, conf.LogPackets)
 	log.Infof("\t\tStrace: %t, max size: %d, syscalls: %s", conf.Strace, conf.StraceLogSize, conf.StraceSyscalls)
-	log.Infof("\t\tLISAFS: %t", conf.Lisafs)
+	log.Infof("\t\tIOURING: %t", conf.IOUring)
 	log.Infof("\t\tDebug: %v", conf.Debug)
 	log.Infof("\t\tSystemd: %v", conf.SystemdCgroup)
 	log.Infof("***************************")
@@ -234,12 +248,13 @@ func Main(version string) {
 		log.Warningf("Block the TERM signal. This is only safe in tests!")
 		signal.Ignore(unix.SIGTERM)
 	}
+	linux.SetAFSSyscallPanic(conf.TestOnlyAFSSyscallPanic)
 
 	// Call the subcommand and pass in the configuration.
 	var ws unix.WaitStatus
 	subcmdCode := subcommands.Execute(context.Background(), conf, &ws)
 	// Check for leaks and write coverage report before os.Exit().
-	refsvfs2.DoLeakCheck()
+	refs.DoLeakCheck()
 	_ = coverage.Report()
 	if subcmdCode == subcommands.ExitSuccess {
 		log.Infof("Exiting with status: %v", ws)

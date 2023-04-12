@@ -43,23 +43,27 @@ import (
 
 var (
 	debug              = flag.Bool("debug", false, "enable debug logs")
+	oneSandbox         = flag.Bool("one-sandbox", false, "run all test cases in one sandbox")
 	strace             = flag.Bool("strace", false, "enable strace logs")
 	platform           = flag.String("platform", "ptrace", "platform to run on")
 	platformSupport    = flag.String("platform-support", "", "String passed to the test as GVISOR_PLATFORM_SUPPORT environment variable. Used to determine which syscall tests are expected to work with the current platform.")
 	network            = flag.String("network", "none", "network stack to run on (sandbox, host, none)")
 	useTmpfs           = flag.Bool("use-tmpfs", false, "mounts tmpfs for /tmp")
+	fusefs             = flag.Bool("fusefs", false, "mounts a fusefs for /tmp")
 	fileAccess         = flag.String("file-access", "exclusive", "mounts root in exclusive or shared mode")
 	overlay            = flag.Bool("overlay", false, "wrap filesystem mounts with writable tmpfs overlay")
-	fuse               = flag.Bool("fuse", false, "enable FUSE")
-	lisafs             = flag.Bool("lisafs", false, "enable lisafs protocol if vfs2 is also enabled")
 	container          = flag.Bool("container", false, "run tests in their own namespaces (user ns, network ns, etc), pretending to be root. Implicitly enabled if network=host, or if using network namespaces")
 	setupContainerPath = flag.String("setup-container", "", "path to setup_container binary (for use with --container)")
 	trace              = flag.Bool("trace", false, "enables all trace points")
 
-	addUDSTree = flag.Bool("add-uds-tree", false, "expose a tree of UDS utilities for use in tests")
+	addHostUDS       = flag.Bool("add-host-uds", false, "expose a tree of UDS to test communication with the host")
+	addHostConnector = flag.Bool("add-host-connector", false, "create goroutines that connect to bound UDS that will be created by sandbox")
+	addHostFIFO      = flag.Bool("add-host-fifo", false, "expose a tree of FIFO to test communication with the host")
+	ioUring          = flag.Bool("iouring", false, "Enables IO_URING API for asynchronous I/O")
 	// TODO(gvisor.dev/issue/4572): properly support leak checking for runsc, and
 	// set to true as the default for the test runner.
-	leakCheck = flag.Bool("leak-check", false, "check for reference leaks")
+	leakCheck  = flag.Bool("leak-check", false, "check for reference leaks")
+	waitForPid = flag.Duration("delay-for-debugger", 0, "Print out the sandbox PID and wait for the specified duration to start the test. This is useful for attaching a debugger to the runsc-sandbox process.")
 )
 
 const (
@@ -80,7 +84,7 @@ func getSetupContainerPath() string {
 }
 
 // runTestCaseNative runs the test case directly on the host machine.
-func runTestCaseNative(testBin string, tc gtest.TestCase, t *testing.T) {
+func runTestCaseNative(testBin string, tc *gtest.TestCase, args []string, t *testing.T) {
 	// These tests might be running in parallel, so make sure they have a
 	// unique test temp dir.
 	tmpDir, err := ioutil.TempDir(testutil.TmpDir(), "")
@@ -108,8 +112,8 @@ func runTestCaseNative(testBin string, tc gtest.TestCase, t *testing.T) {
 	// interpret them.
 	env = filterEnv(env, []string{"TEST_SHARD_INDEX", "TEST_TOTAL_SHARDS", "GTEST_SHARD_INDEX", "GTEST_TOTAL_SHARDS"})
 
-	if *addUDSTree {
-		socketDir, cleanup, err := uds.CreateSocketTree("/tmp")
+	if *addHostUDS {
+		socketDir, cleanup, err := uds.CreateBoundUDSTree("/tmp")
 		if err != nil {
 			t.Fatalf("failed to create socket tree: %v", err)
 		}
@@ -117,15 +121,42 @@ func runTestCaseNative(testBin string, tc gtest.TestCase, t *testing.T) {
 
 		env = append(env, "TEST_UDS_TREE="+socketDir)
 		// On Linux, the concept of "attach" location doesn't exist.
-		// Just pass the same path to make these test identical.
+		// Just pass the same path to make these tests identical.
 		env = append(env, "TEST_UDS_ATTACH_TREE="+socketDir)
+	}
+
+	if *addHostConnector {
+		connectorDir, cleanup, err := uds.CreateSocketConnectors("/tmp")
+		if err != nil {
+			t.Fatalf("failed to create socket connectors: %v", err)
+		}
+		defer cleanup()
+
+		env = append(env, "TEST_CONNECTOR_TREE="+connectorDir)
+	}
+
+	if *addHostFIFO {
+		pipeDir, cleanup, err := uds.CreateFifoTree("/tmp")
+		if err != nil {
+			t.Fatalf("failed to create pipe tree: %v", err)
+		}
+		defer cleanup()
+
+		env = append(env, "TEST_FIFO_TREE="+pipeDir)
+		// On Linux, the concept of "attach" location doesn't exist.
+		// Just pass the same path to make these tests identical.
+		env = append(env, "TEST_FIFO_ATTACH_TREE="+pipeDir)
 	}
 
 	if *platformSupport != "" {
 		env = append(env, fmt.Sprintf("%s=%s", platformSupportEnvVar, *platformSupport))
 	}
 
-	cmd := exec.Command(testBin, tc.Args()...)
+	if args == nil {
+		args = tc.Args()
+	}
+
+	cmd := exec.Command(testBin, args...)
 	cmd.Env = env
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -169,7 +200,7 @@ func runTestCaseNative(testBin string, tc gtest.TestCase, t *testing.T) {
 // runsc logs will be saved to a path in TEST_UNDECLARED_OUTPUTS_DIR.
 //
 // Returns an error if the sandboxed application exits non-zero.
-func runRunsc(tc gtest.TestCase, spec *specs.Spec) error {
+func runRunsc(tc *gtest.TestCase, spec *specs.Spec) error {
 	bundleDir, cleanup, err := testutil.SetupBundleDir(spec)
 	if err != nil {
 		return fmt.Errorf("SetupBundleDir failed: %v", err)
@@ -185,7 +216,7 @@ func runRunsc(tc gtest.TestCase, spec *specs.Spec) error {
 	name := tc.FullName()
 	id := testutil.RandomContainerID()
 	log.Infof("Running test %q in container %q", name, id)
-	specutils.LogSpec(spec)
+	specutils.LogSpecDebug(spec, false)
 
 	args := []string{
 		"-root", rootDir,
@@ -193,20 +224,23 @@ func runRunsc(tc gtest.TestCase, spec *specs.Spec) error {
 		"-log-format=text",
 		"-TESTONLY-unsafe-nonroot=true",
 		"-TESTONLY-allow-packet-endpoint-write=true",
-		"-net-raw=true",
 		fmt.Sprintf("-panic-signal=%d", unix.SIGTERM),
+		fmt.Sprintf("-iouring=%t", *ioUring),
 		"-watchdog-action=panic",
 		"-platform", *platform,
 		"-file-access", *fileAccess,
+		"-gvisor-gro=200000ns",
+	}
+
+	if *network == "host" && !specutils.HasCapabilities(capability.CAP_NET_RAW) {
+		log.Warningf("Testing with network=host but host does not have CAP_NET_RAW. Raw socket support will be disabled.")
+	} else {
+		args = append(args, "-net-raw")
 	}
 	if *overlay {
-		args = append(args, "-overlay")
-	}
-	if *fuse {
-		args = append(args, "-fuse")
-	}
-	if *lisafs {
-		args = append(args, "-lisafs")
+		args = append(args, "-overlay2=all:dir=/tmp")
+	} else {
+		args = append(args, "-overlay2=none")
 	}
 	if *debug {
 		args = append(args, "-debug", "-log-packets=true")
@@ -214,8 +248,14 @@ func runRunsc(tc gtest.TestCase, spec *specs.Spec) error {
 	if *strace {
 		args = append(args, "-strace")
 	}
-	if *addUDSTree {
-		args = append(args, "-fsgofer-host-uds")
+	if *addHostUDS {
+		args = append(args, "-host-uds=open")
+	}
+	if *addHostConnector {
+		args = append(args, "-host-uds=create")
+	}
+	if *addHostFIFO {
+		args = append(args, "-host-fifo=open")
 	}
 	if *leakCheck {
 		args = append(args, "-ref-leak-mode=log-names")
@@ -253,9 +293,7 @@ func runRunsc(tc gtest.TestCase, spec *specs.Spec) error {
 
 	// Current process doesn't have CAP_SYS_ADMIN, create user namespace and run
 	// as root inside that namespace to get it.
-	rArgs := append(args, "run", "--bundle", bundleDir, id)
-	cmd := exec.Command(specutils.ExePath, rArgs...)
-	cmd.SysProcAttr = &unix.SysProcAttr{
+	sysProcAttr := &unix.SysProcAttr{
 		Cloneflags: unix.CLONE_NEWUSER | unix.CLONE_NEWNS,
 		// Set current user/group as root inside the namespace.
 		UidMappings: []syscall.SysProcIDMap{
@@ -270,6 +308,41 @@ func runRunsc(tc gtest.TestCase, spec *specs.Spec) error {
 			Gid: 0,
 		},
 	}
+	var cmdArgs []string
+	if *waitForPid != 0 {
+		createArgs := append(args, "create", "-pid-file", filepath.Join(testLogDir, "pid"), "--bundle", bundleDir, id)
+		defer os.Remove(filepath.Join(testLogDir, "pid"))
+		createCmd := exec.Command(specutils.ExePath, createArgs...)
+		createCmd.SysProcAttr = sysProcAttr
+		createCmd.Stdout = os.Stdout
+		createCmd.Stderr = os.Stderr
+		if err := createCmd.Run(); err != nil {
+			return fmt.Errorf("could not create sandbox: %v", err)
+		}
+
+		sandboxPidBytes, err := os.ReadFile(filepath.Join(testLogDir, "pid"))
+		if err != nil {
+			return fmt.Errorf("could not read pid file: %v", err)
+		}
+		log.Infof("Sandbox process ID is %s. You can attach to it from a debugger of your choice.", sandboxPidBytes)
+		log.Infof("For example, with Delve you can call: $ dlv attach %s", sandboxPidBytes)
+		log.Infof("The test will automatically start after %s.", *waitForPid)
+		log.Infof("You may also signal the test process to start the test immediately: $ kill -SIGUSR1 %d", os.Getpid())
+
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, unix.SIGUSR1)
+		select {
+		case <-sigCh:
+		case <-time.After(*waitForPid):
+		}
+		signal.Reset(unix.SIGUSR1)
+
+		cmdArgs = append(args, "start", id)
+	} else {
+		cmdArgs = append(args, "run", "--bundle", bundleDir, id)
+	}
+	cmd := exec.Command(specutils.ExePath, cmdArgs...)
+	cmd.SysProcAttr = sysProcAttr
 	if *container || *network == "host" || (cmd.SysProcAttr.Cloneflags&unix.CLONE_NEWNET != 0) {
 		cmd.SysProcAttr.Cloneflags |= unix.CLONE_NEWNET
 		cmd.Path = getSetupContainerPath()
@@ -289,7 +362,7 @@ func runRunsc(tc gtest.TestCase, spec *specs.Spec) error {
 		log.Warningf("%s: Got signal: %v", name, s)
 		done := make(chan bool, 1)
 		dArgs := append([]string{}, args...)
-		dArgs = append(dArgs, "-alsologtostderr=true", "debug", "--stacks", id)
+		dArgs = append(dArgs, "debug", "--stacks", id)
 		go func(dArgs []string) {
 			debug := exec.Command(specutils.ExePath, dArgs...)
 			debug.Stdout = os.Stdout
@@ -316,6 +389,17 @@ func runRunsc(tc gtest.TestCase, spec *specs.Spec) error {
 	}()
 
 	err = cmd.Run()
+	if *waitForPid != 0 {
+		if err != nil {
+			return fmt.Errorf("could not start container: %v", err)
+		}
+		waitArgs := append(args, "wait", id)
+		waitCmd := exec.Command(specutils.ExePath, waitArgs...)
+		waitCmd.SysProcAttr = sysProcAttr
+		waitCmd.Stdout = os.Stdout
+		waitCmd.Stderr = os.Stderr
+		err = waitCmd.Run()
+	}
 	if err == nil && len(testLogDir) > 0 {
 		// If the test passed, then we erase the log directory. This speeds up
 		// uploading logs in continuous integration & saves on disk space.
@@ -325,9 +409,10 @@ func runRunsc(tc gtest.TestCase, spec *specs.Spec) error {
 	return err
 }
 
-// setupUDSTree updates the spec to expose a UDS tree for gofer socket testing.
-func setupUDSTree(spec *specs.Spec) (cleanup func(), err error) {
-	socketDir, cleanup, err := uds.CreateSocketTree("/tmp")
+// setupHostUDSTree updates the spec to expose a UDS files tree for testing
+// communication with the host.
+func setupHostUDSTree(spec *specs.Spec) (cleanup func(), err error) {
+	socketDir, cleanup, err := uds.CreateBoundUDSTree("/tmp")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create socket tree: %v", err)
 	}
@@ -341,26 +426,15 @@ func setupUDSTree(spec *specs.Spec) (cleanup func(), err error) {
 
 	// Individial attach points for each socket to test mounts that attach
 	// directly to the sockets.
-	spec.Mounts = append(spec.Mounts, specs.Mount{
-		Destination: "/tmp/sockets-attach/stream/echo",
-		Source:      filepath.Join(socketDir, "stream/echo"),
-		Type:        "bind",
-	})
-	spec.Mounts = append(spec.Mounts, specs.Mount{
-		Destination: "/tmp/sockets-attach/stream/nonlistening",
-		Source:      filepath.Join(socketDir, "stream/nonlistening"),
-		Type:        "bind",
-	})
-	spec.Mounts = append(spec.Mounts, specs.Mount{
-		Destination: "/tmp/sockets-attach/seqpacket/echo",
-		Source:      filepath.Join(socketDir, "seqpacket/echo"),
-		Type:        "bind",
-	})
-	spec.Mounts = append(spec.Mounts, specs.Mount{
-		Destination: "/tmp/sockets-attach/seqpacket/nonlistening",
-		Source:      filepath.Join(socketDir, "seqpacket/nonlistening"),
-		Type:        "bind",
-	})
+	for _, protocol := range []string{"stream", "seqpacket"} {
+		for _, name := range []string{"echo", "nonlistening"} {
+			spec.Mounts = append(spec.Mounts, specs.Mount{
+				Destination: filepath.Join("/tmp/sockets-attach", protocol, name),
+				Source:      filepath.Join(socketDir, protocol, name),
+				Type:        "bind",
+			})
+		}
+	}
 	spec.Mounts = append(spec.Mounts, specs.Mount{
 		Destination: "/tmp/sockets-attach/dgram/null",
 		Source:      filepath.Join(socketDir, "dgram/null"),
@@ -373,12 +447,74 @@ func setupUDSTree(spec *specs.Spec) (cleanup func(), err error) {
 	return cleanup, nil
 }
 
+// setupHostFifoTree starts goroutines that will attempt to connect to sockets
+// in a directory that will be bind mounted into the container.
+func setupHostConnectorTree(spec *specs.Spec) (cleanup func(), err error) {
+	connectorDir, cleanup, err := uds.CreateSocketConnectors("/tmp")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create connector tree: %v", err)
+	}
+
+	// Standard access to entire tree.
+	spec.Mounts = append(spec.Mounts, specs.Mount{
+		Destination: "/tmp/connectors",
+		Source:      connectorDir,
+		Type:        "bind",
+	})
+	// We can not create individual attach points for sockets that have not been
+	// created yet.
+	spec.Process.Env = append(spec.Process.Env, "TEST_CONNECTOR_TREE=/tmp/connectors")
+	return cleanup, nil
+}
+
+// setupHostFifoTree updates the spec to expose FIFO file tree for testing
+// communication with the host.
+func setupHostFifoTree(spec *specs.Spec) (cleanup func(), err error) {
+	fifoDir, cleanup, err := uds.CreateFifoTree("/tmp")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create FIFO tree: %v", err)
+	}
+
+	// Standard access to entire tree.
+	spec.Mounts = append(spec.Mounts, specs.Mount{
+		Destination: "/tmp/pipes",
+		Source:      fifoDir,
+		Type:        "bind",
+	})
+
+	// Individual attach points for each pipe to test mounts that attach
+	// directly to the pipe.
+	for _, name := range []string{"in", "out"} {
+		spec.Mounts = append(spec.Mounts, specs.Mount{
+			Destination: filepath.Join("/tmp/pipes-attach", name),
+			Source:      filepath.Join(fifoDir, name),
+			Type:        "bind",
+		})
+	}
+
+	spec.Process.Env = append(spec.Process.Env, "TEST_FIFO_TREE=/tmp/pipes")
+	spec.Process.Env = append(spec.Process.Env, "TEST_FIFO_ATTACH_TREE=/tmp/pipes-attach")
+
+	return cleanup, nil
+}
+
 // runsTestCaseRunsc runs the test case in runsc.
-func runTestCaseRunsc(testBin string, tc gtest.TestCase, t *testing.T) {
+func runTestCaseRunsc(testBin string, tc *gtest.TestCase, args []string, t *testing.T) {
 	// Run a new container with the test executable and filter for the
 	// given test suite and name.
-	spec := testutil.NewSpecWithArgs(append([]string{testBin}, tc.Args()...)...)
-
+	if args == nil {
+		args = tc.Args()
+	}
+	var spec *specs.Spec
+	if *fusefs {
+		fuseServer, err := testutil.FindFile("test/runner/fuse/fuse")
+		if err != nil {
+			fatalf("cannot find fuse: %v", err)
+		}
+		spec = testutil.NewSpecWithArgs(append([]string{fuseServer, testBin}, args...)...)
+	} else {
+		spec = testutil.NewSpecWithArgs(append([]string{testBin}, args...)...)
+	}
 	// Mark the root as writeable, as some tests attempt to
 	// write to the rootfs, and expect EACCES, not EROFS.
 	spec.Root.Readonly = false
@@ -425,28 +561,50 @@ func runTestCaseRunsc(testBin string, tc gtest.TestCase, t *testing.T) {
 			testTmpDir = "/tmp"
 		}
 	}
+	if *fusefs {
+		// In fuse tests, the fuse server forwards all filesystem ops from /tmp
+		// to /fuse.
+		spec.Mounts = append(spec.Mounts, specs.Mount{
+			Destination: "/fuse",
+			Type:        "tmpfs",
+		})
+	}
+	if *network == "host" {
+		// If host does not have CAP_NET_ADMIN or CAP_NET_RAW, then we
+		// must drop those caps inside the sandbox, since we will not
+		// be able to perform those operations with hostinet.
+		if !specutils.HasCapabilities(capability.CAP_NET_ADMIN) {
+			log.Warningf("Running with network=host, but host does not have CAP_NET_ADMIN. Dropping this capability inside the sandbox.")
+			specutils.DropCapability(spec.Process.Capabilities, "CAP_NET_ADMIN")
+
+		}
+		if !specutils.HasCapabilities(capability.CAP_NET_RAW) {
+			log.Warningf("Running with network=host, but host does not have CAP_NET_RAW. Dropping this capability inside the sandbox.")
+			specutils.DropCapability(spec.Process.Capabilities, "CAP_NET_RAW")
+		}
+	}
 
 	// Set environment variables that indicate we are running in gVisor with
 	// the given platform, network, and filesystem stack.
 	const (
 		platformVar = "TEST_ON_GVISOR"
 		networkVar  = "GVISOR_NETWORK"
-		fuseVar     = "FUSE_ENABLED"
-		lisafsVar   = "LISAFS_ENABLED"
+		ioUringVar  = "IOURING_ENABLED"
+		fuseVar     = "GVISOR_FUSE_TEST"
 	)
 	env := append(os.Environ(), platformVar+"="+*platform, networkVar+"="+*network)
 	if *platformSupport != "" {
 		env = append(env, fmt.Sprintf("%s=%s", platformSupportEnvVar, *platformSupport))
 	}
-	if *fuse {
+	if *ioUring {
+		env = append(env, ioUringVar+"=TRUE")
+	} else {
+		env = append(env, ioUringVar+"=FALSE")
+	}
+	if *fusefs {
 		env = append(env, fuseVar+"=TRUE")
 	} else {
 		env = append(env, fuseVar+"=FALSE")
-	}
-	if *lisafs {
-		env = append(env, lisafsVar+"=TRUE")
-	} else {
-		env = append(env, lisafsVar+"=FALSE")
 	}
 
 	// Remove shard env variables so that the gunit binary does not try to
@@ -460,10 +618,24 @@ func runTestCaseRunsc(testBin string, tc gtest.TestCase, t *testing.T) {
 
 	spec.Process.Env = env
 
-	if *addUDSTree {
-		cleanup, err := setupUDSTree(spec)
+	if *addHostUDS {
+		cleanup, err := setupHostUDSTree(spec)
 		if err != nil {
 			t.Fatalf("error creating UDS tree: %v", err)
+		}
+		defer cleanup()
+	}
+	if *addHostConnector {
+		cleanup, err := setupHostConnectorTree(spec)
+		if err != nil {
+			t.Fatalf("error creating connector tree: %v", err)
+		}
+		defer cleanup()
+	}
+	if *addHostFIFO {
+		cleanup, err := setupHostFifoTree(spec)
+		if err != nil {
+			t.Fatalf("error creating FIFO tree: %v", err)
 		}
 		defer cleanup()
 	}
@@ -491,7 +663,7 @@ func filterEnv(env, exclude []string) []string {
 	return out
 }
 
-func fatalf(s string, args ...interface{}) {
+func fatalf(s string, args ...any) {
 	fmt.Fprintf(os.Stderr, s+"\n", args...)
 	os.Exit(1)
 }
@@ -552,23 +724,44 @@ func main() {
 		fatalf("Abs() failed: %v", err)
 	}
 
-	// Run the tests.
 	var tests []testing.InternalTest
-	for _, tci := range indices {
-		// Capture tc.
-		tc := testCases[tci]
+	if *oneSandbox {
+		tc := gtest.TestCase{
+			Suite: "main",
+			Name:  "test",
+		}
+
 		tests = append(tests, testing.InternalTest{
 			Name: fmt.Sprintf("%s_%s", tc.Suite, tc.Name),
 			F: func(t *testing.T) {
+				args := gtest.BuildTestArgs(indices, testCases)
 				if *platform == "native" {
 					// Run the test case on host.
-					runTestCaseNative(testBin, tc, t)
+					runTestCaseNative(testBin, &tc, args, t)
 				} else {
 					// Run the test case in runsc.
-					runTestCaseRunsc(testBin, tc, t)
+					runTestCaseRunsc(testBin, &tc, args, t)
 				}
 			},
 		})
+	} else {
+		// Run the tests.
+		for _, tci := range indices {
+			// Capture tc.
+			tc := testCases[tci]
+			tests = append(tests, testing.InternalTest{
+				Name: fmt.Sprintf("%s_%s", tc.Suite, tc.Name),
+				F: func(t *testing.T) {
+					if *platform == "native" {
+						// Run the test case on host.
+						runTestCaseNative(testBin, &tc, nil, t)
+					} else {
+						// Run the test case in runsc.
+						runTestCaseRunsc(testBin, &tc, nil, t)
+					}
+				},
+			})
+		}
 	}
 
 	testing.Main(matchString, tests, nil, nil)

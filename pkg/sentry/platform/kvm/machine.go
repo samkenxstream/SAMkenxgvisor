@@ -25,9 +25,9 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/hosttid"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/metric"
-	"gvisor.dev/gvisor/pkg/procid"
 	"gvisor.dev/gvisor/pkg/ring0"
 	"gvisor.dev/gvisor/pkg/ring0/pagetables"
 	"gvisor.dev/gvisor/pkg/seccomp"
@@ -106,32 +106,32 @@ const (
 var (
 	// hostExitCounter is a metric that tracks how many times the sentry
 	// performed a host to guest world switch.
-	hostExitCounter = metric.MustCreateNewUint64Metric(
+	hostExitCounter = metric.MustCreateNewProfilingUint64Metric(
 		"/kvm/host_exits", false, "The number of times the sentry performed a host to guest world switch.")
 
 	// userExitCounter is a metric that tracks how many times the sentry has
 	// had an exit from userspace. Analogous to vCPU.userExits.
-	userExitCounter = metric.MustCreateNewUint64Metric(
+	userExitCounter = metric.MustCreateNewProfilingUint64Metric(
 		"/kvm/user_exits", false, "The number of times the sentry has had an exit from userspace.")
 
 	// interruptCounter is a metric that tracks how many times execution returned
 	// to the KVM host to handle a pending signal.
-	interruptCounter = metric.MustCreateNewUint64Metric(
+	interruptCounter = metric.MustCreateNewProfilingUint64Metric(
 		"/kvm/interrupts", false, "The number of times the signal handler was invoked.")
 
 	// mmapCallCounter is a metric that tracks how many times the function
 	// seccompMmapSyscall has been called.
-	mmapCallCounter = metric.MustCreateNewUint64Metric(
+	mmapCallCounter = metric.MustCreateNewProfilingUint64Metric(
 		"/kvm/mmap_calls", false, "The number of times seccompMmapSyscall has been called.")
 
 	// getVCPUCounter is a metric that tracks how many times different paths of
 	// machine.Get() are triggered.
-	getVCPUCounter = metric.MustCreateNewUint64Metric(
+	getVCPUCounter = metric.MustCreateNewProfilingUint64Metric(
 		"/kvm/get_vcpu", false, "The number of times that machine.Get() was called, split by path the function took.",
 		metric.NewField("acquisition_type", []string{"fast_reused", "reused", "unused", "stolen"}))
 
 	// asInvalidateDuration are durations of calling addressSpace.invalidate().
-	asInvalidateDuration = metric.MustRegisterTimerMetric("/kvm/address_space_invalidate",
+	asInvalidateDuration = metric.MustCreateNewProfilingTimerMetric("/kvm/address_space_invalidate",
 		metric.NewExponentialBucketer(15, uint64(time.Nanosecond*100), 1, 2),
 		"Duration of calling addressSpace.invalidate().")
 )
@@ -372,7 +372,7 @@ func (m *machine) hasSlot(physical uintptr) bool {
 // mapPhysical checks for the mapping of a physical range, and installs one if
 // not available. This attempts to be efficient for calls in the hot path.
 //
-// This panics on error.
+// This throws on error.
 //
 //go:nosplit
 func (m *machine) mapPhysical(physical, length uintptr, phyRegions []physicalRegion) {
@@ -380,13 +380,13 @@ func (m *machine) mapPhysical(physical, length uintptr, phyRegions []physicalReg
 		_, physicalStart, length, pr := calculateBluepillFault(physical, phyRegions)
 		if pr == nil {
 			// Should never happen.
-			panic("mapPhysical on unknown physical address")
+			throw("mapPhysical on unknown physical address")
 		}
 
 		// Is this already mapped? Check the usedSlots.
 		if !m.hasSlot(physicalStart) {
 			if _, ok := handleBluepillFault(m, physical, phyRegions); !ok {
-				panic("handleBluepillFault failed")
+				throw("handleBluepillFault failed")
 			}
 		}
 
@@ -447,7 +447,7 @@ func (m *machine) Destroy() {
 func (m *machine) Get() *vCPU {
 	m.mu.RLock()
 	runtime.LockOSThread()
-	tid := procid.Current()
+	tid := hosttid.Current()
 
 	// Check for an exact match.
 	if c := m.vCPUsByTID[tid]; c != nil {
@@ -467,7 +467,7 @@ func (m *machine) Get() *vCPU {
 	runtime.UnlockOSThread()
 	m.mu.Lock()
 	runtime.LockOSThread()
-	tid = procid.Current()
+	tid = hosttid.Current()
 
 	// Recheck for an exact match.
 	if c := m.vCPUsByTID[tid]; c != nil {

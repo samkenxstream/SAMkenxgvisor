@@ -68,10 +68,13 @@ def _syscall_test(
         network = "none",
         file_access = "exclusive",
         overlay = False,
-        add_uds_tree = False,
-        lisafs = False,
-        fuse = False,
+        add_host_uds = False,
+        add_host_connector = False,
+        add_host_fifo = False,
+        iouring = False,
         container = None,
+        one_sandbox = True,
+        fusefs = False,
         **kwargs):
     # Prepend "runsc" to non-native platform names.
     full_platform = platform if platform == "native" else "runsc_" + platform
@@ -82,12 +85,10 @@ def _syscall_test(
         name += "_shared"
     if overlay:
         name += "_overlay"
-    if fuse:
-        name += "_fuse"
-    if lisafs:
-        name += "_lisafs"
     if network != "none":
         name += "_" + network + "net"
+    if fusefs:
+        name += "_fuse"
 
     # Apply all tags.
     if tags == None:
@@ -135,14 +136,17 @@ def _syscall_test(
         "--platform-support=" + platform_support,
         "--network=" + network,
         "--use-tmpfs=" + str(use_tmpfs),
+        "--fusefs=" + str(fusefs),
         "--file-access=" + file_access,
         "--overlay=" + str(overlay),
-        "--add-uds-tree=" + str(add_uds_tree),
-        "--lisafs=" + str(lisafs),
-        "--fuse=" + str(fuse),
+        "--add-host-uds=" + str(add_host_uds),
+        "--add-host-connector=" + str(add_host_connector),
+        "--add-host-fifo=" + str(add_host_fifo),
         "--strace=" + str(debug),
         "--debug=" + str(debug),
         "--container=" + str(container),
+        "--one-sandbox=" + str(one_sandbox),
+        "--iouring=" + str(iouring),
     ]
 
     # Trace points are platform agnostic, so enable them for ptrace only.
@@ -167,11 +171,14 @@ def all_platforms():
 def syscall_test(
         test,
         use_tmpfs = False,
+        add_fusefs = False,
         add_overlay = False,
-        add_uds_tree = False,
+        add_host_uds = False,
+        add_host_connector = False,
+        add_host_fifo = False,
         add_hostinet = False,
-        add_lisafs = True,
-        fuse = False,
+        one_sandbox = True,
+        iouring = False,
         allow_native = True,
         debug = True,
         container = None,
@@ -182,11 +189,14 @@ def syscall_test(
     Args:
       test: the test target.
       use_tmpfs: use tmpfs in the defined tests.
+      add_fusefs: add a fusefs test.
       add_overlay: add an overlay test.
-      add_uds_tree: add a UDS test.
+      add_host_uds: setup bound UDS on the host.
+      add_host_connector: setup host threads to connect to bound UDS created by sandbox.
+      add_host_fifo: setup FIFO files on the host.
       add_hostinet: add a hostinet test.
-      add_lisafs: add a lisafs test.
-      fuse: enable FUSE support.
+      one_sandbox: runs each unit test in a new sandbox instance.
+      iouring: enable IO_URING support.
       allow_native: generate a native test variant.
       debug: enable debug output.
       container: Run the test in a container. If None, determined from other information.
@@ -196,16 +206,19 @@ def syscall_test(
     if not tags:
         tags = []
 
-    if not fuse and allow_native:
-        # Generate a native test if fuse is not required and if it is allowed.
+    if allow_native:
         _syscall_test(
             test = test,
             platform = "native",
             use_tmpfs = False,
-            add_uds_tree = add_uds_tree,
+            add_host_uds = add_host_uds,
+            add_host_connector = add_host_connector,
+            add_host_fifo = add_host_fifo,
             tags = tags,
+            iouring = iouring,
             debug = debug,
             container = container,
+            one_sandbox = one_sandbox,
             **kwargs
         )
 
@@ -214,38 +227,30 @@ def syscall_test(
             test = test,
             platform = platform,
             use_tmpfs = use_tmpfs,
-            add_uds_tree = add_uds_tree,
+            add_host_uds = add_host_uds,
+            add_host_connector = add_host_connector,
+            add_host_fifo = add_host_fifo,
             tags = platform_tags + tags,
-            fuse = fuse,
+            iouring = iouring,
             debug = debug,
             container = container,
+            one_sandbox = one_sandbox,
             **kwargs
         )
 
-    if add_lisafs:
-        # Generate a *_lisafs variant with the default platform.
-        _syscall_test(
-            test = test,
-            platform = default_platform,
-            use_tmpfs = use_tmpfs,
-            add_uds_tree = add_uds_tree,
-            tags = platforms[default_platform] + tags + ["lisafs"],
-            debug = debug,
-            fuse = fuse,
-            container = container,
-            lisafs = True,
-            **kwargs
-        )
     if add_overlay:
         _syscall_test(
             test = test,
             platform = default_platform,
             use_tmpfs = use_tmpfs,
-            add_uds_tree = add_uds_tree,
+            add_host_uds = add_host_uds,
+            add_host_connector = add_host_connector,
+            add_host_fifo = add_host_fifo,
             tags = platforms.get(default_platform, []) + tags,
             debug = debug,
-            fuse = fuse,
+            iouring = iouring,
             container = container,
+            one_sandbox = one_sandbox,
             overlay = True,
             **kwargs
         )
@@ -255,11 +260,14 @@ def syscall_test(
             platform = default_platform,
             use_tmpfs = use_tmpfs,
             network = "host",
-            add_uds_tree = add_uds_tree,
+            add_host_uds = add_host_uds,
+            add_host_connector = add_host_connector,
+            add_host_fifo = add_host_fifo,
             tags = platforms.get(default_platform, []) + tags,
             debug = debug,
-            fuse = fuse,
+            iouring = iouring,
             container = container,
+            one_sandbox = one_sandbox,
             **kwargs
         )
     if not use_tmpfs:
@@ -268,11 +276,29 @@ def syscall_test(
             test = test,
             platform = default_platform,
             use_tmpfs = use_tmpfs,
-            add_uds_tree = add_uds_tree,
+            add_host_uds = add_host_uds,
+            add_host_connector = add_host_connector,
+            add_host_fifo = add_host_fifo,
+            tags = platforms.get(default_platform, []) + tags,
+            iouring = iouring,
+            debug = debug,
+            container = container,
+            one_sandbox = one_sandbox,
+            file_access = "shared",
+            **kwargs
+        )
+    if add_fusefs:
+        _syscall_test(
+            test = test,
+            platform = default_platform,
+            use_tmpfs = True,
+            fusefs = True,
+            add_host_uds = add_host_uds,
+            add_host_connector = add_host_connector,
+            add_host_fifo = add_host_fifo,
             tags = platforms.get(default_platform, []) + tags,
             debug = debug,
             container = container,
-            file_access = "shared",
-            fuse = fuse,
+            one_sandbox = one_sandbox,
             **kwargs
         )

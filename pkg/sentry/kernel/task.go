@@ -25,7 +25,6 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/metric"
-	"gvisor.dev/gvisor/pkg/sentry/fs"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/futex"
@@ -447,10 +446,10 @@ type Task struct {
 	// abstractSockets is protected by mu.
 	abstractSockets *AbstractSocketNamespace
 
-	// mountNamespaceVFS2 is the task's mount namespace.
+	// mountNamespace is the task's mount namespace.
 	//
 	// It is protected by mu. It is owned by the task goroutine.
-	mountNamespaceVFS2 *vfs.MountNamespace
+	mountNamespace *vfs.MountNamespace
 
 	// parentDeathSignal is sent to this task's thread group when its parent exits.
 	//
@@ -600,12 +599,12 @@ type Task struct {
 var (
 	// syscallCounter is a metric that tracks how many syscalls the sentry has
 	// executed.
-	syscallCounter = metric.MustCreateNewUint64Metric(
+	syscallCounter = metric.MustCreateNewProfilingUint64Metric(
 		"/task/syscalls", false, "The number of syscalls the sentry has executed for the user.")
 
 	// faultCounter is a metric that tracks how many faults the sentry has had to
 	// handle.
-	faultCounter = metric.MustCreateNewUint64Metric(
+	faultCounter = metric.MustCreateNewProfilingUint64Metric(
 		"/task/faults", false, "The number of faults the sentry has handled.")
 )
 
@@ -705,19 +704,9 @@ func (t *Task) SyscallRestartBlock() SyscallRestartBlock {
 // Preconditions: The caller must be running on the task goroutine, or t.mu
 // must be locked.
 func (t *Task) IsChrooted() bool {
-	if VFS2Enabled {
-		realRoot := t.mountNamespaceVFS2.Root()
-		root := t.fsContext.RootDirectoryVFS2()
-		defer root.DecRef(t)
-		return root != realRoot
-	}
-
-	realRoot := t.tg.mounts.Root()
-	defer realRoot.DecRef(t)
+	realRoot := t.mountNamespace.Root()
 	root := t.fsContext.RootDirectory()
-	if root != nil {
-		defer root.DecRef(t)
-	}
+	defer root.DecRef(t)
 	return root != realRoot
 }
 
@@ -750,16 +739,8 @@ func (t *Task) FDTable() *FDTable {
 // GetFile is a convenience wrapper for t.FDTable().Get.
 //
 // Precondition: same as FDTable.Get.
-func (t *Task) GetFile(fd int32) *fs.File {
+func (t *Task) GetFile(fd int32) *vfs.FileDescription {
 	f, _ := t.fdTable.Get(fd)
-	return f
-}
-
-// GetFileVFS2 is a convenience wrapper for t.FDTable().GetVFS2.
-//
-// Precondition: same as FDTable.Get.
-func (t *Task) GetFileVFS2(fd int32) *vfs.FileDescription {
-	f, _ := t.fdTable.GetVFS2(fd)
 	return f
 }
 
@@ -768,39 +749,17 @@ func (t *Task) GetFileVFS2(fd int32) *vfs.FileDescription {
 // This automatically passes the task as the context.
 //
 // Precondition: same as FDTable.
-func (t *Task) NewFDs(fd int32, files []*fs.File, flags FDFlags) ([]int32, error) {
+func (t *Task) NewFDs(fd int32, files []*vfs.FileDescription, flags FDFlags) ([]int32, error) {
 	return t.fdTable.NewFDs(t, fd, files, flags)
 }
 
-// NewFDsVFS2 is a convenience wrapper for t.FDTable().NewFDsVFS2.
-//
-// This automatically passes the task as the context.
-//
-// Precondition: same as FDTable.
-func (t *Task) NewFDsVFS2(fd int32, files []*vfs.FileDescription, flags FDFlags) ([]int32, error) {
-	return t.fdTable.NewFDsVFS2(t, fd, files, flags)
-}
-
-// NewFDFrom is a convenience wrapper for t.FDTable().NewFDs with a single file.
-//
-// This automatically passes the task as the context.
-//
-// Precondition: same as FDTable.
-func (t *Task) NewFDFrom(fd int32, file *fs.File, flags FDFlags) (int32, error) {
-	fds, err := t.fdTable.NewFDs(t, fd, []*fs.File{file}, flags)
-	if err != nil {
-		return 0, err
-	}
-	return fds[0], nil
-}
-
-// NewFDFromVFS2 is a convenience wrapper for t.FDTable().NewFDVFS2.
+// NewFDFrom is a convenience wrapper for t.FDTable().NewFD.
 //
 // This automatically passes the task as the context.
 //
 // Precondition: same as FDTable.Get.
-func (t *Task) NewFDFromVFS2(fd int32, file *vfs.FileDescription, flags FDFlags) (int32, error) {
-	return t.fdTable.NewFDVFS2(t, fd, file, flags)
+func (t *Task) NewFDFrom(minFD int32, file *vfs.FileDescription, flags FDFlags) (int32, error) {
+	return t.fdTable.NewFD(t, minFD, file, flags)
 }
 
 // NewFDAt is a convenience wrapper for t.FDTable().NewFDAt.
@@ -808,17 +767,8 @@ func (t *Task) NewFDFromVFS2(fd int32, file *vfs.FileDescription, flags FDFlags)
 // This automatically passes the task as the context.
 //
 // Precondition: same as FDTable.
-func (t *Task) NewFDAt(fd int32, file *fs.File, flags FDFlags) error {
+func (t *Task) NewFDAt(fd int32, file *vfs.FileDescription, flags FDFlags) error {
 	return t.fdTable.NewFDAt(t, fd, file, flags)
-}
-
-// NewFDAtVFS2 is a convenience wrapper for t.FDTable().NewFDAtVFS2.
-//
-// This automatically passes the task as the context.
-//
-// Precondition: same as FDTable.
-func (t *Task) NewFDAtVFS2(fd int32, file *vfs.FileDescription, flags FDFlags) error {
-	return t.fdTable.NewFDAtVFS2(t, fd, file, flags)
 }
 
 // WithMuLocked executes f with t.mu locked.
@@ -828,18 +778,12 @@ func (t *Task) WithMuLocked(f func(*Task)) {
 	t.mu.Unlock()
 }
 
-// MountNamespace returns t's MountNamespace. MountNamespace does not take an
-// additional reference on the returned MountNamespace.
-func (t *Task) MountNamespace() *fs.MountNamespace {
-	return t.tg.mounts
-}
-
-// MountNamespaceVFS2 returns t's MountNamespace. A reference is taken on the
+// MountNamespace returns t's MountNamespace. A reference is taken on the
 // returned mount namespace.
-func (t *Task) MountNamespaceVFS2() *vfs.MountNamespace {
+func (t *Task) MountNamespace() *vfs.MountNamespace {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.mountNamespaceVFS2
+	return t.mountNamespace
 }
 
 // AbstractSockets returns t's AbstractSocketNamespace.

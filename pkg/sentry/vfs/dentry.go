@@ -66,6 +66,12 @@ type Dentry struct {
 	// InvalidateDentry). dead is protected by mu.
 	dead bool
 
+	// evictable is set by the VFS layer or filesystems like overlayfs as a hint
+	// that this dentry will not be accessed hence forth. So filesystems that
+	// cache dentries locally can use this hint to release the dentry when all
+	// references are dropped. evictable is protected by mu.
+	evictable bool
+
 	// mounts is the number of Mounts for which this Dentry is Mount.point.
 	mounts atomicbitops.Uint32
 
@@ -120,12 +126,6 @@ type DentryImpl interface {
 	// the Dentry. Dentries that are hard links to the same underlying file
 	// share the same watches.
 	//
-	// Watches may return nil if the dentry belongs to a FilesystemImpl that
-	// does not support inotify. If an implementation returns a non-nil watch
-	// set, it must always return a non-nil watch set. Likewise, if an
-	// implementation returns a nil watch set, it must always return a nil watch
-	// set.
-	//
 	// The caller does not need to hold a reference on the dentry.
 	Watches() *Watches
 
@@ -163,6 +163,20 @@ func (d *Dentry) IsDead() bool {
 	return d.dead
 }
 
+// IsEvictable returns true if d is evictable from filesystem dentry cache.
+func (d *Dentry) IsEvictable() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.evictable
+}
+
+// MarkEvictable marks d as evictable.
+func (d *Dentry) MarkEvictable() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.evictable = true
+}
+
 func (d *Dentry) isMounted() bool {
 	return d.mounts.Load() != 0
 }
@@ -174,9 +188,6 @@ func (d *Dentry) InotifyWithParent(ctx context.Context, events, cookie uint32, e
 }
 
 // Watches returns the set of inotify watches associated with d.
-//
-// Watches will return nil if d belongs to a FilesystemImpl that does not
-// support inotify.
 func (d *Dentry) Watches() *Watches {
 	return d.impl.Watches()
 }

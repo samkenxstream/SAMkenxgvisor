@@ -42,7 +42,7 @@ type fileContext struct {
 	context.Context
 }
 
-func (f *fileContext) Value(key interface{}) interface{} {
+func (f *fileContext) Value(key any) any {
 	switch key {
 	case uniqueid.CtxGlobalUniqueID:
 		return uint64(0)
@@ -55,6 +55,7 @@ type byteFullReader struct {
 	data []byte
 }
 
+// ReadFull implements fullReader.ReadFull.
 func (b *byteFullReader) ReadFull(ctx context.Context, dst usermem.IOSequence, offset int64) (int64, error) {
 	if offset < 0 {
 		return 0, linuxerr.EINVAL

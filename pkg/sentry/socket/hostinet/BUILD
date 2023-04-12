@@ -1,16 +1,19 @@
 load("//tools:defs.bzl", "go_library")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "hostinet",
     srcs = [
         "device.go",
         "hostinet.go",
-        "save_restore.go",
+        "netlink.go",
         "socket.go",
         "socket_unsafe.go",
-        "socket_vfs2.go",
+        "sockopt.go",
         "sockopt_impl.go",
         "stack.go",
         "stack_unsafe.go",
@@ -18,6 +21,7 @@ go_library(
     visibility = ["//pkg/sentry:internal"],
     deps = [
         "//pkg/abi/linux",
+        "//pkg/binary",
         "//pkg/context",
         "//pkg/errors/linuxerr",
         "//pkg/fdnotifier",
@@ -28,12 +32,11 @@ go_library(
         "//pkg/safemem",
         "//pkg/sentry/arch",
         "//pkg/sentry/device",
-        "//pkg/sentry/fs",
-        "//pkg/sentry/fs/fsutil",
         "//pkg/sentry/fsimpl/sockfs",
         "//pkg/sentry/hostfd",
         "//pkg/sentry/inet",
         "//pkg/sentry/kernel",
+        "//pkg/sentry/kernel/auth",
         "//pkg/sentry/kernel/time",
         "//pkg/sentry/socket",
         "//pkg/sentry/socket/control",

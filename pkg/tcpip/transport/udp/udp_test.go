@@ -24,10 +24,11 @@ import (
 	"os"
 	"testing"
 
+	"gvisor.dev/gvisor/pkg/bufferv2"
 	"gvisor.dev/gvisor/pkg/refs"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/checker"
+	"gvisor.dev/gvisor/pkg/tcpip/checksum"
 	"gvisor.dev/gvisor/pkg/tcpip/faketime"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
@@ -84,6 +85,7 @@ func TestBindToDeviceOption(t *testing.T) {
 		TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
 		Clock:              &faketime.NullClock{},
 	})
+	defer s.Destroy()
 
 	ep, err := s.NewEndpoint(udp.ProtocolNumber, ipv4.ProtocolNumber, &waiter.Queue{})
 	if err != nil {
@@ -589,7 +591,7 @@ func testWriteAndVerifyInternal(c *context.Context, flow context.TestFlow, setDe
 	// Received the packet and check the payload.
 
 	p := c.LinkEP.Read()
-	if p == nil {
+	if p.IsNil() {
 		c.T.Fatalf("Packet wasn't written out")
 	}
 	defer p.DecRef()
@@ -602,8 +604,8 @@ func testWriteAndVerifyInternal(c *context.Context, flow context.TestFlow, setDe
 		c.T.Errorf("got p.TransportProtocolNumber = %d, want = %d", got, want)
 	}
 
-	buf := p.Buffer()
-	b := buf.Flatten()
+	v := p.ToView()
+	defer v.Release()
 
 	h := flow.MakeHeader4Tuple(context.Outgoing)
 	checkers = append(
@@ -612,13 +614,13 @@ func testWriteAndVerifyInternal(c *context.Context, flow context.TestFlow, setDe
 		checker.DstAddr(h.Dst.Addr),
 		checker.UDP(checker.DstPort(h.Dst.Port)),
 	)
-	flow.CheckerFn()(c.T, b, checkers...)
+	flow.CheckerFn()(c.T, v, checkers...)
 
 	var udpH header.UDP
 	if flow.IsV4() {
-		udpH = header.IPv4(b).Payload()
+		udpH = header.IPv4(v.AsSlice()).Payload()
 	} else {
-		udpH = header.IPv6(b).Payload()
+		udpH = header.IPv6(v.AsSlice()).Payload()
 	}
 	if !bytes.Equal(payload, udpH.Payload()) {
 		c.T.Fatalf("Bad payload: got %x, want %x", udpH.Payload(), payload)
@@ -675,7 +677,6 @@ func TestDualWriteConnectedToV6(t *testing.T) {
 		{writeOpSequence: []writeOperation{preflight, write}, expectedNoRouteErrCount: 1},
 	} {
 		c := context.New(t, []stack.TransportProtocolFactory{udp.NewProtocol, icmp.NewProtocol6, icmp.NewProtocol4})
-		defer c.Cleanup()
 
 		c.CreateEndpoint(ipv6.ProtocolNumber, udp.ProtocolNumber)
 
@@ -692,116 +693,133 @@ func TestDualWriteConnectedToV6(t *testing.T) {
 		if got := c.EP.Stats().(*tcpip.TransportEndpointStats).SendErrors.NoRoute.Value(); got != testCase.expectedNoRouteErrCount {
 			c.T.Fatalf("Endpoint stat not updated. got %d want %d", got, testCase.expectedNoRouteErrCount)
 		}
+		c.Cleanup()
 	}
 }
 
-var writeOpSequences [][]writeOperation = [][]writeOperation{
-	[]writeOperation{write},
-	[]writeOperation{preflight},
-	[]writeOperation{preflight, write},
+var writeOpSequences = map[string]([]writeOperation){
+	"write":           []writeOperation{write},
+	"preflight":       []writeOperation{preflight},
+	"write|preflight": []writeOperation{preflight, write},
 }
 
 func TestDualWriteConnectedToV4Mapped(t *testing.T) {
-	for _, writeOpSequence := range writeOpSequences {
-		c := context.New(t, []stack.TransportProtocolFactory{udp.NewProtocol, icmp.NewProtocol6, icmp.NewProtocol4})
-		defer c.Cleanup()
+	for name, writeOpSequence := range writeOpSequences {
+		t.Run(name, func(t *testing.T) {
+			c := context.New(t, []stack.TransportProtocolFactory{udp.NewProtocol, icmp.NewProtocol6, icmp.NewProtocol4})
+			defer c.Cleanup()
 
-		c.CreateEndpoint(ipv6.ProtocolNumber, udp.ProtocolNumber)
+			c.CreateEndpoint(ipv6.ProtocolNumber, udp.ProtocolNumber)
 
-		// Connect to v4 mapped address.
-		if err := c.EP.Connect(tcpip.FullAddress{Addr: context.TestV4MappedAddr, Port: context.TestPort}); err != nil {
-			c.T.Fatalf("Bind failed: %s", err)
-		}
+			// Connect to v4 mapped address.
+			if err := c.EP.Connect(tcpip.FullAddress{Addr: context.TestV4MappedAddr, Port: context.TestPort}); err != nil {
+				c.T.Fatalf("Bind failed: %s", err)
+			}
 
-		testWriteOpSequenceSucceeds(c, context.UnicastV4in6, writeOpSequence)
+			testWriteOpSequenceSucceeds(c, context.UnicastV4in6, writeOpSequence)
 
-		// Write to v6 address.
-		testWriteOpSequenceFails(c, context.UnicastV6, writeOpSequence, &tcpip.ErrInvalidEndpointState{})
+			// Write to v6 address.
+			testWriteOpSequenceFails(c, context.UnicastV6, writeOpSequence, &tcpip.ErrInvalidEndpointState{})
+		})
 	}
 }
 
 func TestPreflightBindsEndpoint(t *testing.T) {
-	for _, ipProtocolNumber := range []tcpip.NetworkProtocolNumber{ipv6.ProtocolNumber, ipv4.ProtocolNumber} {
-		c := context.New(t, []stack.TransportProtocolFactory{udp.NewProtocol})
-		defer c.Cleanup()
+	protocols := map[string]tcpip.NetworkProtocolNumber{
+		"ipv4": ipv4.ProtocolNumber,
+		"ipv6": ipv6.ProtocolNumber,
+	}
+	for name, ipProtocolNumber := range protocols {
+		t.Run(name, func(t *testing.T) {
+			c := context.New(t, []stack.TransportProtocolFactory{udp.NewProtocol})
+			defer c.Cleanup()
 
-		c.CreateEndpoint(ipProtocolNumber, udp.ProtocolNumber)
+			c.CreateEndpoint(ipProtocolNumber, udp.ProtocolNumber)
 
-		flow := context.UnicastV6
-		h := flow.MakeHeader4Tuple(context.Outgoing)
-		writeDstAddr := flow.MapAddrIfApplicable(h.Dst.Addr)
-		writeOpts := tcpip.WriteOptions{
-			To: &tcpip.FullAddress{Addr: writeDstAddr, Port: h.Dst.Port},
-		}
+			flow := context.UnicastV6
+			h := flow.MakeHeader4Tuple(context.Outgoing)
+			writeDstAddr := flow.MapAddrIfApplicable(h.Dst.Addr)
+			writeOpts := tcpip.WriteOptions{
+				To: &tcpip.FullAddress{Addr: writeDstAddr, Port: h.Dst.Port},
+			}
 
-		if err := getEndpointWithPreflight(c).Preflight(writeOpts); err != nil {
-			c.T.Fatalf("Preflight failed: %s", err)
-		}
+			if err := getEndpointWithPreflight(c).Preflight(writeOpts); err != nil {
+				c.T.Fatalf("Preflight failed: %s", err)
+			}
 
-		if c.EP.State() != uint32(transport.DatagramEndpointStateBound) {
-			c.T.Fatalf("Expect UDP endpoint in state %d, found %d", transport.DatagramEndpointStateBound, c.EP.State())
-		}
+			if c.EP.State() != uint32(transport.DatagramEndpointStateBound) {
+				c.T.Fatalf("Expect UDP endpoint in state %d, found %d", transport.DatagramEndpointStateBound, c.EP.State())
+			}
+		})
 	}
 }
 
 func TestV4WriteOnV6Only(t *testing.T) {
-	for _, writeOpSequence := range writeOpSequences {
-		c := context.New(t, []stack.TransportProtocolFactory{udp.NewProtocol, icmp.NewProtocol6, icmp.NewProtocol4})
-		defer c.Cleanup()
+	for name, writeOpSequence := range writeOpSequences {
+		t.Run(name, func(t *testing.T) {
+			c := context.New(t, []stack.TransportProtocolFactory{udp.NewProtocol, icmp.NewProtocol6, icmp.NewProtocol4})
+			defer c.Cleanup()
 
-		c.CreateEndpointForFlow(context.UnicastV6Only, udp.ProtocolNumber)
+			c.CreateEndpointForFlow(context.UnicastV6Only, udp.ProtocolNumber)
 
-		// Write to V4 mapped address.
-		testWriteOpSequenceFails(c, context.UnicastV4in6, writeOpSequence, &tcpip.ErrNoRoute{})
+			// Write to V4 mapped address.
+			testWriteOpSequenceFails(c, context.UnicastV4in6, writeOpSequence, &tcpip.ErrHostUnreachable{})
+		})
 	}
 }
 
 func TestV6WriteOnBoundToV4Mapped(t *testing.T) {
-	for _, writeOpSequence := range writeOpSequences {
-		c := context.New(t, []stack.TransportProtocolFactory{udp.NewProtocol, icmp.NewProtocol6, icmp.NewProtocol4})
-		defer c.Cleanup()
+	for name, writeOpSequence := range writeOpSequences {
+		t.Run(name, func(t *testing.T) {
+			c := context.New(t, []stack.TransportProtocolFactory{udp.NewProtocol, icmp.NewProtocol6, icmp.NewProtocol4})
+			defer c.Cleanup()
 
-		c.CreateEndpoint(ipv6.ProtocolNumber, udp.ProtocolNumber)
+			c.CreateEndpoint(ipv6.ProtocolNumber, udp.ProtocolNumber)
 
-		// Bind to v4 mapped address.
-		if err := c.EP.Bind(tcpip.FullAddress{Addr: context.StackV4MappedAddr, Port: context.StackPort}); err != nil {
-			c.T.Fatalf("Bind failed: %s", err)
-		}
+			// Bind to v4 mapped address.
+			if err := c.EP.Bind(tcpip.FullAddress{Addr: context.StackV4MappedAddr, Port: context.StackPort}); err != nil {
+				c.T.Fatalf("Bind failed: %s", err)
+			}
 
-		// Write to v6 address.
-		testWriteOpSequenceFails(c, context.UnicastV6, writeOpSequence, &tcpip.ErrInvalidEndpointState{})
+			// Write to v6 address.
+			testWriteOpSequenceFails(c, context.UnicastV6, writeOpSequence, &tcpip.ErrInvalidEndpointState{})
+		})
 	}
 }
 
 func TestV6WriteOnConnected(t *testing.T) {
-	for _, writeOpSequence := range writeOpSequences {
-		c := context.New(t, []stack.TransportProtocolFactory{udp.NewProtocol, icmp.NewProtocol6, icmp.NewProtocol4})
-		defer c.Cleanup()
+	for name, writeOpSequence := range writeOpSequences {
+		t.Run(name, func(t *testing.T) {
+			c := context.New(t, []stack.TransportProtocolFactory{udp.NewProtocol, icmp.NewProtocol6, icmp.NewProtocol4})
+			defer c.Cleanup()
 
-		c.CreateEndpoint(ipv6.ProtocolNumber, udp.ProtocolNumber)
+			c.CreateEndpoint(ipv6.ProtocolNumber, udp.ProtocolNumber)
 
-		// Connect to v6 address.
-		if err := c.EP.Connect(tcpip.FullAddress{Addr: context.TestV6Addr, Port: context.TestPort}); err != nil {
-			c.T.Fatalf("Connect failed: %s", err)
-		}
+			// Connect to v6 address.
+			if err := c.EP.Connect(tcpip.FullAddress{Addr: context.TestV6Addr, Port: context.TestPort}); err != nil {
+				c.T.Fatalf("Connect failed: %s", err)
+			}
 
-		testWriteOpSequenceSucceedsNoDestination(c, context.UnicastV6, writeOpSequence)
+			testWriteOpSequenceSucceedsNoDestination(c, context.UnicastV6, writeOpSequence)
+		})
 	}
 }
 
 func TestV4WriteOnConnected(t *testing.T) {
-	for _, writeOpSequence := range writeOpSequences {
-		c := context.New(t, []stack.TransportProtocolFactory{udp.NewProtocol, icmp.NewProtocol6, icmp.NewProtocol4})
-		defer c.Cleanup()
+	for name, writeOpSequence := range writeOpSequences {
+		t.Run(name, func(t *testing.T) {
+			c := context.New(t, []stack.TransportProtocolFactory{udp.NewProtocol, icmp.NewProtocol6, icmp.NewProtocol4})
+			defer c.Cleanup()
 
-		c.CreateEndpoint(ipv6.ProtocolNumber, udp.ProtocolNumber)
+			c.CreateEndpoint(ipv6.ProtocolNumber, udp.ProtocolNumber)
 
-		// Connect to v4 mapped address.
-		if err := c.EP.Connect(tcpip.FullAddress{Addr: context.TestV4MappedAddr, Port: context.TestPort}); err != nil {
-			c.T.Fatalf("Connect failed: %s", err)
-		}
+			// Connect to v4 mapped address.
+			if err := c.EP.Connect(tcpip.FullAddress{Addr: context.TestV4MappedAddr, Port: context.TestPort}); err != nil {
+				c.T.Fatalf("Connect failed: %s", err)
+			}
 
-		testWriteOpSequenceSucceedsNoDestination(c, context.UnicastV4, writeOpSequence)
+			testWriteOpSequenceSucceedsNoDestination(c, context.UnicastV4, writeOpSequence)
+		})
 	}
 }
 
@@ -1524,7 +1542,7 @@ func TestV4UnknownDestination(t *testing.T) {
 				}
 			}
 			if !tc.icmpRequired {
-				if p := c.LinkEP.Read(); p != nil {
+				if p := c.LinkEP.Read(); !p.IsNil() {
 					t.Fatalf("unexpected packet received: %+v", p)
 				}
 				return
@@ -1532,25 +1550,27 @@ func TestV4UnknownDestination(t *testing.T) {
 
 			// ICMP required.
 			p := c.LinkEP.Read()
-			if p == nil {
+			if p.IsNil() {
 				t.Fatalf("packet wasn't written out")
 			}
 
-			buf := p.Buffer()
+			buf := p.ToBuffer()
+			defer buf.Release()
 			p.DecRef()
 			pkt := buf.Flatten()
 			if got, want := len(pkt), header.IPv4MinimumProcessableDatagramSize; got > want {
 				t.Fatalf("got an ICMP packet of size: %d, want: sz <= %d", got, want)
 			}
 
-			hdr := header.IPv4(pkt)
+			hdr := bufferv2.NewViewWithData(pkt)
+			defer hdr.Release()
 			checker.IPv4(t, hdr, checker.ICMPv4(
 				checker.ICMPv4Type(header.ICMPv4DstUnreachable),
 				checker.ICMPv4Code(header.ICMPv4PortUnreachable)))
 
 			// We need to compare the included data part of the UDP packet that is in
 			// the ICMP packet with the matching original data.
-			icmpPkt := header.ICMPv4(hdr.Payload())
+			icmpPkt := header.ICMPv4(header.IPv4(hdr.AsSlice()).Payload())
 			payloadIPHeader := header.IPv4(icmpPkt.Payload())
 			incomingHeaderLength := header.IPv4MinimumSize + header.UDPMinimumSize
 			wantLen := len(payload)
@@ -1619,7 +1639,7 @@ func TestV6UnknownDestination(t *testing.T) {
 				}
 			}
 			if !tc.icmpRequired {
-				if p := c.LinkEP.Read(); p != nil {
+				if p := c.LinkEP.Read(); !p.IsNil() {
 					t.Fatalf("unexpected packet received: %+v", p)
 				}
 				return
@@ -1627,23 +1647,25 @@ func TestV6UnknownDestination(t *testing.T) {
 
 			// ICMP required.
 			p := c.LinkEP.Read()
-			if p == nil {
+			if p.IsNil() {
 				t.Fatalf("packet wasn't written out")
 			}
 
-			buf := p.Buffer()
+			buf := p.ToBuffer()
+			defer buf.Release()
 			p.DecRef()
 			pkt := buf.Flatten()
 			if got, want := len(pkt), header.IPv6MinimumMTU; got > want {
 				t.Fatalf("got an ICMP packet of size: %d, want: sz <= %d", got, want)
 			}
 
-			hdr := header.IPv6(pkt)
+			hdr := bufferv2.NewViewWithData(pkt)
+			defer hdr.Release()
 			checker.IPv6(t, hdr, checker.ICMPv6(
 				checker.ICMPv6Type(header.ICMPv6DstUnreachable),
 				checker.ICMPv6Code(header.ICMPv6PortUnreachable)))
 
-			icmpPkt := header.ICMPv6(hdr.Payload())
+			icmpPkt := header.ICMPv6(header.IPv6(hdr.AsSlice()).Payload())
 			payloadIPHeader := header.IPv6(icmpPkt.Payload())
 			wantLen := len(payload)
 			if tc.largePayload {
@@ -1923,7 +1945,6 @@ func TestShutdownRead(t *testing.T) {
 func TestShutdownWrite(t *testing.T) {
 	for _, writeOpSequence := range writeOpSequences {
 		c := context.New(t, []stack.TransportProtocolFactory{udp.NewProtocol, icmp.NewProtocol6, icmp.NewProtocol4})
-		defer c.Cleanup()
 
 		c.CreateEndpoint(ipv6.ProtocolNumber, udp.ProtocolNumber)
 
@@ -1936,6 +1957,7 @@ func TestShutdownWrite(t *testing.T) {
 		}
 
 		testWriteOpSequenceFails(c, context.UnicastV6, writeOpSequence, &tcpip.ErrClosedForSend{})
+		c.Cleanup()
 	}
 }
 
@@ -2069,6 +2091,7 @@ func TestOutgoingSubnetBroadcast(t *testing.T) {
 				TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
 				Clock:              &faketime.NullClock{},
 			})
+			defer s.Destroy()
 			e := channel.New(0, context.DefaultMTU, "")
 			defer e.Close()
 			if err := s.CreateNIC(nicID1, e); err != nil {
@@ -2178,11 +2201,12 @@ func TestChecksumWithZeroValueOnesComplementSum(t *testing.T) {
 		}
 
 		pkt := c.LinkEP.Read()
-		if pkt == nil {
+		if pkt.IsNil() {
 			t.Fatal("Packet wasn't written out")
 		}
 
 		v := stack.PayloadSince(pkt.NetworkHeader())
+		defer v.Release()
 		pkt.DecRef()
 		checker.IPv6(t, v, checker.UDP())
 
@@ -2197,7 +2221,7 @@ func TestChecksumWithZeroValueOnesComplementSum(t *testing.T) {
 		// The resulting ones complement will be  C' = C - C so we know C' will be
 		// zero. The stack should never send a zero value though so we expect all
 		// ones below.
-		binary.BigEndian.PutUint16(payload[:], header.UDP(header.IPv6(v).Payload()).Checksum())
+		binary.BigEndian.PutUint16(payload[:], header.UDP(header.IPv6(v.AsSlice()).Payload()).Checksum())
 	}
 
 	{
@@ -2214,18 +2238,19 @@ func TestChecksumWithZeroValueOnesComplementSum(t *testing.T) {
 
 	{
 		pkt := c.LinkEP.Read()
-		if pkt == nil {
+		if pkt.IsNil() {
 			t.Fatal("Packet wasn't written out")
 		}
 		defer pkt.DecRef()
 
 		v := stack.PayloadSince(pkt.NetworkHeader())
-		checker.IPv6(t, stack.PayloadSince(pkt.NetworkHeader()), checker.UDP(checker.TransportChecksum(math.MaxUint16)))
+		defer v.Release()
+		checker.IPv6(t, v, checker.UDP(checker.TransportChecksum(math.MaxUint16)))
 
 		// Make sure the all ones checksum is valid.
-		hdr := header.IPv6(v)
+		hdr := header.IPv6(v.AsSlice())
 		udp := header.UDP(hdr.Payload())
-		if src, dst, payloadXsum := hdr.SourceAddress(), hdr.DestinationAddress(), header.Checksum(udp.Payload(), 0); !udp.IsChecksumValid(src, dst, payloadXsum) {
+		if src, dst, payloadXsum := hdr.SourceAddress(), hdr.DestinationAddress(), checksum.Checksum(udp.Payload(), 0); !udp.IsChecksumValid(src, dst, payloadXsum) {
 			t.Errorf("got udp.IsChecksumValid(%s, %s, %d) = false, want = true", src, dst, payloadXsum)
 		}
 	}
@@ -2236,7 +2261,6 @@ func TestChecksumWithZeroValueOnesComplementSum(t *testing.T) {
 func TestWritePayloadSizeTooBig(t *testing.T) {
 	for _, writeOpSequence := range writeOpSequences {
 		c := context.New(t, []stack.TransportProtocolFactory{udp.NewProtocol, icmp.NewProtocol6, icmp.NewProtocol4})
-		defer c.Cleanup()
 
 		c.CreateEndpoint(ipv6.ProtocolNumber, udp.ProtocolNumber)
 
@@ -2254,12 +2278,13 @@ func TestWritePayloadSizeTooBig(t *testing.T) {
 				testPreflightSucceeds(c, context.UnicastV6)
 			}
 		}
+		c.Cleanup()
 	}
 }
 
 func TestMain(m *testing.M) {
 	refs.SetLeakMode(refs.LeaksPanic)
 	code := m.Run()
-	refsvfs2.DoLeakCheck()
+	refs.DoLeakCheck()
 	os.Exit(code)
 }

@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "go_library", "go_test")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "arp",
@@ -26,9 +29,8 @@ go_test(
     srcs = ["arp_test.go"],
     deps = [
         ":arp",
-        "//pkg/buffer",
+        "//pkg/bufferv2",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/tcpip",
         "//pkg/tcpip/faketime",
         "//pkg/tcpip/header",
@@ -49,7 +51,6 @@ go_test(
     library = ":arp",
     deps = [
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/tcpip",
         "//pkg/tcpip/stack",
         "//pkg/tcpip/testutil",

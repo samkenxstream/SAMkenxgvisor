@@ -35,21 +35,21 @@ const (
 )
 
 // Infof logs an formatted info message by calling log.Infof.
-func (t *Task) Infof(fmt string, v ...interface{}) {
+func (t *Task) Infof(fmt string, v ...any) {
 	if log.IsLogging(log.Info) {
 		log.InfofAtDepth(1, t.logPrefix.Load().(string)+fmt, v...)
 	}
 }
 
 // Warningf logs a warning string by calling log.Warningf.
-func (t *Task) Warningf(fmt string, v ...interface{}) {
+func (t *Task) Warningf(fmt string, v ...any) {
 	if log.IsLogging(log.Warning) {
 		log.WarningfAtDepth(1, t.logPrefix.Load().(string)+fmt, v...)
 	}
 }
 
 // Debugf creates a debug string that includes the task ID.
-func (t *Task) Debugf(fmt string, v ...interface{}) {
+func (t *Task) Debugf(fmt string, v ...any) {
 	if log.IsLogging(log.Debug) {
 		log.DebugfAtDepth(1, t.logPrefix.Load().(string)+fmt, v...)
 	}
@@ -253,6 +253,6 @@ func (t *Task) traceExecEvent(image *TaskImage) {
 
 	// traceExecEvent function may be called before the task goroutine
 	// starts, so we must use the async context.
-	name := file.PathnameWithDeleted(t.AsyncContext())
+	name := file.MappedName(t.AsyncContext())
 	trace.Logf(t.traceContext, traceCategory, "exec: %s", name)
 }

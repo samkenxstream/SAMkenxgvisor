@@ -22,7 +22,7 @@
 // ENTRY_CPU_SELF is the location of the CPU in the entry struct.
 //
 // This is sourced from ring0.
-#define ENTRY_CPU_SELF {{ .kernelEntry.cpuSelf.Offset }}
+#define ENTRY_CPU_SELF 272 // +checkoffset ring0 kernelEntry.cpuSelf
 
 // Context offsets.
 //
@@ -41,9 +41,9 @@
 #define SYS_MMAP 9
 
 // See bluepill.go.
-TEXT ·bluepill(SB),NOSPLIT,$0
+TEXT ·bluepill(SB),NOSPLIT|NOFRAME,$0
 begin:
-	MOVQ vcpu+0(FP), AX
+	MOVQ arg+0(FP), AX
 	LEAQ VCPU_CPU(AX), BX
 
 	// The gorountine stack will be changed in guest which renders
@@ -72,7 +72,7 @@ right_vCPU:
 // 	SI - Pointer to siginfo_t structure.
 // 	DX - Pointer to ucontext structure.
 //
-TEXT ·sighandler(SB),NOSPLIT,$0
+TEXT ·sighandler(SB),NOSPLIT|NOFRAME,$0
 	// Check if the signal is from the kernel.
 	MOVQ $0x80, CX
 	CMPL CX, 0x8(SI)
@@ -103,7 +103,7 @@ TEXT ·addrOfSighandler(SB), $0-8
 	MOVQ AX, ret+0(FP)
 	RET
 
-TEXT ·sigsysHandler(SB),NOSPLIT,$0
+TEXT ·sigsysHandler(SB),NOSPLIT|NOFRAME,$0
 	// Check if the signal is from the kernel.
 	MOVQ $1, CX
 	CMPL CX, 0x8(SI)
@@ -129,7 +129,7 @@ TEXT ·addrOfSigsysHandler(SB), $0-8
 	RET
 
 // dieTrampoline: see bluepill.go, bluepill_amd64_unsafe.go for documentation.
-TEXT ·dieTrampoline(SB),NOSPLIT,$0
+TEXT ·dieTrampoline(SB),NOSPLIT|NOFRAME,$0
 	PUSHQ BX // First argument (vCPU).
 	PUSHQ AX // Fake the old RIP as caller.
 	JMP ·dieHandler(SB)

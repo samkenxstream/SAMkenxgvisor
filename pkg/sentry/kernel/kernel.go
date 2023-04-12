@@ -20,7 +20,7 @@
 //
 //	Kernel.extMu
 //		ThreadGroup.timerMu
-//		  ktime.Timer.mu (for kernelCPUClockTicker and IntervalTimer)
+//		  ktime.Timer.mu (for IntervalTimer) and Kernel.cpuClockMu
 //		    TaskSet.mu
 //		      SignalHandlers.mu
 //		        Task.mu
@@ -46,11 +46,7 @@ import (
 	"gvisor.dev/gvisor/pkg/eventchannel"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	"gvisor.dev/gvisor/pkg/sentry/fs"
-	oldtimerfd "gvisor.dev/gvisor/pkg/sentry/fs/timerfd"
-	"gvisor.dev/gvisor/pkg/sentry/fsbridge"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/pipefs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/sockfs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/timerfd"
@@ -79,21 +75,9 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip"
 )
 
-// VFS2Enabled is set to true when VFS2 is enabled. Added as a global to allow
-// easy access everywhere.
-//
-// TODO(gvisor.dev/issue/1624): Remove when VFS1 is no longer used.
-var VFS2Enabled = false
-
-// LISAFSEnabled is set to true when lisafs protocol is enabled. Added as a
-// global to allow easy access everywhere.
-//
-// TODO(gvisor.dev/issue/6319): Remove when lisafs is default.
-var LISAFSEnabled = false
-
-// FUSEEnabled is set to true when FUSE is enabled. Added as a global to allow
-// easy access everywhere. To be removed once FUSE is completed.
-var FUSEEnabled = false
+// IOUringEnabled is set to true when IO_URING is enabled. Added as a global to
+// allow easy access everywhere.
+var IOUringEnabled = false
 
 // userCounters is a set of user counters.
 //
@@ -183,12 +167,6 @@ type Kernel struct {
 	// syslog is the kernel log.
 	syslog syslog
 
-	// runningTasksMu synchronizes disable/enable of cpuClockTicker when
-	// the kernel is idle (runningTasks == 0).
-	//
-	// runningTasksMu is used to exclude critical sections when the timer
-	// disables itself and when the first active task enables the timer,
-	// ensuring that tasks always see a valid cpuClock value.
 	runningTasksMu runningTasksMutex `state:"nosave"`
 
 	// runningTasks is the total count of tasks currently in
@@ -199,36 +177,49 @@ type Kernel struct {
 	// further protected by runningTasksMu (see incRunningTasks).
 	runningTasks atomicbitops.Int64
 
-	// cpuClock is incremented every linux.ClockTick. cpuClock is used to
-	// measure task CPU usage, since sampling monotonicClock twice on every
-	// syscall turns out to be unreasonably expensive. This is similar to how
-	// Linux does task CPU accounting on x86 (CONFIG_IRQ_TIME_ACCOUNTING),
-	// although Linux also uses scheduler timing information to improve
-	// resolution (kernel/sched/cputime.c:cputime_adjust()), which we can't do
-	// since "preeemptive" scheduling is managed by the Go runtime, which
-	// doesn't provide this information.
+	// runningTasksCond is signaled when runningTasks is incremented from 0 to 1.
+	//
+	// Invariant: runningTasksCond.L == &runningTasksMu.
+	runningTasksCond sync.Cond `state:"nosave"`
+
+	// cpuClock is incremented every linux.ClockTick by a goroutine running
+	// kernel.runCPUClockTicker() while runningTasks != 0.
+	//
+	// cpuClock is used to measure task CPU usage, since sampling monotonicClock
+	// twice on every syscall turns out to be unreasonably expensive. This is
+	// similar to how Linux does task CPU accounting on x86
+	// (CONFIG_IRQ_TIME_ACCOUNTING), although Linux also uses scheduler timing
+	// information to improve resolution
+	// (kernel/sched/cputime.c:cputime_adjust()), which we can't do since
+	// "preeemptive" scheduling is managed by the Go runtime, which doesn't
+	// provide this information.
 	//
 	// cpuClock is mutable, and is accessed using atomic memory operations.
 	cpuClock atomicbitops.Uint64
 
-	// cpuClockTicker increments cpuClock.
-	cpuClockTicker *ktime.Timer `state:"nosave"`
+	// cpuClockTickTimer drives increments of cpuClock.
+	cpuClockTickTimer *time.Timer `state:"nosave"`
 
-	// cpuClockTickerDisabled indicates that cpuClockTicker has been
-	// disabled because no tasks are running.
-	//
-	// cpuClockTickerDisabled is protected by runningTasksMu.
-	cpuClockTickerDisabled bool
+	// cpuClockMu is used to make increments of cpuClock, and updates of timers
+	// based on cpuClock, atomic.
+	cpuClockMu cpuClockMutex `state:"nosave"`
 
-	// cpuClockTickerSetting is the ktime.Setting of cpuClockTicker at the
-	// point it was disabled. It is cached here to avoid a lock ordering
-	// violation with cpuClockTicker.mu when runningTaskMu is held.
+	// cpuClockTickerRunning is true if the goroutine that increments cpuClock is
+	// running and false if it is blocked in runningTasksCond.Wait() or if it
+	// never started.
 	//
-	// cpuClockTickerSetting is only valid when cpuClockTickerDisabled is
-	// true.
+	// cpuClockTickerRunning is protected by runningTasksMu.
+	cpuClockTickerRunning bool
+
+	// cpuClockTickerWakeCh is sent to to wake the goroutine that increments
+	// cpuClock if it's sleeping between ticks.
+	cpuClockTickerWakeCh chan struct{} `state:"nosave"`
+
+	// cpuClockTickerStopCond is broadcast when cpuClockTickerRunning transitions
+	// from true to false.
 	//
-	// cpuClockTickerSetting is protected by runningTasksMu.
-	cpuClockTickerSetting ktime.Setting
+	// Invariant: cpuClockTickerStopCond.L == &runningTasksMu.
+	cpuClockTickerStopCond sync.Cond `state:"nosave"`
 
 	// uniqueID is used to generate unique identifiers.
 	//
@@ -253,14 +244,8 @@ type Kernel struct {
 	// danglingEndpoints is used to save / restore tcpip.DanglingEndpoints.
 	danglingEndpoints struct{} `state:".([]tcpip.Endpoint)"`
 
-	// sockets is the list of all network sockets in the system.
-	// Protected by extMu.
-	// TODO(gvisor.dev/issue/1624): Only used by VFS1.
-	sockets socketList
-
-	// socketsVFS2 records all network sockets in the system. Protected by
-	// extMu.
-	socketsVFS2 map[*vfs.FileDescription]*SocketRecord
+	// sockets records all network sockets in the system. Protected by extMu.
+	sockets map[*vfs.FileDescription]*SocketRecord
 
 	// nextSocketRecord is the next entry number to use in sockets. Protected
 	// by extMu.
@@ -268,11 +253,6 @@ type Kernel struct {
 
 	// deviceRegistry is used to save/restore device.SimpleDevices.
 	deviceRegistry struct{} `state:".(*device.Registry)"`
-
-	// DirentCacheLimiter controls the number of total dirent entries can be in
-	// caches. Not all caches use it, only the caches that use host resources use
-	// the limiter. It may be nil if disabled.
-	DirentCacheLimiter *fs.DirentCacheLimiter
 
 	// unimplementedSyscallEmitterOnce is used in the initialization of
 	// unimplementedSyscallEmitter.
@@ -411,6 +391,9 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 	if k.rootNetworkNamespace == nil {
 		k.rootNetworkNamespace = inet.NewRootNamespace(nil, nil)
 	}
+	k.runningTasksCond.L = &k.runningTasksMu
+	k.cpuClockTickerWakeCh = make(chan struct{}, 1)
+	k.cpuClockTickerStopCond.L = &k.runningTasksMu
 	k.applicationCores = args.ApplicationCores
 	if args.UseHostCores {
 		k.useHostCores = true
@@ -432,44 +415,42 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 	k.YAMAPtraceScope = atomicbitops.FromInt32(linux.YAMA_SCOPE_RELATIONAL)
 	k.userCountersMap = make(map[auth.KUID]*userCounters)
 
-	if VFS2Enabled {
-		ctx := k.SupervisorContext()
-		if err := k.vfs.Init(ctx); err != nil {
-			return fmt.Errorf("failed to initialize VFS: %v", err)
-		}
-
-		err := k.rootIPCNamespace.InitPosixQueues(ctx, &k.vfs, auth.CredentialsFromContext(ctx))
-		if err != nil {
-			return fmt.Errorf("failed to create mqfs filesystem: %v", err)
-		}
-
-		pipeFilesystem, err := pipefs.NewFilesystem(&k.vfs)
-		if err != nil {
-			return fmt.Errorf("failed to create pipefs filesystem: %v", err)
-		}
-		defer pipeFilesystem.DecRef(ctx)
-		pipeMount := k.vfs.NewDisconnectedMount(pipeFilesystem, nil, &vfs.MountOptions{})
-		k.pipeMount = pipeMount
-
-		tmpfsFilesystem, tmpfsRoot, err := tmpfs.NewFilesystem(ctx, &k.vfs, auth.NewRootCredentials(k.rootUserNamespace))
-		if err != nil {
-			return fmt.Errorf("failed to create tmpfs filesystem: %v", err)
-		}
-		defer tmpfsFilesystem.DecRef(ctx)
-		defer tmpfsRoot.DecRef(ctx)
-		k.shmMount = k.vfs.NewDisconnectedMount(tmpfsFilesystem, tmpfsRoot, &vfs.MountOptions{})
-
-		socketFilesystem, err := sockfs.NewFilesystem(&k.vfs)
-		if err != nil {
-			return fmt.Errorf("failed to create sockfs filesystem: %v", err)
-		}
-		defer socketFilesystem.DecRef(ctx)
-		k.socketMount = k.vfs.NewDisconnectedMount(socketFilesystem, nil, &vfs.MountOptions{})
-
-		k.socketsVFS2 = make(map[*vfs.FileDescription]*SocketRecord)
-
-		k.cgroupRegistry = newCgroupRegistry()
+	ctx := k.SupervisorContext()
+	if err := k.vfs.Init(ctx); err != nil {
+		return fmt.Errorf("failed to initialize VFS: %v", err)
 	}
+
+	err := k.rootIPCNamespace.InitPosixQueues(ctx, &k.vfs, auth.CredentialsFromContext(ctx))
+	if err != nil {
+		return fmt.Errorf("failed to create mqfs filesystem: %v", err)
+	}
+
+	pipeFilesystem, err := pipefs.NewFilesystem(&k.vfs)
+	if err != nil {
+		return fmt.Errorf("failed to create pipefs filesystem: %v", err)
+	}
+	defer pipeFilesystem.DecRef(ctx)
+	pipeMount := k.vfs.NewDisconnectedMount(pipeFilesystem, nil, &vfs.MountOptions{})
+	k.pipeMount = pipeMount
+
+	tmpfsFilesystem, tmpfsRoot, err := tmpfs.NewFilesystem(ctx, &k.vfs, auth.NewRootCredentials(k.rootUserNamespace))
+	if err != nil {
+		return fmt.Errorf("failed to create tmpfs filesystem: %v", err)
+	}
+	defer tmpfsFilesystem.DecRef(ctx)
+	defer tmpfsRoot.DecRef(ctx)
+	k.shmMount = k.vfs.NewDisconnectedMount(tmpfsFilesystem, tmpfsRoot, &vfs.MountOptions{})
+
+	socketFilesystem, err := sockfs.NewFilesystem(&k.vfs)
+	if err != nil {
+		return fmt.Errorf("failed to create sockfs filesystem: %v", err)
+	}
+	defer socketFilesystem.DecRef(ctx)
+	k.socketMount = k.vfs.NewDisconnectedMount(socketFilesystem, nil, &vfs.MountOptions{})
+
+	k.sockets = make(map[*vfs.FileDescription]*SocketRecord)
+
+	k.cgroupRegistry = newCgroupRegistry()
 	return nil
 }
 
@@ -491,50 +472,16 @@ func (k *Kernel) SaveTo(ctx context.Context, w wire.Writer) error {
 	k.mf.StartEvictions()
 	k.mf.WaitForEvictions()
 
-	if VFS2Enabled {
-		// Discard unsavable mappings, such as those for host file descriptors.
-		if err := k.invalidateUnsavableMappings(ctx); err != nil {
-			return fmt.Errorf("failed to invalidate unsavable mappings: %v", err)
-		}
+	// Discard unsavable mappings, such as those for host file descriptors.
+	if err := k.invalidateUnsavableMappings(ctx); err != nil {
+		return fmt.Errorf("failed to invalidate unsavable mappings: %v", err)
+	}
 
-		// Prepare filesystems for saving. This must be done after
-		// invalidateUnsavableMappings(), since dropping memory mappings may
-		// affect filesystem state (e.g. page cache reference counts).
-		if err := k.vfs.PrepareSave(ctx); err != nil {
-			return err
-		}
-	} else {
-		// Flush cached file writes to backing storage. This must come after
-		// MemoryFile eviction since eviction may cause file writes.
-		if err := k.flushWritesToFiles(ctx); err != nil {
-			return err
-		}
-
-		// Clear the dirent cache before saving because Dirents must be Loaded in a
-		// particular order (parents before children), and Loading dirents from a cache
-		// breaks that order.
-		if err := k.flushMountSourceRefs(ctx); err != nil {
-			return err
-		}
-
-		// Ensure that all inode and mount release operations have completed.
-		fs.AsyncBarrier()
-
-		// Once all fs work has completed (flushed references have all been released),
-		// reset mount mappings. This allows individual mounts to save how inodes map
-		// to filesystem resources. Without this, fs.Inodes cannot be restored.
-		fs.SaveInodeMappings()
-
-		// Discard unsavable mappings, such as those for host file descriptors.
-		// This must be done after waiting for "asynchronous fs work", which
-		// includes async I/O that may touch application memory.
-		//
-		// TODO(gvisor.dev/issue/1624): This rationale is believed to be
-		// obsolete since AIO callbacks are now waited-for by Kernel.Pause(),
-		// but this order is conservatively retained for VFS1.
-		if err := k.invalidateUnsavableMappings(ctx); err != nil {
-			return fmt.Errorf("failed to invalidate unsavable mappings: %v", err)
-		}
+	// Prepare filesystems for saving. This must be done after
+	// invalidateUnsavableMappings(), since dropping memory mappings may
+	// affect filesystem state (e.g. page cache reference counts).
+	if err := k.vfs.PrepareSave(ctx); err != nil {
+		return err
 	}
 
 	// Save the CPUID FeatureSet before the rest of the kernel so we can
@@ -580,77 +527,6 @@ func (k *Kernel) SaveTo(ctx context.Context, w wire.Writer) error {
 	return nil
 }
 
-// flushMountSourceRefs flushes the MountSources for all mounted filesystems
-// and open FDs.
-//
-// Preconditions: !VFS2Enabled.
-func (k *Kernel) flushMountSourceRefs(ctx context.Context) error {
-	// Flush all mount sources for currently mounted filesystems in each task.
-	flushed := make(map[*fs.MountNamespace]struct{})
-	k.tasks.mu.RLock()
-	k.tasks.forEachThreadGroupLocked(func(tg *ThreadGroup) {
-		if _, ok := flushed[tg.mounts]; ok {
-			// Already flushed.
-			return
-		}
-		tg.mounts.FlushMountSourceRefs()
-		flushed[tg.mounts] = struct{}{}
-	})
-	k.tasks.mu.RUnlock()
-
-	// There may be some open FDs whose filesystems have been unmounted. We
-	// must flush those as well.
-	return k.tasks.forEachFDPaused(ctx, func(file *fs.File, _ *vfs.FileDescription) error {
-		file.Dirent.Inode.MountSource.FlushDirentRefs()
-		return nil
-	})
-}
-
-// forEachFDPaused applies the given function to each open file descriptor in
-// each task.
-//
-// Precondition: Must be called with the kernel paused.
-func (ts *TaskSet) forEachFDPaused(ctx context.Context, f func(*fs.File, *vfs.FileDescription) error) (err error) {
-	ts.mu.RLock()
-	defer ts.mu.RUnlock()
-	for t := range ts.Root.tids {
-		// We can skip locking Task.mu here since the kernel is paused.
-		if t.fdTable == nil {
-			continue
-		}
-		t.fdTable.forEach(ctx, func(_ int32, file *fs.File, fileVFS2 *vfs.FileDescription, _ FDFlags) {
-			if lastErr := f(file, fileVFS2); lastErr != nil && err == nil {
-				err = lastErr
-			}
-		})
-	}
-	return err
-}
-
-// Preconditions: !VFS2Enabled.
-func (k *Kernel) flushWritesToFiles(ctx context.Context) error {
-	return k.tasks.forEachFDPaused(ctx, func(file *fs.File, _ *vfs.FileDescription) error {
-		if flags := file.Flags(); !flags.Write {
-			return nil
-		}
-		if sattr := file.Dirent.Inode.StableAttr; !fs.IsFile(sattr) && !fs.IsDir(sattr) {
-			return nil
-		}
-		// Here we need all metadata synced.
-		syncErr := file.Fsync(ctx, 0, fs.FileMaxOffset, fs.SyncAll)
-		if err := fs.SaveFileFsyncError(syncErr); err != nil {
-			name, _ := file.Dirent.FullName(nil /* root */)
-			// Wrap this error in ErrSaveRejection so that it will trigger a save
-			// error, rather than a panic. This also allows us to distinguish Fsync
-			// errors from state file errors in state.Save.
-			return &fs.ErrSaveRejection{
-				Err: fmt.Errorf("%q was not sufficiently synced: %w", name, err),
-			}
-		}
-		return nil
-	})
-}
-
 // Preconditions: The kernel must be paused.
 func (k *Kernel) invalidateUnsavableMappings(ctx context.Context) error {
 	invalidated := make(map[*mm.MemoryManager]struct{})
@@ -679,6 +555,10 @@ func (k *Kernel) invalidateUnsavableMappings(ctx context.Context) error {
 // LoadFrom returns a new Kernel loaded from args.
 func (k *Kernel) LoadFrom(ctx context.Context, r wire.Reader, timeReady chan struct{}, net inet.Stack, clocks sentrytime.Clocks, vfsOpts *vfs.CompleteRestoreOptions) error {
 	loadStart := time.Now()
+
+	k.runningTasksCond.L = &k.runningTasksMu
+	k.cpuClockTickerWakeCh = make(chan struct{}, 1)
+	k.cpuClockTickerStopCond.L = &k.runningTasksMu
 
 	initAppCores := k.applicationCores
 
@@ -732,17 +612,8 @@ func (k *Kernel) LoadFrom(ctx context.Context, r wire.Reader, timeReady chan str
 		net.Resume()
 	}
 
-	if VFS2Enabled {
-		if err := k.vfs.CompleteRestore(ctx, vfsOpts); err != nil {
-			return err
-		}
-	} else {
-		// Ensure that all pending asynchronous work is complete:
-		//   - namedpipe opening
-		//   - inode file opening
-		if err := fs.AsyncErrorBarrier(); err != nil {
-			return err
-		}
+	if err := k.vfs.CompleteRestore(ctx, vfsOpts); err != nil {
+		return err
 	}
 
 	tcpip.AsyncLoading.Wait()
@@ -782,7 +653,7 @@ type CreateProcessArgs struct {
 	// File is a passed host FD pointing to a file to load as the init binary.
 	//
 	// This is checked if and only if Filename is "".
-	File fsbridge.File
+	File *vfs.FileDescription
 
 	// Argvv is a list of arguments.
 	Argv []string
@@ -829,14 +700,7 @@ type CreateProcessArgs struct {
 	//
 	// Anyone setting MountNamespace must donate a reference (i.e.
 	// increment it).
-	MountNamespace *fs.MountNamespace
-
-	// MountNamespaceVFS2 optionally contains the mount namespace for this
-	// process. If nil, the init process's mount namespace is used.
-	//
-	// Anyone setting MountNamespaceVFS2 must donate a reference (i.e.
-	// increment it).
-	MountNamespaceVFS2 *vfs.MountNamespace
+	MountNamespace *vfs.MountNamespace
 
 	// ContainerID is the container that the process belongs to.
 	ContainerID string
@@ -861,7 +725,7 @@ type createProcessContext struct {
 }
 
 // Value implements context.Context.Value.
-func (ctx *createProcessContext) Value(key interface{}) interface{} {
+func (ctx *createProcessContext) Value(key any) any {
 	switch key {
 	case CtxKernel:
 		return ctx.kernel
@@ -875,28 +739,20 @@ func (ctx *createProcessContext) Value(key interface{}) interface{} {
 		return ipcns
 	case auth.CtxCredentials:
 		return ctx.args.Credentials
-	case fs.CtxRoot:
-		if ctx.args.MountNamespace != nil {
-			// MountNamespace.Root() will take a reference on the root dirent for us.
-			return ctx.args.MountNamespace.Root()
-		}
-		return nil
 	case vfs.CtxRoot:
-		if ctx.args.MountNamespaceVFS2 == nil {
+		if ctx.args.MountNamespace == nil {
 			return nil
 		}
-		root := ctx.args.MountNamespaceVFS2.Root()
+		root := ctx.args.MountNamespace.Root()
 		root.IncRef()
 		return root
 	case vfs.CtxMountNamespace:
 		if ctx.kernel.globalInit == nil {
 			return nil
 		}
-		mntns := ctx.kernel.GlobalInit().Leader().MountNamespaceVFS2()
+		mntns := ctx.kernel.GlobalInit().Leader().MountNamespace()
 		mntns.IncRef()
 		return mntns
-	case fs.CtxDirentCacheLimiter:
-		return ctx.kernel.DirentCacheLimiter
 	case inet.CtxStack:
 		return ctx.kernel.RootNetworkNamespace().Stack()
 	case ktime.CtxRealtimeClock:
@@ -939,86 +795,46 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 	log.Infof("EXEC: %v", args.Argv)
 
 	ctx := args.NewContext(k)
-
-	var (
-		opener    fsbridge.Lookup
-		fsContext *FSContext
-		mntns     *fs.MountNamespace
-		mntnsVFS2 *vfs.MountNamespace
-	)
-
-	if VFS2Enabled {
-		mntnsVFS2 = args.MountNamespaceVFS2
-		if mntnsVFS2 == nil {
-			if k.globalInit == nil {
-				return nil, 0, fmt.Errorf("mount namespace is nil")
-			}
-			// Add a reference to the namespace, which is transferred to the new process.
-			mntnsVFS2 = k.globalInit.Leader().MountNamespaceVFS2()
-			mntnsVFS2.IncRef()
+	mntns := args.MountNamespace
+	if mntns == nil {
+		if k.globalInit == nil {
+			return nil, 0, fmt.Errorf("mount namespace is nil")
 		}
-		// Get the root directory from the MountNamespace.
-		root := mntnsVFS2.Root()
-		root.IncRef()
-		defer root.DecRef(ctx)
-
-		// Grab the working directory.
-		wd := root // Default.
-		if args.WorkingDirectory != "" {
-			pop := vfs.PathOperation{
-				Root:               root,
-				Start:              wd,
-				Path:               fspath.Parse(args.WorkingDirectory),
-				FollowFinalSymlink: true,
-			}
-			// NOTE(b/236028361): Do not set CheckSearchable flag to true.
-			// Application is allowed to start with a working directory that it can
-			// not access/search. This is consistent with Docker and VFS1. Runc
-			// explicitly allows for this in 6ce2d63a5db6 ("libct/init_linux: retry
-			// chdir to fix EPERM"). As described in the commit, runc unintentionally
-			// allowed this behavior in a couple of releases and applications started
-			// relying on it. So they decided to allow it for backward compatibility.
-			var err error
-			wd, err = k.VFS().GetDentryAt(ctx, args.Credentials, &pop, &vfs.GetDentryOptions{})
-			if err != nil {
-				return nil, 0, fmt.Errorf("failed to find initial working directory %q: %v", args.WorkingDirectory, err)
-			}
-			defer wd.DecRef(ctx)
-		}
-		opener = fsbridge.NewVFSLookup(mntnsVFS2, root, wd)
-		fsContext = NewFSContextVFS2(root, wd, args.Umask)
-
-	} else {
-		mntns = args.MountNamespace
-		if mntns == nil {
-			if k.globalInit == nil {
-				return nil, 0, fmt.Errorf("mount namespace is nil")
-			}
-			mntns = k.GlobalInit().Leader().MountNamespace()
-			mntns.IncRef()
-		}
-		// Get the root directory from the MountNamespace.
-		root := mntns.Root()
-		// The call to newFSContext below will take a reference on root, so we
-		// don't need to hold this one.
-		defer root.DecRef(ctx)
-
-		// Grab the working directory.
-		remainingTraversals := args.MaxSymlinkTraversals
-		wd := root // Default.
-		if args.WorkingDirectory != "" {
-			var err error
-			wd, err = mntns.FindInode(ctx, root, nil, args.WorkingDirectory, &remainingTraversals)
-			if err != nil {
-				return nil, 0, fmt.Errorf("failed to find initial working directory %q: %v", args.WorkingDirectory, err)
-			}
-			defer wd.DecRef(ctx)
-		}
-		opener = fsbridge.NewFSLookup(mntns, root, wd)
-		fsContext = newFSContext(root, wd, args.Umask)
+		// Add a reference to the namespace, which is transferred to the new process.
+		mntns = k.globalInit.Leader().MountNamespace()
+		mntns.IncRef()
 	}
+	// Get the root directory from the MountNamespace.
+	root := mntns.Root()
+	root.IncRef()
+	defer root.DecRef(ctx)
 
-	tg := k.NewThreadGroup(mntns, args.PIDNamespace, NewSignalHandlers(), linux.SIGCHLD, args.Limits)
+	// Grab the working directory.
+	wd := root // Default.
+	if args.WorkingDirectory != "" {
+		pop := vfs.PathOperation{
+			Root:               root,
+			Start:              wd,
+			Path:               fspath.Parse(args.WorkingDirectory),
+			FollowFinalSymlink: true,
+		}
+		// NOTE(b/236028361): Do not set CheckSearchable flag to true.
+		// Application is allowed to start with a working directory that it can
+		// not access/search. This is consistent with Docker and VFS1. Runc
+		// explicitly allows for this in 6ce2d63a5db6 ("libct/init_linux: retry
+		// chdir to fix EPERM"). As described in the commit, runc unintentionally
+		// allowed this behavior in a couple of releases and applications started
+		// relying on it. So they decided to allow it for backward compatibility.
+		var err error
+		wd, err = k.VFS().GetDentryAt(ctx, args.Credentials, &pop, &vfs.GetDentryOptions{})
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to find initial working directory %q: %v", args.WorkingDirectory, err)
+		}
+		defer wd.DecRef(ctx)
+	}
+	fsContext := NewFSContext(root, wd, args.Umask)
+
+	tg := k.NewThreadGroup(args.PIDNamespace, NewSignalHandlers(), linux.SIGCHLD, args.Limits)
 	cu := cleanup.Make(func() {
 		tg.Release(ctx)
 	})
@@ -1032,7 +848,7 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 		args.File = nil
 	case args.File != nil:
 		// If File is set, take the File provided directly.
-		args.Filename = args.File.PathnameWithDeleted(ctx)
+		args.Filename = args.File.MappedName(ctx)
 	default:
 		// Otherwise look at Argv and see if the first argument is a valid path.
 		if len(args.Argv) == 0 {
@@ -1047,7 +863,8 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 	// Create a fresh task context.
 	remainingTraversals := args.MaxSymlinkTraversals
 	loadArgs := loader.LoadArgs{
-		Opener:              opener,
+		Root:                root,
+		WorkingDir:          wd,
 		RemainingTraversals: &remainingTraversals,
 		ResolveFinal:        true,
 		Filename:            args.Filename,
@@ -1080,7 +897,7 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 		UTSNamespace:            args.UTSNamespace,
 		IPCNamespace:            args.IPCNamespace,
 		AbstractSocketNamespace: args.AbstractSocketNamespace,
-		MountNamespaceVFS2:      mntnsVFS2,
+		MountNamespace:          mntns,
 		ContainerID:             args.ContainerID,
 		UserCounters:            k.GetUserCounters(args.Credentials.RealKUID),
 	}
@@ -1119,11 +936,11 @@ func (k *Kernel) Start() error {
 	}
 
 	k.started = true
-	k.cpuClockTicker = ktime.NewTimer(k.timekeeper.monotonicClock, newKernelCPUClockTicker(k))
-	k.cpuClockTicker.Swap(ktime.Setting{
-		Enabled: true,
-		Period:  linux.ClockTick,
-	})
+	k.cpuClockTickTimer = time.NewTimer(linux.ClockTick)
+	k.runningTasksMu.Lock()
+	k.cpuClockTickerRunning = true
+	k.runningTasksMu.Unlock()
+	go k.runCPUClockTicker()
 	// If k was created by LoadKernelFrom, timers were stopped during
 	// Kernel.SaveTo and need to be resumed. If k was created by NewKernel,
 	// this is a no-op.
@@ -1150,11 +967,18 @@ func (k *Kernel) Start() error {
 //   - Any task goroutines running in k must be stopped.
 //   - k.extMu must be locked.
 func (k *Kernel) pauseTimeLocked(ctx context.Context) {
-	// k.cpuClockTicker may be nil since Kernel.SaveTo() may be called before
-	// Kernel.Start().
-	if k.cpuClockTicker != nil {
-		k.cpuClockTicker.Pause()
+	// Since all task goroutines have been stopped by precondition, the CPU clock
+	// ticker should stop on its own; wait for it to do so, waking it up from
+	// sleeping betwen ticks if necessary.
+	k.runningTasksMu.Lock()
+	for k.cpuClockTickerRunning {
+		select {
+		case k.cpuClockTickerWakeCh <- struct{}{}:
+		default:
+		}
+		k.cpuClockTickerStopCond.Wait()
 	}
+	k.runningTasksMu.Unlock()
 
 	// By precondition, nothing else can be interacting with PIDNamespace.tids
 	// or FDTable.files, so we can iterate them without synchronization. (We
@@ -1171,15 +995,9 @@ func (k *Kernel) pauseTimeLocked(ctx context.Context) {
 		// This means we'll iterate FDTables shared by multiple tasks repeatedly,
 		// but ktime.Timer.Pause is idempotent so this is harmless.
 		if t.fdTable != nil {
-			t.fdTable.forEach(ctx, func(_ int32, file *fs.File, fd *vfs.FileDescription, _ FDFlags) {
-				if VFS2Enabled {
-					if tfd, ok := fd.Impl().(*timerfd.TimerFileDescription); ok {
-						tfd.PauseTimer()
-					}
-				} else {
-					if tfd, ok := file.FileOperations.(*oldtimerfd.TimerOperations); ok {
-						tfd.PauseTimer()
-					}
+			t.fdTable.forEach(ctx, func(_ int32, fd *vfs.FileDescription, _ FDFlags) {
+				if tfd, ok := fd.Impl().(*timerfd.TimerFileDescription); ok {
+					tfd.PauseTimer()
 				}
 			})
 		}
@@ -1195,9 +1013,8 @@ func (k *Kernel) pauseTimeLocked(ctx context.Context) {
 //   - Any task goroutines running in k must be stopped.
 //   - k.extMu must be locked.
 func (k *Kernel) resumeTimeLocked(ctx context.Context) {
-	if k.cpuClockTicker != nil {
-		k.cpuClockTicker.Resume()
-	}
+	// The CPU clock ticker will automatically resume as task goroutines resume
+	// execution.
 
 	k.timekeeper.ResumeUpdates()
 	for t := range k.tasks.Root.tids {
@@ -1208,15 +1025,9 @@ func (k *Kernel) resumeTimeLocked(ctx context.Context) {
 			}
 		}
 		if t.fdTable != nil {
-			t.fdTable.forEach(ctx, func(_ int32, file *fs.File, fd *vfs.FileDescription, _ FDFlags) {
-				if VFS2Enabled {
-					if tfd, ok := fd.Impl().(*timerfd.TimerFileDescription); ok {
-						tfd.ResumeTimer()
-					}
-				} else {
-					if tfd, ok := file.FileOperations.(*oldtimerfd.TimerOperations); ok {
-						tfd.ResumeTimer()
-					}
+			t.fdTable.forEach(ctx, func(_ int32, fd *vfs.FileDescription, _ FDFlags) {
+				if tfd, ok := fd.Impl().(*timerfd.TimerFileDescription); ok {
+					tfd.ResumeTimer()
 				}
 			})
 		}
@@ -1234,75 +1045,52 @@ func (k *Kernel) incRunningTasks() {
 			return
 		}
 
-		// Transition from 0 -> 1. Synchronize with other transitions and timer.
+		// Transition from 0 -> 1.
 		k.runningTasksMu.Lock()
-		tasks = k.runningTasks.Load()
-		if tasks != 0 {
-			// We're no longer the first task, no need to
-			// re-enable.
+		if k.runningTasks.Load() != 0 {
+			// Raced with another transition and lost.
 			k.runningTasks.Add(1)
 			k.runningTasksMu.Unlock()
 			return
 		}
-
-		if !k.cpuClockTickerDisabled {
-			// Timer was never disabled.
-			k.runningTasks.Store(1)
-			k.runningTasksMu.Unlock()
-			return
+		if !k.cpuClockTickerRunning {
+			select {
+			case tickTime := <-k.cpuClockTickTimer.C:
+				// Rearm the timer since we consumed the wakeup. Estimate how much time
+				// remains on the current tick so that periodic workloads interact with
+				// the (periodic) CPU clock ticker in the same way that they would
+				// without the optimization of putting the ticker to sleep.
+				missedNS := time.Since(tickTime).Nanoseconds()
+				missedTicks := missedNS / linux.ClockTick.Nanoseconds()
+				thisTickNS := missedNS - missedTicks*linux.ClockTick.Nanoseconds()
+				k.cpuClockTickTimer.Reset(time.Duration(linux.ClockTick.Nanoseconds() - thisTickNS))
+				// Increment k.cpuClock on the CPU clock ticker goroutine's behalf.
+				// (Whole missed ticks don't matter, and adding them to k.cpuClock will
+				// just confuse the watchdog.) At the time the tick occurred, all task
+				// goroutines were asleep, so there's nothing else to do. This ensures
+				// that our caller (Task.accountTaskGoroutineLeave()) records an
+				// updated k.cpuClock in Task.gosched.Timestamp, so that it's correctly
+				// accounted as having resumed execution in the sentry during this tick
+				// instead of at the end of the previous one.
+				k.cpuClock.Add(1)
+			default:
+			}
+			// We are transitioning from idle to active. Set k.cpuClockTickerRunning
+			// = true here so that if we transition to idle and then active again
+			// before the CPU clock ticker goroutine has a chance to run, the first
+			// call to k.incRunningTasks() at the end of that cycle does not try to
+			// steal k.cpuClockTickTimer.C again, as this would allow workloads that
+			// rapidly cycle between idle and active to starve the CPU clock ticker
+			// of chances to observe task goroutines in a running state and account
+			// their CPU usage.
+			k.cpuClockTickerRunning = true
+			k.runningTasksCond.Signal()
 		}
-
-		// We need to update cpuClock for all of the ticks missed while we
-		// slept, and then re-enable the timer.
-		//
-		// The Notify in Swap isn't sufficient. kernelCPUClockTicker.Notify
-		// always increments cpuClock by 1 regardless of the number of
-		// expirations as a heuristic to avoid over-accounting in cases of CPU
-		// throttling.
-		//
-		// We want to cover the normal case, when all time should be accounted,
-		// so we increment for all expirations. Throttling is less concerning
-		// here because the ticker is only disabled from Notify. This means
-		// that Notify must schedule and compensate for the throttled period
-		// before the timer is disabled. Throttling while the timer is disabled
-		// doesn't matter, as nothing is running or reading cpuClock anyways.
-		//
-		// S/R also adds complication, as there are two cases. Recall that
-		// monotonicClock will jump forward on restore.
-		//
-		// 1. If the ticker is enabled during save, then on Restore Notify is
-		// called with many expirations, covering the time jump, but cpuClock
-		// is only incremented by 1.
-		//
-		// 2. If the ticker is disabled during save, then after Restore the
-		// first wakeup will call this function and cpuClock will be
-		// incremented by the number of expirations across the S/R.
-		//
-		// These cause very different value of cpuClock. But again, since
-		// nothing was running while the ticker was disabled, those differences
-		// don't matter.
-		setting, exp := k.cpuClockTickerSetting.At(k.timekeeper.monotonicClock.Now())
-		if exp > 0 {
-			k.cpuClock.Add(exp)
-		}
-
-		// Now that cpuClock is updated it is safe to allow other tasks to
-		// transition to running.
+		// This store must happen after the increment of k.cpuClock above to ensure
+		// that concurrent calls to Task.accountTaskGoroutineLeave() also observe
+		// the updated k.cpuClock.
 		k.runningTasks.Store(1)
-
-		// N.B. we must unlock before calling Swap to maintain lock ordering.
-		//
-		// cpuClockTickerDisabled need not wait until after Swap to become
-		// true. It is sufficient that the timer *will* be enabled.
-		k.cpuClockTickerDisabled = false
 		k.runningTasksMu.Unlock()
-
-		// This won't call Notify (unless it's been ClockTick since setting.At
-		// above). This means we skip the thread group work in Notify. However,
-		// since nothing was running while we were disabled, none of the timers
-		// could have expired.
-		k.cpuClockTicker.Swap(setting)
-
 		return
 	}
 }
@@ -1600,95 +1388,54 @@ func (k *Kernel) SupervisorContext() context.Context {
 	}
 }
 
-// SocketRecord represents a socket recorded in Kernel.socketsVFS2.
+// SocketRecord represents a socket recorded in Kernel.sockets.
 //
 // +stateify savable
 type SocketRecord struct {
-	k        *Kernel
-	Sock     *refs.WeakRef        // TODO(gvisor.dev/issue/1624): Only used by VFS1.
-	SockVFS2 *vfs.FileDescription // Only used by VFS2.
-	ID       uint64               // Socket table entry number.
+	k    *Kernel
+	Sock *vfs.FileDescription
+	ID   uint64 // Socket table entry number.
 }
 
-// SocketRecordVFS1 represents a socket recorded in Kernel.sockets. It implements
-// refs.WeakRefUser for sockets stored in the socket table.
-//
-// +stateify savable
-type SocketRecordVFS1 struct {
-	socketEntry
-	SocketRecord
-}
-
-// WeakRefGone implements refs.WeakRefUser.WeakRefGone.
-func (s *SocketRecordVFS1) WeakRefGone(context.Context) {
-	s.k.extMu.Lock()
-	s.k.sockets.Remove(s)
-	s.k.extMu.Unlock()
-}
-
-// RecordSocket adds a socket to the system-wide socket table for tracking.
-//
-// Precondition: Caller must hold a reference to sock.
-func (k *Kernel) RecordSocket(sock *fs.File) {
-	k.extMu.Lock()
-	id := k.nextSocketRecord
-	k.nextSocketRecord++
-	s := &SocketRecordVFS1{
-		SocketRecord: SocketRecord{
-			k:  k,
-			ID: id,
-		},
-	}
-	s.Sock = refs.NewWeakRef(sock, s)
-	k.sockets.PushBack(s)
-	k.extMu.Unlock()
-}
-
-// RecordSocketVFS2 adds a VFS2 socket to the system-wide socket table for
+// RecordSocket adds a socket to the system-wide socket table for
 // tracking.
 //
 // Precondition: Caller must hold a reference to sock.
 //
 // Note that the socket table will not hold a reference on the
 // vfs.FileDescription.
-func (k *Kernel) RecordSocketVFS2(sock *vfs.FileDescription) {
+func (k *Kernel) RecordSocket(sock *vfs.FileDescription) {
 	k.extMu.Lock()
-	if _, ok := k.socketsVFS2[sock]; ok {
+	if _, ok := k.sockets[sock]; ok {
 		panic(fmt.Sprintf("Socket %p added twice", sock))
 	}
 	id := k.nextSocketRecord
 	k.nextSocketRecord++
 	s := &SocketRecord{
-		k:        k,
-		ID:       id,
-		SockVFS2: sock,
+		k:    k,
+		ID:   id,
+		Sock: sock,
 	}
-	k.socketsVFS2[sock] = s
+	k.sockets[sock] = s
 	k.extMu.Unlock()
 }
 
-// DeleteSocketVFS2 removes a VFS2 socket from the system-wide socket table.
-func (k *Kernel) DeleteSocketVFS2(sock *vfs.FileDescription) {
+// DeleteSocket removes a socket from the system-wide socket table.
+func (k *Kernel) DeleteSocket(sock *vfs.FileDescription) {
 	k.extMu.Lock()
-	delete(k.socketsVFS2, sock)
+	delete(k.sockets, sock)
 	k.extMu.Unlock()
 }
 
 // ListSockets returns a snapshot of all sockets.
 //
-// Callers of ListSockets() in VFS2 should use SocketRecord.SockVFS2.TryIncRef()
+// Callers of ListSockets() should use SocketRecord.Sock.TryIncRef()
 // to get a reference on a socket in the table.
 func (k *Kernel) ListSockets() []*SocketRecord {
 	k.extMu.Lock()
 	var socks []*SocketRecord
-	if VFS2Enabled {
-		for _, s := range k.socketsVFS2 {
-			socks = append(socks, s)
-		}
-	} else {
-		for s := k.sockets.Front(); s != nil; s = s.Next() {
-			socks = append(socks, &s.SocketRecord)
-		}
+	for _, s := range k.sockets {
+		socks = append(socks, s)
 	}
 	k.extMu.Unlock()
 	return socks
@@ -1717,7 +1464,7 @@ func (*Kernel) Err() error {
 }
 
 // Value implements context.Context.
-func (ctx *supervisorContext) Value(key interface{}) interface{} {
+func (ctx *supervisorContext) Value(key any) any {
 	switch key {
 	case CtxCanTrace:
 		// The supervisor context can trace anything. (None of
@@ -1737,27 +1484,20 @@ func (ctx *supervisorContext) Value(key interface{}) interface{} {
 	case auth.CtxCredentials:
 		// The supervisor context is global root.
 		return auth.NewRootCredentials(ctx.Kernel.rootUserNamespace)
-	case fs.CtxRoot:
-		if ctx.Kernel.globalInit != nil {
-			return ctx.Kernel.globalInit.mounts.Root()
-		}
-		return nil
 	case vfs.CtxRoot:
 		if ctx.Kernel.globalInit == nil {
 			return vfs.VirtualDentry{}
 		}
-		root := ctx.Kernel.GlobalInit().Leader().MountNamespaceVFS2().Root()
+		root := ctx.Kernel.GlobalInit().Leader().MountNamespace().Root()
 		root.IncRef()
 		return root
 	case vfs.CtxMountNamespace:
 		if ctx.Kernel.globalInit == nil {
 			return nil
 		}
-		mntns := ctx.Kernel.GlobalInit().Leader().MountNamespaceVFS2()
+		mntns := ctx.Kernel.GlobalInit().Leader().MountNamespace()
 		mntns.IncRef()
 		return mntns
-	case fs.CtxDirentCacheLimiter:
-		return ctx.Kernel.DirentCacheLimiter
 	case inet.CtxStack:
 		return ctx.Kernel.RootNetworkNamespace().Stack()
 	case ktime.CtxRealtimeClock:
@@ -1794,12 +1534,13 @@ const (
 
 // EmitUnimplementedEvent emits an UnimplementedSyscall event via the event
 // channel.
-func (k *Kernel) EmitUnimplementedEvent(ctx context.Context) {
+func (k *Kernel) EmitUnimplementedEvent(ctx context.Context, sysno uintptr) {
 	k.unimplementedSyscallEmitterOnce.Do(func() {
 		k.unimplementedSyscallEmitter = eventchannel.RateLimitedEmitterFrom(eventchannel.DefaultEmitter, unimplementedSyscallsMaxRate, unimplementedSyscallBurst)
 	})
 
 	t := TaskFromContext(ctx)
+	IncrementUnimplementedSyscallCounter(sysno)
 	_, _ = k.unimplementedSyscallEmitter.Emit(&uspb.UnimplementedSyscall{
 		Tid:       int32(t.ThreadID()),
 		Registers: t.Arch().StateData().Proto(),
@@ -1850,13 +1591,11 @@ func (k *Kernel) CgroupRegistry() *CgroupRegistry {
 // initialized, e.g. after k.Start() has been called.
 func (k *Kernel) Release() {
 	ctx := k.SupervisorContext()
-	if VFS2Enabled {
-		k.hostMount.DecRef(ctx)
-		k.pipeMount.DecRef(ctx)
-		k.shmMount.DecRef(ctx)
-		k.socketMount.DecRef(ctx)
-		k.vfs.Release(ctx)
-	}
+	k.hostMount.DecRef(ctx)
+	k.pipeMount.DecRef(ctx)
+	k.shmMount.DecRef(ctx)
+	k.socketMount.DecRef(ctx)
+	k.vfs.Release(ctx)
 	k.timekeeper.Destroy()
 	k.vdso.Release(ctx)
 	k.RootNetworkNamespace().DecRef()
@@ -1927,15 +1666,15 @@ func (k *Kernel) ReplaceFSContextRoots(ctx context.Context, oldRoot vfs.VirtualD
 		if fsc := t.fsContext; fsc != nil {
 			fsc.mu.Lock()
 			defer fsc.mu.Unlock()
-			if fsc.rootVFS2 == oldRoot {
+			if fsc.root == oldRoot {
 				newRoot.IncRef()
 				oldRootDecRefs++
-				fsc.rootVFS2 = newRoot
+				fsc.root = newRoot
 			}
-			if fsc.cwdVFS2 == oldRoot {
+			if fsc.cwd == oldRoot {
 				newRoot.IncRef()
 				oldRootDecRefs++
-				fsc.cwdVFS2 = newRoot
+				fsc.cwd = newRoot
 			}
 		}
 	})

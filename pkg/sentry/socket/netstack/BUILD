@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "go_library")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "netstack",
@@ -8,9 +11,7 @@ go_library(
         "device.go",
         "netstack.go",
         "netstack_state.go",
-        "netstack_vfs2.go",
         "provider.go",
-        "provider_vfs2.go",
         "save_restore.go",
         "stack.go",
         "tun.go",
@@ -28,10 +29,9 @@ go_library(
         "//pkg/marshal",
         "//pkg/marshal/primitive",
         "//pkg/metric",
+        "//pkg/refs",
         "//pkg/sentry/arch",
         "//pkg/sentry/device",
-        "//pkg/sentry/fs",
-        "//pkg/sentry/fs/fsutil",
         "//pkg/sentry/fsimpl/sockfs",
         "//pkg/sentry/inet",
         "//pkg/sentry/kernel",
@@ -39,7 +39,6 @@ go_library(
         "//pkg/sentry/kernel/time",
         "//pkg/sentry/socket",
         "//pkg/sentry/socket/netfilter",
-        "//pkg/sentry/unimpl",
         "//pkg/sentry/vfs",
         "//pkg/sync",
         "//pkg/syserr",

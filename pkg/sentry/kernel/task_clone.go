@@ -65,7 +65,12 @@ func (t *Task) Clone(args *linux.CloneArgs) (ThreadID, *SyscallControl, error) {
 
 	// Pull task registers and FPU state, a cloned task will inherit the
 	// state of the current task.
-	t.p.PullFullState(t.MemoryManager().AddressSpace(), t.Arch())
+	if err := t.p.PullFullState(t.MemoryManager().AddressSpace(), t.Arch()); err != nil {
+		t.Warningf("Unable to pull a full state: %v", err)
+		t.forceSignal(linux.SIGILL, true /* unconditional */)
+		t.SendSignal(SignalInfoPriv(linux.SIGILL))
+		return 0, nil, linuxerr.EFAULT
+	}
 
 	// "If CLONE_NEWUSER is specified along with other CLONE_NEW* flags in a
 	// single clone(2) or unshare(2) call, the user namespace is guaranteed to
@@ -103,9 +108,7 @@ func (t *Task) Clone(args *linux.CloneArgs) (ThreadID, *SyscallControl, error) {
 	ipcns := t.IPCNamespace()
 	if args.Flags&linux.CLONE_NEWIPC != 0 {
 		ipcns = NewIPCNamespace(userns)
-		if VFS2Enabled {
-			ipcns.InitPosixQueues(t, t.k.VFS(), creds)
-		}
+		ipcns.InitPosixQueues(t, t.k.VFS(), creds)
 	} else {
 		ipcns.IncRef()
 	}
@@ -125,15 +128,21 @@ func (t *Task) Clone(args *linux.CloneArgs) (ThreadID, *SyscallControl, error) {
 	})
 
 	// TODO(b/63601033): Implement CLONE_NEWNS.
-	mntnsVFS2 := t.mountNamespaceVFS2
-	if mntnsVFS2 != nil {
-		mntnsVFS2.IncRef()
+	mntns := t.mountNamespace
+	if mntns != nil {
+		mntns.IncRef()
 		cu.Add(func() {
-			mntnsVFS2.DecRef(t)
+			mntns.DecRef(t)
 		})
 	}
 
-	image, err := t.image.Fork(t, t.k, args.Flags&linux.CLONE_VM != 0)
+	// We must hold t.mu to access t.image, but we can't hold it during Fork(),
+	// since TaskImage.Fork()=>mm.Fork() takes mm.addressSpaceMu, which is ordered
+	// above Task.mu. So we copy t.image with t.mu held and call Fork() on the copy.
+	t.mu.Lock()
+	curImage := t.image
+	t.mu.Unlock()
+	image, err := curImage.Fork(t, t.k, args.Flags&linux.CLONE_VM != 0)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -178,14 +187,11 @@ func (t *Task) Clone(args *linux.CloneArgs) (ThreadID, *SyscallControl, error) {
 	rseqAddr := hostarch.Addr(0)
 	rseqSignature := uint32(0)
 	if args.Flags&linux.CLONE_THREAD == 0 {
-		if tg.mounts != nil {
-			tg.mounts.IncRef()
-		}
 		sh := t.tg.signalHandlers
 		if args.Flags&linux.CLONE_SIGHAND == 0 {
 			sh = sh.Fork()
 		}
-		tg = t.k.NewThreadGroup(tg.mounts, pidns, sh, linux.Signal(args.ExitSignal), tg.limits.GetCopy())
+		tg = t.k.NewThreadGroup(pidns, sh, linux.Signal(args.ExitSignal), tg.limits.GetCopy())
 		tg.oomScoreAdj = atomicbitops.FromInt32(t.tg.oomScoreAdj.Load())
 		rseqAddr = t.rseqAddr
 		rseqSignature = t.rseqSignature
@@ -210,7 +216,7 @@ func (t *Task) Clone(args *linux.CloneArgs) (ThreadID, *SyscallControl, error) {
 		UTSNamespace:            utsns,
 		IPCNamespace:            ipcns,
 		AbstractSocketNamespace: t.abstractSockets,
-		MountNamespaceVFS2:      mntnsVFS2,
+		MountNamespace:          mntns,
 		RSeqAddr:                rseqAddr,
 		RSeqSignature:           rseqSignature,
 		ContainerID:             t.ContainerID(),
@@ -253,7 +259,7 @@ func (t *Task) Clone(args *linux.CloneArgs) (ThreadID, *SyscallControl, error) {
 
 	if seccheck.Global.Enabled(seccheck.PointClone) {
 		mask, info := getCloneSeccheckInfo(t, nt, args.Flags)
-		if err := seccheck.Global.SendToCheckers(func(c seccheck.Checker) error {
+		if err := seccheck.Global.SentToSinks(func(c seccheck.Sink) error {
 			return c.Clone(t, mask, info)
 		}); err != nil {
 			// nt has been visible to the rest of the system since NewTask, so
@@ -315,7 +321,10 @@ func (t *Task) Clone(args *linux.CloneArgs) (ThreadID, *SyscallControl, error) {
 
 func getCloneSeccheckInfo(t, nt *Task, flags uint64) (seccheck.FieldSet, *pb.CloneInfo) {
 	fields := seccheck.Global.GetFieldSet(seccheck.PointClone)
-
+	var cwd string
+	if fields.Context.Contains(seccheck.FieldCtxtCwd) {
+		cwd = getTaskCurrentWorkingDirectory(t)
+	}
 	t.k.tasks.mu.RLock()
 	defer t.k.tasks.mu.RUnlock()
 	info := &pb.CloneInfo{
@@ -327,7 +336,7 @@ func getCloneSeccheckInfo(t, nt *Task, flags uint64) (seccheck.FieldSet, *pb.Clo
 
 	if !fields.Context.Empty() {
 		info.ContextData = &pb.ContextData{}
-		LoadSeccheckDataLocked(t, fields.Context, info.ContextData)
+		LoadSeccheckDataLocked(t, fields.Context, info.ContextData, cwd)
 	}
 
 	return fields, info
@@ -487,9 +496,7 @@ func (t *Task) Unshare(flags int32) error {
 		// namespace"
 		oldIPCNS = t.ipcns
 		t.ipcns = NewIPCNamespace(creds.UserNamespace)
-		if VFS2Enabled {
-			t.ipcns.InitPosixQueues(t, t.k.VFS(), creds)
-		}
+		t.ipcns.InitPosixQueues(t, t.k.VFS(), creds)
 	}
 	var oldFDTable *FDTable
 	if flags&linux.CLONE_FILES != 0 {

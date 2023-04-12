@@ -494,7 +494,7 @@ TEST_P(SocketInetLoopbackTest, TCPInfoState) {
       .fd = conn_fd.get(),
       .events = POLLIN | POLLRDHUP,
   };
-  constexpr int kTimeout = 10000;
+  constexpr int kTimeout = 2000;
   int n = poll(&pfd, 1, kTimeout);
   ASSERT_GE(n, 0) << strerror(errno);
   ASSERT_EQ(n, 1);
@@ -551,7 +551,7 @@ void TestHangupDuringConnect(const SocketInetTestParam& param,
     struct pollfd pfd = {
         .fd = client.get(),
     };
-    constexpr int kTimeout = 10000;
+    constexpr int kTimeout = 2000;
     int n = poll(&pfd, 1, kTimeout);
     ASSERT_GE(n, 0) << strerror(errno);
     ASSERT_EQ(n, 1);
@@ -574,7 +574,7 @@ TEST_P(SocketInetLoopbackTest, TCPListenShutdownDuringConnect) {
 
 void TestListenHangupConnectingRead(const SocketInetTestParam& param,
                                     void (*hangup)(FileDescriptor&)) {
-  constexpr int kTimeout = 10000;
+  constexpr int kTimeout = 2000;
 
   TestAddress const& listener = param.listener;
   TestAddress const& connector = param.connector;
@@ -736,7 +736,7 @@ TEST_P(SocketInetLoopbackTest, TCPNonBlockingConnectClose) {
         .events = POLLIN | POLLRDHUP,
     };
     // Use a large timeout to accomodate for retransmitted FINs.
-    constexpr int kTimeout = 30000;
+    constexpr int kTimeout = 120000;
     int n = poll(&pfd, 1, kTimeout);
     ASSERT_GE(n, 0) << strerror(errno);
     ASSERT_EQ(n, 1);
@@ -943,7 +943,7 @@ TEST_P(SocketInetLoopbackTest, TCPBacklogAcceptAll) {
   }
 
   auto accept_connection = [&]() {
-    constexpr int kTimeout = 10000;
+    constexpr int kTimeout = 2000;
     pollfd pfd = {
         .fd = listen_fd.get(),
         .events = POLLIN,
@@ -973,7 +973,7 @@ TEST_P(SocketInetLoopbackTest, TCPBacklogAcceptAll) {
   // re-send that ACK, to address that case).
   for (std::size_t i = 0; i < std::size(waiting_clients); i++) {
     SCOPED_TRACE(absl::StrCat("waiting clients i=", i));
-    constexpr int kTimeout = 10000;
+    constexpr int kTimeout = 2000;
     pollfd pfd = {
         .fd = waiting_clients[i].get(),
         .events = POLLOUT,
@@ -1170,7 +1170,7 @@ TEST_P(SocketInetLoopbackTest, TCPAcceptAfterReset) {
   ASSERT_EQ(addrlen, listener.addr_len);
 
   // Wait for accept_fd to process the RST.
-  constexpr int kTimeout = 10000;
+  constexpr int kTimeout = 2000;
   pollfd pfd = {
       .fd = accept_fd.get(),
       .events = POLLIN,
@@ -1411,7 +1411,7 @@ TEST_P(SocketInetReusePortTest, TcpPortReuseMultiThread) {
     ASSERT_NO_ERRNO(SetAddrPort(connector.family(), &conn_addr, port));
   }
 
-  std::atomic<int> connects_received = ATOMIC_VAR_INIT(0);
+  std::atomic<int> connects_received(0);
   std::unique_ptr<ScopedThread> listen_thread[kThreadCount];
   int accept_counts[kThreadCount] = {};
   // TODO(avagin): figure how to not disable S/R for the whole test.
@@ -1420,7 +1420,7 @@ TEST_P(SocketInetReusePortTest, TcpPortReuseMultiThread) {
   DisableSave ds;
 
   for (int i = 0; i < kThreadCount; i++) {
-    listen_thread[i] = absl::make_unique<ScopedThread>(
+    listen_thread[i] = std::make_unique<ScopedThread>(
         [&listener_fds, &accept_counts, i, &connects_received]() {
           do {
             auto fd = Accept(listener_fds[i].get(), nullptr, nullptr);
@@ -1520,14 +1520,14 @@ TEST_P(SocketInetReusePortTest, UdpPortReuseMultiThread) {
   }
 
   constexpr int kConnectAttempts = 10000;
-  std::atomic<int> packets_received = ATOMIC_VAR_INIT(0);
+  std::atomic<int> packets_received(0);
   std::unique_ptr<ScopedThread> receiver_thread[kThreadCount];
   int packets_per_socket[kThreadCount] = {};
   // TODO(avagin): figure how to not disable S/R for the whole test.
   DisableSave ds;  // Too expensive.
 
   for (int i = 0; i < kThreadCount; i++) {
-    receiver_thread[i] = absl::make_unique<ScopedThread>(
+    receiver_thread[i] = std::make_unique<ScopedThread>(
         [&listener_fds, &packets_per_socket, i, &packets_received]() {
           do {
             struct sockaddr_storage addr = {};

@@ -66,9 +66,8 @@ package kernel
 
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
-	"gvisor.dev/gvisor/pkg/sentry/fs"
-	"gvisor.dev/gvisor/pkg/sentry/fsbridge"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	pb "gvisor.dev/gvisor/pkg/sentry/seccheck/points/points_go_proto"
@@ -93,14 +92,17 @@ func (*execStop) Killable() bool { return true }
 //
 // Preconditions: The caller must be running Task.doSyscallInvoke on the task
 // goroutine.
-func (t *Task) Execve(newImage *TaskImage, argv, env []string, executable fsbridge.File, pathname string) (*SyscallControl, error) {
+func (t *Task) Execve(newImage *TaskImage, argv, env []string, executable *vfs.FileDescription, pathname string) (*SyscallControl, error) {
+	cu := cleanup.Make(func() {
+		newImage.release()
+	})
+	defer cu.Clean()
 	// We can't clearly hold kernel package locks while stat'ing executable.
 	if seccheck.Global.Enabled(seccheck.PointExecve) {
 		mask, info := getExecveSeccheckInfo(t, argv, env, executable, pathname)
-		if err := seccheck.Global.SendToCheckers(func(c seccheck.Checker) error {
+		if err := seccheck.Global.SentToSinks(func(c seccheck.Sink) error {
 			return c.Execve(t, mask, info)
 		}); err != nil {
-			newImage.release()
 			return nil, err
 		}
 	}
@@ -113,7 +115,6 @@ func (t *Task) Execve(newImage *TaskImage, argv, env []string, executable fsbrid
 	if t.tg.exiting || t.tg.execing != nil {
 		// We lost to a racing group-exit, kill, or exec from another thread
 		// and should just exit.
-		newImage.release()
 		return nil, linuxerr.EINTR
 	}
 
@@ -135,6 +136,7 @@ func (t *Task) Execve(newImage *TaskImage, argv, env []string, executable fsbrid
 		t.beginInternalStopLocked((*execStop)(nil))
 	}
 
+	cu.Release()
 	return &SyscallControl{next: &runSyscallAfterExecStop{newImage}, ignoreReturn: true}, nil
 }
 
@@ -220,7 +222,7 @@ func (r *runSyscallAfterExecStop) execute(t *Task) taskRunState {
 	oldFDTable.DecRef(t)
 
 	// Remove FDs with the CloseOnExec flag set.
-	t.fdTable.RemoveIf(t, func(_ *fs.File, _ *vfs.FileDescription, flags FDFlags) bool {
+	t.fdTable.RemoveIf(t, func(_ *vfs.FileDescription, flags FDFlags) bool {
 		return flags.CloseOnExec
 	})
 
@@ -304,7 +306,7 @@ func (t *Task) promoteLocked() {
 	oldLeader.exitNotifyLocked(false)
 }
 
-func getExecveSeccheckInfo(t *Task, argv, env []string, executable fsbridge.File, pathname string) (seccheck.FieldSet, *pb.ExecveInfo) {
+func getExecveSeccheckInfo(t *Task, argv, env []string, executable *vfs.FileDescription, pathname string) (seccheck.FieldSet, *pb.ExecveInfo) {
 	fields := seccheck.Global.GetFieldSet(seccheck.PointExecve)
 	info := &pb.ExecveInfo{
 		Argv: argv,
@@ -312,25 +314,21 @@ func getExecveSeccheckInfo(t *Task, argv, env []string, executable fsbridge.File
 	}
 	if executable != nil {
 		info.BinaryPath = pathname
-		if vfs2bridgeFile, ok := executable.(*fsbridge.VFSFile); ok {
-			if fields.Local.Contains(seccheck.FieldSentryExecveBinaryInfo) {
-				statOpts := vfs.StatOptions{
-					Mask: linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_UID | linux.STATX_GID,
+		if fields.Local.Contains(seccheck.FieldSentryExecveBinaryInfo) {
+			statOpts := vfs.StatOptions{
+				Mask: linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_UID | linux.STATX_GID,
+			}
+			if stat, err := executable.Stat(t, statOpts); err == nil {
+				if stat.Mask&(linux.STATX_TYPE|linux.STATX_MODE) == (linux.STATX_TYPE | linux.STATX_MODE) {
+					info.BinaryMode = uint32(stat.Mode)
 				}
-				if stat, err := vfs2bridgeFile.FileDescription().Stat(t, statOpts); err == nil {
-					if stat.Mask&(linux.STATX_TYPE|linux.STATX_MODE) == (linux.STATX_TYPE | linux.STATX_MODE) {
-						info.BinaryMode = uint32(stat.Mode)
-					}
-					if stat.Mask&linux.STATX_UID != 0 {
-						info.BinaryUid = stat.UID
-					}
-					if stat.Mask&linux.STATX_GID != 0 {
-						info.BinaryGid = stat.GID
-					}
+				if stat.Mask&linux.STATX_UID != 0 {
+					info.BinaryUid = stat.UID
+				}
+				if stat.Mask&linux.STATX_GID != 0 {
+					info.BinaryGid = stat.GID
 				}
 			}
-			// TODO(b/202293325): Decide if we actually want to offer binary
-			// SHA256, which is very expensive.
 		}
 	}
 

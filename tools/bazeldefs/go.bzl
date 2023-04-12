@@ -1,13 +1,11 @@
 """Go rules."""
 
 load("@bazel_gazelle//:def.bzl", _gazelle = "gazelle")
-load("@io_bazel_rules_go//go:def.bzl", "GoLibrary", _go_binary = "go_binary", _go_context = "go_context", _go_embed_data = "go_embed_data", _go_library = "go_library", _go_path = "go_path", _go_test = "go_test")
+load("@io_bazel_rules_go//go:def.bzl", "GoLibrary", _go_binary = "go_binary", _go_context = "go_context", _go_library = "go_library", _go_path = "go_path", _go_test = "go_test")
 load("@io_bazel_rules_go//proto:def.bzl", _go_grpc_library = "go_grpc_library", _go_proto_library = "go_proto_library")
 load("//tools/bazeldefs:defs.bzl", "select_arch", "select_system")
 
 gazelle = _gazelle
-
-go_embed_data = _go_embed_data
 
 go_path = _go_path
 
@@ -43,7 +41,7 @@ def go_proto_library(name, **kwargs):
 def go_grpc_and_proto_libraries(name, **kwargs):
     _go_proto_or_grpc_library(_go_grpc_library, name, **kwargs)
 
-def go_binary(name, static = False, pure = False, x_defs = None, system_malloc = False, **kwargs):
+def go_binary(name, static = False, pure = False, x_defs = None, **kwargs):
     """Build a go binary.
 
     Args:
@@ -79,17 +77,20 @@ def go_library(name, arch_deps = [], **kwargs):
         **kwargs
     )
 
-def go_test(name, pure = False, library = None, **kwargs):
+def go_test(name, static = False, pure = False, library = None, **kwargs):
     """Build a go test.
 
     Args:
         name: name of the output binary.
+        static: build a static binary.
         pure: should it be built without cgo.
         library: the library to embed.
         **kwargs: rest of the arguments to pass to _go_test.
     """
     if pure:
         kwargs["pure"] = "on"
+    if static:
+        kwargs["static"] = "on"
     if library:
         kwargs["embed"] = [library]
     _go_test(
@@ -140,8 +141,10 @@ def go_context(ctx, goos = None, goarch = None, std = False):
         goos = go_ctx.sdk.goos
     if goarch == None:
         goarch = go_ctx.sdk.goarch
+    env = go_ctx.env
+    env["CGO_ENABLED"] = "0"
     return struct(
-        env = go_ctx.env,
+        env = env,
         go = go_ctx.go,
         goarch = goarch,
         goos = goos,

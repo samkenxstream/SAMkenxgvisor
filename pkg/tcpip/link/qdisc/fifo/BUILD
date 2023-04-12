@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "go_library", "go_test")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "fifo",
@@ -24,9 +27,8 @@ go_test(
     srcs = ["qdisc_test.go"],
     deps = [
         ":fifo",
-        "//pkg/buffer",
+        "//pkg/bufferv2",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/sync",
         "//pkg/tcpip",
         "//pkg/tcpip/stack",

@@ -23,8 +23,8 @@ import (
 	"testing"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/bufferv2"
 	"gvisor.dev/gvisor/pkg/refs"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/checker"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -717,7 +717,7 @@ func verifySpuriousRecoveryMetric(t *testing.T, c *context.Context, numSpuriousR
 	}
 }
 
-func checkReceivedPacket(t *testing.T, c *context.Context, tcpHdr header.TCP, bytesRead uint32, b, data []byte) {
+func checkReceivedPacket(t *testing.T, c *context.Context, tcpHdr header.TCP, bytesRead uint32, b *bufferv2.View, data []byte) {
 	payloadLen := uint32(len(tcpHdr.Payload()))
 	checker.IPv4(t, b,
 		checker.TCP(
@@ -773,7 +773,8 @@ func TestDetectSpuriousRecoveryWithRTO(t *testing.T) {
 	var bytesRead uint32
 	for i := 0; i < numPackets; i++ {
 		b := c.GetPacket()
-		tcpHdr := header.TCP(header.IPv4(b).Payload())
+		defer b.Release()
+		tcpHdr := header.TCP(header.IPv4(b.AsSlice()).Payload())
 		checkReceivedPacket(t, c, tcpHdr, bytesRead, b, data)
 
 		// Get options only for the first packet. This will be sent with
@@ -859,7 +860,8 @@ func TestSACKDetectSpuriousRecoveryWithDupACK(t *testing.T) {
 	var bytesRead uint32
 	for i := 0; i < numPackets; i++ {
 		b := c.GetPacket()
-		tcpHdr := header.TCP(header.IPv4(b).Payload())
+		defer b.Release()
+		tcpHdr := header.TCP(header.IPv4(b.AsSlice()).Payload())
 		checkReceivedPacket(t, c, tcpHdr, bytesRead, b, data)
 
 		// Get options only for the first packet. This will be sent with
@@ -952,6 +954,6 @@ func TestMain(m *testing.M) {
 	// Allow TCP async work to complete to avoid false reports of leaks.
 	// TODO(gvisor.dev/issue/5940): Use fake clock in tests.
 	time.Sleep(1 * time.Second)
-	refsvfs2.DoLeakCheck()
+	refs.DoLeakCheck()
 	os.Exit(code)
 }

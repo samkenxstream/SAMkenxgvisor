@@ -30,6 +30,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -195,10 +196,19 @@ type MemoryFileOpts struct {
 	// no effect unless DelayedEviction is DelayedEvictionEnabled.
 	UseHostMemcgPressure bool
 
+	// DecommitOnDestroy indicates whether the entire host file should be
+	// decommitted on destruction. This is appropriate for host filesystem based
+	// files that need to be explicitly cleaned up to release disk space.
+	DecommitOnDestroy bool
+
 	// If ManualZeroing is true, MemoryFile must not assume that new pages
 	// obtained from the host are zero-filled, such that MemoryFile must manually
 	// zero newly-allocated pages.
 	ManualZeroing bool
+
+	// If DisableIMAWorkAround is true, NewMemoryFile will not call
+	// IMAWorkAroundForMemFile().
+	DisableIMAWorkAround bool
 }
 
 // DelayedEvictionType is the type of MemoryFileOpts.DelayedEviction.
@@ -351,24 +361,31 @@ func NewMemoryFile(file *os.File, opts MemoryFileOpts) (*MemoryFile, error) {
 
 	go f.runReclaim() // S/R-SAFE: f.mu
 
-	// The Linux kernel contains an optional feature called "Integrity
-	// Measurement Architecture" (IMA). If IMA is enabled, it will checksum
-	// binaries the first time they are mapped PROT_EXEC. This is bad news for
-	// executable pages mapped from our backing file, which can grow to
-	// terabytes in (sparse) size. If IMA attempts to checksum a file that
-	// large, it will allocate all of the sparse pages and quickly exhaust all
-	// memory.
-	//
-	// Work around IMA by immediately creating a temporary PROT_EXEC mapping,
-	// while the backing file is still small. IMA will ignore any future
-	// mappings.
+	if !opts.DisableIMAWorkAround {
+		IMAWorkAroundForMemFile(file.Fd())
+	}
+	return f, nil
+}
+
+// IMAWorkAroundForMemFile works around IMA by immediately creating a temporary
+// PROT_EXEC mapping, while the backing file is still small. IMA will ignore
+// any future mappings.
+//
+// The Linux kernel contains an optional feature called "Integrity
+// Measurement Architecture" (IMA). If IMA is enabled, it will checksum
+// binaries the first time they are mapped PROT_EXEC. This is bad news for
+// executable pages mapped from our backing file, which can grow to
+// terabytes in (sparse) size. If IMA attempts to checksum a file that
+// large, it will allocate all of the sparse pages and quickly exhaust all
+// memory.
+func IMAWorkAroundForMemFile(fd uintptr) {
 	m, _, errno := unix.Syscall6(
 		unix.SYS_MMAP,
 		0,
 		hostarch.PageSize,
 		unix.PROT_EXEC,
 		unix.MAP_SHARED,
-		file.Fd(),
+		fd,
 		0)
 	if errno != 0 {
 		// This isn't fatal (IMA may not even be in use). Log the error, but
@@ -383,8 +400,6 @@ func NewMemoryFile(file *os.File, opts MemoryFileOpts) (*MemoryFile, error) {
 			panic(fmt.Sprintf("failed to unmap PROT_EXEC MemoryFile mapping: %v", errno))
 		}
 	}
-
-	return f, nil
 }
 
 // Destroy releases all resources used by f.
@@ -571,10 +586,16 @@ func findAvailableRangeBottomUp(usage *usageSet, length, alignment uint64) (memm
 // nearest page. If this is shorter than length bytes due to an error returned
 // by r.ReadToBlocks(), it returns that error.
 //
+// If populate is true, AllocateAndFill will attempt to pre-fault pages in bulk
+// in the safemem.BlockSeq passed to r. Callers that will fill the allocated
+// memory by writing to it in the sentry should pass populate = true to avoid
+// faulting page-by-page. Callers that will fill the allocated memory by
+// invoking host system calls should pass populate = false.
+//
 // Preconditions:
 //   - length > 0.
 //   - length must be page-aligned.
-func (f *MemoryFile) AllocateAndFill(length uint64, kind usage.MemoryKind, r safemem.Reader) (memmap.FileRange, error) {
+func (f *MemoryFile) AllocateAndFill(length uint64, kind usage.MemoryKind, populate bool, r safemem.Reader) (memmap.FileRange, error) {
 	fr, err := f.Allocate(length, AllocOpts{Kind: kind})
 	if err != nil {
 		return memmap.FileRange{}, err
@@ -583,6 +604,18 @@ func (f *MemoryFile) AllocateAndFill(length uint64, kind usage.MemoryKind, r saf
 	if err != nil {
 		f.DecRef(fr)
 		return memmap.FileRange{}, err
+	}
+	if populate && canPopulate() {
+		rem := dsts
+		for {
+			if !tryPopulate(rem.Head()) {
+				break
+			}
+			rem = rem.Tail()
+			if rem.IsEmpty() {
+				break
+			}
+		}
 	}
 	n, err := safemem.ReadFullToBlocks(r, dsts)
 	un := uint64(hostarch.Addr(n).RoundDown())
@@ -593,6 +626,43 @@ func (f *MemoryFile) AllocateAndFill(length uint64, kind usage.MemoryKind, r saf
 		fr.End = fr.Start + un
 	}
 	return fr, err
+}
+
+var mlockDisabled atomicbitops.Uint32
+
+func canPopulate() bool {
+	return mlockDisabled.Load() == 0
+}
+
+func tryPopulate(b safemem.Block) bool {
+	// Call mlock to populate pages, then munlock to cancel the mlock (but keep
+	// the pages populated). Only do so for hugepage-aligned address ranges to
+	// ensure that splitting the VMA in mlock doesn't split any existing
+	// hugepages. This assumes that two host syscalls, plus the MM overhead of
+	// mlock + munlock, is faster on average than trapping for
+	// HugePageSize/PageSize small page faults.
+	start, ok := hostarch.Addr(b.Addr()).HugeRoundUp()
+	if !ok {
+		return true
+	}
+	end := hostarch.Addr(b.Addr() + uintptr(b.Len())).HugeRoundDown()
+	if start >= end {
+		return true
+	}
+	_, _, errno := unix.Syscall(unix.SYS_MLOCK, uintptr(start), uintptr(end-start), 0)
+	unix.RawSyscall(unix.SYS_MUNLOCK, uintptr(start), uintptr(end-start), 0)
+	if errno != 0 {
+		if errno == unix.ENOMEM || errno == unix.EPERM {
+			// These errors are expected from hitting non-zero RLIMIT_MEMLOCK, or
+			// hitting zero RLIMIT_MEMLOCK without CAP_IPC_LOCK, respectively.
+			log.Infof("Disabling pgalloc.MemoryFile.AllocateAndFill pre-population: mlock failed: %s", errno)
+		} else {
+			log.Warningf("Disabling pgalloc.MemoryFile.AllocateAndFill pre-population: mlock failed: %s", errno)
+		}
+		mlockDisabled.Store(1)
+		return false
+	}
+	return true
 }
 
 // fallocate(2) modes, defined in Linux's include/uapi/linux/falloc.h.
@@ -1150,6 +1220,12 @@ func (f *MemoryFile) runReclaim() {
 	if !f.destroyed {
 		f.mu.Unlock()
 		panic("findReclaimable broke out of reclaim loop, but destroyed is no longer set")
+	}
+	if f.opts.DecommitOnDestroy && f.fileSize > 0 {
+		if err := f.decommitFile(memmap.FileRange{Start: 0, End: uint64(f.fileSize)}); err != nil {
+			f.mu.Unlock()
+			panic(fmt.Sprintf("failed to decommit entire memory file during destruction: %v", err))
+		}
 	}
 	f.file.Close()
 	// Ensure that any attempts to use f.file.Fd() fail instead of getting a fd

@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "go_library")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "ptrace",
@@ -27,8 +30,8 @@ go_library(
         "//pkg/context",
         "//pkg/cpuid",
         "//pkg/hostarch",
+        "//pkg/hosttid",
         "//pkg/log",
-        "//pkg/procid",
         "//pkg/safecopy",
         "//pkg/seccomp",
         "//pkg/sentry/arch",

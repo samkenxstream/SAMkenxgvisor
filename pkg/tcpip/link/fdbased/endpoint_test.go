@@ -29,9 +29,8 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"golang.org/x/sys/unix"
-	"gvisor.dev/gvisor/pkg/buffer"
+	"gvisor.dev/gvisor/pkg/bufferv2"
 	"gvisor.dev/gvisor/pkg/refs"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -48,7 +47,7 @@ const (
 
 type packetInfo struct {
 	Proto    tcpip.NetworkProtocolNumber
-	Contents *stack.PacketBuffer
+	Contents stack.PacketBufferPtr
 }
 
 type packetContents struct {
@@ -62,15 +61,15 @@ func checkPacketInfoEqual(t *testing.T, got, want packetInfo) {
 	t.Helper()
 	if diff := cmp.Diff(
 		want, got,
-		cmp.Transformer("ExtractPacketBuffer", func(pk *stack.PacketBuffer) *packetContents {
-			if pk == nil {
+		cmp.Transformer("ExtractPacketBuffer", func(pk stack.PacketBufferPtr) *packetContents {
+			if pk.IsNil() {
 				return nil
 			}
 			return &packetContents{
-				LinkHeader:      pk.LinkHeader().View(),
-				NetworkHeader:   pk.NetworkHeader().View(),
-				TransportHeader: pk.TransportHeader().View(),
-				Data:            pk.Data().AsRange().ToOwnedView(),
+				LinkHeader:      pk.LinkHeader().Slice(),
+				NetworkHeader:   pk.NetworkHeader().Slice(),
+				TransportHeader: pk.TransportHeader().Slice(),
+				Data:            pk.Data().AsRange().ToSlice(),
 			}
 		}),
 	); diff != "" {
@@ -133,11 +132,12 @@ func (c *context) cleanup() {
 	}
 }
 
-func (c *context) DeliverNetworkPacket(protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
+func (c *context) DeliverNetworkPacket(protocol tcpip.NetworkProtocolNumber, pkt stack.PacketBufferPtr) {
+	pkt.IncRef()
 	c.ch <- packetInfo{protocol, pkt}
 }
 
-func (c *context) DeliverLinkPacket(tcpip.NetworkProtocolNumber, *stack.PacketBuffer, bool) {
+func (c *context) DeliverLinkPacket(tcpip.NetworkProtocolNumber, stack.PacketBufferPtr) {
 	c.t.Fatal("DeliverLinkPacket not implemented")
 }
 
@@ -195,15 +195,15 @@ func testWritePacket(t *testing.T, plen int, eth bool, gsoMaxSize uint32, hash u
 	const netHdrLen = 100
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 		ReserveHeaderBytes: int(c.ep.MaxHeaderLength()) + netHdrLen,
-		Payload:            buffer.NewWithData(payload),
+		Payload:            bufferv2.MakeWithData(payload),
 	})
+	defer pkt.DecRef()
 	pkt.Hash = hash
 	// Every PacketBuffer must have these set:
 	// See nic.writePacket.
 	pkt.EgressRoute.LocalLinkAddress = laddr
 	pkt.EgressRoute.RemoteLinkAddress = raddr
 	pkt.NetworkProtocolNumber = proto
-	defer pkt.DecRef()
 
 	// Build header.
 	b := pkt.NetworkHeader().Push(netHdrLen)
@@ -386,7 +386,7 @@ func TestDeliverPacket(t *testing.T) {
 
 				wantPkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 					ReserveHeaderBytes: header.EthernetMinimumSize,
-					Payload:            buffer.NewWithData(all),
+					Payload:            bufferv2.MakeWithData(all),
 				})
 				defer wantPkt.DecRef()
 				if eth {
@@ -407,6 +407,7 @@ func TestDeliverPacket(t *testing.T) {
 				// Receive packet through the endpoint.
 				select {
 				case pi := <-c.ch:
+					defer pi.Contents.DecRef()
 					want := packetInfo{
 						Proto:    proto,
 						Contents: wantPkt,
@@ -454,31 +455,31 @@ var capLengthTestCases = []struct {
 }{
 	{
 		comment:     "Single slice",
-		config:      []int{2},
-		n:           1,
+		config:      []int{256},
+		n:           128,
 		wantUsed:    1,
-		wantLengths: []int{1},
+		wantLengths: []int{128},
 	},
 	{
 		comment:     "Multiple slices",
-		config:      []int{1, 2},
-		n:           2,
+		config:      []int{128, 256},
+		n:           256,
 		wantUsed:    2,
-		wantLengths: []int{1, 1},
+		wantLengths: []int{128, 128},
 	},
 	{
 		comment:     "Entire buffer",
-		config:      []int{1, 2},
-		n:           3,
+		config:      []int{128, 256},
+		n:           384,
 		wantUsed:    2,
-		wantLengths: []int{1, 2},
+		wantLengths: []int{128, 256},
 	},
 	{
 		comment:     "Entire buffer but not on the last slice",
-		config:      []int{1, 2, 3},
-		n:           3,
+		config:      []int{128, 256, 512},
+		n:           384,
 		wantUsed:    2,
-		wantLengths: []int{1, 2},
+		wantLengths: []int{128, 256},
 	},
 }
 
@@ -486,6 +487,7 @@ func TestIovecBuffer(t *testing.T) {
 	for _, c := range capLengthTestCases {
 		t.Run(c.comment, func(t *testing.T) {
 			b := newIovecBuffer(c.config, false /* skipsVnetHdr */)
+			defer b.release()
 
 			// Test initial allocation.
 			iovecs := b.nextIovecs()
@@ -499,9 +501,10 @@ func TestIovecBuffer(t *testing.T) {
 
 			// Test the buffer that get pulled.
 			buf := b.pullBuffer(c.n)
+			defer buf.Release()
 			var lengths []int
-			buf.Apply(func(v []byte) {
-				lengths = append(lengths, len(v))
+			buf.Apply(func(v *bufferv2.View) {
+				lengths = append(lengths, v.Size())
 			})
 			if !reflect.DeepEqual(lengths, c.wantLengths) {
 				t.Errorf("Pulled view lengths = %v, want %v", lengths, c.wantLengths)
@@ -541,15 +544,17 @@ func TestIovecBufferSkipVnetHdr(t *testing.T) {
 		},
 		{
 			desc:    "header skipped",
-			readN:   virtioNetHdrSize + 100,
-			wantLen: 100,
+			readN:   virtioNetHdrSize + 512,
+			wantLen: 512,
 		},
 	} {
 		t.Run(test.desc, func(t *testing.T) {
-			b := newIovecBuffer([]int{10, 20, 50, 50}, true)
+			b := newIovecBuffer([]int{128, 256, 512, 1024}, true)
+			defer b.release()
 			// Pretend a read happend.
 			b.nextIovecs()
 			buf := b.pullBuffer(test.readN)
+			defer buf.Release()
 			if got, want := int(buf.Size()), test.wantLen; got != want {
 				t.Errorf("b.pullView(%d).Size() = %d; want %d", test.readN, got, want)
 			}
@@ -562,14 +567,15 @@ func TestIovecBufferSkipVnetHdr(t *testing.T) {
 
 // fakeNetworkDispatcher delivers packets to pkts.
 type fakeNetworkDispatcher struct {
-	pkts []*stack.PacketBuffer
+	pkts []stack.PacketBufferPtr
 }
 
-func (d *fakeNetworkDispatcher) DeliverNetworkPacket(_ tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
+func (d *fakeNetworkDispatcher) DeliverNetworkPacket(_ tcpip.NetworkProtocolNumber, pkt stack.PacketBufferPtr) {
+	pkt.IncRef()
 	d.pkts = append(d.pkts, pkt)
 }
 
-func (*fakeNetworkDispatcher) DeliverLinkPacket(tcpip.NetworkProtocolNumber, *stack.PacketBuffer, bool) {
+func (*fakeNetworkDispatcher) DeliverLinkPacket(tcpip.NetworkProtocolNumber, stack.PacketBufferPtr) {
 	panic("not implemented")
 }
 
@@ -593,8 +599,6 @@ func TestDispatchPacketFormat(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer unix.Close(fds[0])
-			defer unix.Close(fds[1])
 
 			data := []byte{
 				// Ethernet header.
@@ -618,6 +622,7 @@ func TestDispatchPacketFormat(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			defer d.release()
 			if ok, err := d.dispatch(); !ok || err != nil {
 				t.Fatalf("d.dispatch() = %v, %v", ok, err)
 			}
@@ -627,7 +632,8 @@ func TestDispatchPacketFormat(t *testing.T) {
 				t.Fatalf("len(sink.pkts) = %d, want %d", got, want)
 			}
 			pkt := sink.pkts[0]
-			if got, want := len(pkt.LinkHeader().View()), header.EthernetMinimumSize; got != want {
+			defer pkt.DecRef()
+			if got, want := len(pkt.LinkHeader().Slice()), header.EthernetMinimumSize; got != want {
 				t.Errorf("pkt.LinkHeader().View().Size() = %d, want %d", got, want)
 			}
 			if got, want := pkt.Data().Size(), 4; got != want {
@@ -640,6 +646,6 @@ func TestDispatchPacketFormat(t *testing.T) {
 func TestMain(m *testing.M) {
 	refs.SetLeakMode(refs.LeaksPanic)
 	code := m.Run()
-	refsvfs2.DoLeakCheck()
+	refs.DoLeakCheck()
 	os.Exit(code)
 }

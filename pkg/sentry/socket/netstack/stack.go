@@ -16,10 +16,12 @@ package netstack
 
 import (
 	"fmt"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -40,6 +42,11 @@ type Stack struct {
 // Destroy implements inet.Stack.Destroy.
 func (s *Stack) Destroy() {
 	s.Stack.Close()
+	refs.CleanupSync.Add(1)
+	go func() {
+		s.Stack.Wait()
+		refs.CleanupSync.Done()
+	}()
 }
 
 // SupportsIPv6 implements Stack.SupportsIPv6.
@@ -79,6 +86,17 @@ func (s *Stack) Interfaces() map[int32]inet.Interface {
 // RemoveInterface implements inet.Stack.RemoveInterface.
 func (s *Stack) RemoveInterface(idx int32) error {
 	nic := tcpip.NICID(idx)
+
+	nicInfo, ok := s.Stack.NICInfo()[nic]
+	if !ok {
+		return syserr.ErrUnknownNICID.ToError()
+	}
+
+	// Don't allow removing the loopback interface.
+	if nicInfo.Flags.Loopback {
+		return syserr.ErrNotSupported.ToError()
+	}
+
 	return syserr.TranslateNetstackError(s.Stack.RemoveNIC(nic)).ToError()
 }
 
@@ -280,7 +298,7 @@ func (s *Stack) SetTCPRecovery(recovery inet.TCPLossRecovery) error {
 }
 
 // Statistics implements inet.Stack.Statistics.
-func (s *Stack) Statistics(stat interface{}, arg string) error {
+func (s *Stack) Statistics(stat any, arg string) error {
 	switch stats := stat.(type) {
 	case *inet.StatDev:
 		for _, ni := range s.Stack.NICInfo() {
@@ -490,4 +508,15 @@ func (s *Stack) PortRange() (uint16, uint16) {
 // SetPortRange implements inet.Stack.SetPortRange.
 func (s *Stack) SetPortRange(start uint16, end uint16) error {
 	return syserr.TranslateNetstackError(s.Stack.SetPortRange(start, end)).ToError()
+}
+
+// GROTimeout implements inet.Stack.GROTimeout.
+func (s *Stack) GROTimeout(NICID int32) (time.Duration, error) {
+	timeout, err := s.Stack.GROTimeout(NICID)
+	return timeout, syserr.TranslateNetstackError(err).ToError()
+}
+
+// SetGROTimeout implements inet.Stack.SetGROTimeout.
+func (s *Stack) SetGROTimeout(NICID int32, timeout time.Duration) error {
+	return syserr.TranslateNetstackError(s.Stack.SetGROTimeout(NICID, timeout)).ToError()
 }

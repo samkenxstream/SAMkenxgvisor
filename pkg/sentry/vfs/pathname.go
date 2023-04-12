@@ -22,7 +22,7 @@ import (
 )
 
 var fspathBuilderPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return &fspath.Builder{}
 	},
 }
@@ -125,6 +125,29 @@ loop:
 			break loop
 		case PrependPathAtNonMountRootError, PrependPathSyntheticError:
 			return "", nil
+		default:
+			return "", err
+		}
+	}
+	b.PrependByte('/')
+	return b.String(), nil
+}
+
+// PathnameInFilesystem returns an absolute path to vd relative to vd's
+// Filesystem root. It also appends //deleted to for disowned entries. It is
+// equivalent to Linux's dentry_path().
+func (vfs *VirtualFilesystem) PathnameInFilesystem(ctx context.Context, vd VirtualDentry) (string, error) {
+	b := getFSPathBuilder()
+	defer putFSPathBuilder(b)
+	if vd.dentry.IsDead() {
+		b.PrependString("//deleted")
+	}
+	if err := vd.mount.fs.impl.PrependPath(ctx, VirtualDentry{}, VirtualDentry{dentry: vd.dentry}, b); err != nil {
+		// PrependPath returns an error if it encounters a filesystem root before
+		// the provided vfsroot. We don't provide a vfsroot, so encountering this
+		// error is expected and can be ignored.
+		switch err.(type) {
+		case PrependPathAtNonMountRootError:
 		default:
 			return "", err
 		}
