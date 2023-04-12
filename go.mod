@@ -8,8 +8,8 @@ require (
 	github.com/bazelbuild/rules_go v0.38.1
 	github.com/cenkalti/backoff v2.2.1+incompatible
 	github.com/cilium/ebpf v0.9.3
-	github.com/containerd/cgroups v1.0.1
-	github.com/containerd/console v1.0.1
+	github.com/containerd/cgroups v1.0.3
+	github.com/containerd/console v1.0.2
 	github.com/containerd/containerd v1.4.13
 	github.com/containerd/fifo v1.0.0
 	github.com/containerd/go-runc v1.0.0
@@ -62,7 +62,7 @@ require (
 	cloud.google.com/go/compute/metadata v0.2.3 // indirect
 	cloud.google.com/go/iam v0.8.0 // indirect
 	github.com/Microsoft/go-winio v0.6.0 // indirect
-	github.com/Microsoft/hcsshim v0.8.14 // indirect
+	github.com/Microsoft/hcsshim v0.8.25 // indirect
 	github.com/containerd/continuity v0.3.0 // indirect
 	github.com/containerd/ttrpc v1.1.0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
