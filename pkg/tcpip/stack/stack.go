@@ -29,10 +29,11 @@ import (
 
 	"golang.org/x/time/rate"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/buffer"
+	"gvisor.dev/gvisor/pkg/log"
 	cryptorand "gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/ports"
 	"gvisor.dev/gvisor/pkg/waiter"
@@ -58,11 +59,13 @@ type ResumableEndpoint interface {
 }
 
 // uniqueIDGenerator is a default unique ID generator.
-type uniqueIDGenerator atomicbitops.AlignedAtomicUint64
+type uniqueIDGenerator atomicbitops.Uint64
 
 func (u *uniqueIDGenerator) UniqueID() uint64 {
-	return ((*atomicbitops.AlignedAtomicUint64)(u)).Add(1)
+	return ((*atomicbitops.Uint64)(u)).Add(1)
 }
+
+var netRawMissingLogger = log.BasicRateLimitedLogger(time.Minute)
 
 // Stack is a networking stack, with all supported protocols, NICs, and route
 // table.
@@ -436,13 +439,13 @@ func (s *Stack) SetNetworkProtocolOption(network tcpip.NetworkProtocolNumber, op
 
 // NetworkProtocolOption allows retrieving individual protocol level option
 // values. This method returns an error if the protocol is not supported or
-// option is not supported by the protocol implementation.
-// e.g.
-// var v ipv4.MyOption
-// err := s.NetworkProtocolOption(tcpip.IPv4ProtocolNumber, &v)
-// if err != nil {
-//   ...
-// }
+// option is not supported by the protocol implementation. E.g.:
+//
+//	var v ipv4.MyOption
+//	err := s.NetworkProtocolOption(tcpip.IPv4ProtocolNumber, &v)
+//	if err != nil {
+//		...
+//	}
 func (s *Stack) NetworkProtocolOption(network tcpip.NetworkProtocolNumber, option tcpip.GettableNetworkProtocolOption) tcpip.Error {
 	netProto, ok := s.networkProtocols[network]
 	if !ok {
@@ -466,10 +469,11 @@ func (s *Stack) SetTransportProtocolOption(transport tcpip.TransportProtocolNumb
 // TransportProtocolOption allows retrieving individual protocol level option
 // values. This method returns an error if the protocol is not supported or
 // option is not supported by the protocol implementation.
-// var v tcp.SACKEnabled
-// if err := s.TransportProtocolOption(tcpip.TCPProtocolNumber, &v); err != nil {
-//   ...
-// }
+//
+//	var v tcp.SACKEnabled
+//	if err := s.TransportProtocolOption(tcpip.TCPProtocolNumber, &v); err != nil {
+//		...
+//	}
 func (s *Stack) TransportProtocolOption(transport tcpip.TransportProtocolNumber, option tcpip.GettableTransportProtocolOption) tcpip.Error {
 	transProtoState, ok := s.transportProtocols[transport]
 	if !ok {
@@ -563,6 +567,135 @@ func (s *Stack) SetForwardingDefaultAndAllNICs(protocol tcpip.NetworkProtocolNum
 	return nil
 }
 
+// AddMulticastRoute adds a multicast route to be used for the specified
+// addresses and protocol.
+func (s *Stack) AddMulticastRoute(protocol tcpip.NetworkProtocolNumber, addresses UnicastSourceAndMulticastDestination, route MulticastRoute) tcpip.Error {
+	netProto, ok := s.networkProtocols[protocol]
+	if !ok {
+		return &tcpip.ErrUnknownProtocol{}
+	}
+
+	forwardingNetProto, ok := netProto.(MulticastForwardingNetworkProtocol)
+	if !ok {
+		return &tcpip.ErrNotSupported{}
+	}
+
+	return forwardingNetProto.AddMulticastRoute(addresses, route)
+}
+
+// RemoveMulticastRoute removes a multicast route that matches the specified
+// addresses and protocol.
+func (s *Stack) RemoveMulticastRoute(protocol tcpip.NetworkProtocolNumber, addresses UnicastSourceAndMulticastDestination) tcpip.Error {
+	netProto, ok := s.networkProtocols[protocol]
+	if !ok {
+		return &tcpip.ErrUnknownProtocol{}
+	}
+
+	forwardingNetProto, ok := netProto.(MulticastForwardingNetworkProtocol)
+	if !ok {
+		return &tcpip.ErrNotSupported{}
+	}
+
+	return forwardingNetProto.RemoveMulticastRoute(addresses)
+}
+
+// MulticastRouteLastUsedTime returns a monotonic timestamp that represents the
+// last time that the route that matches the provided addresses and protocol
+// was used or updated.
+func (s *Stack) MulticastRouteLastUsedTime(protocol tcpip.NetworkProtocolNumber, addresses UnicastSourceAndMulticastDestination) (tcpip.MonotonicTime, tcpip.Error) {
+	netProto, ok := s.networkProtocols[protocol]
+	if !ok {
+		return tcpip.MonotonicTime{}, &tcpip.ErrUnknownProtocol{}
+	}
+
+	forwardingNetProto, ok := netProto.(MulticastForwardingNetworkProtocol)
+	if !ok {
+		return tcpip.MonotonicTime{}, &tcpip.ErrNotSupported{}
+	}
+
+	return forwardingNetProto.MulticastRouteLastUsedTime(addresses)
+}
+
+// EnableMulticastForwardingForProtocol enables multicast forwarding for the
+// provided protocol.
+//
+// Returns true if forwarding was already enabled on the protocol.
+// Additionally, returns an error if:
+//
+//   - The protocol is not found.
+//   - The protocol doesn't support multicast forwarding.
+//   - The multicast forwarding event dispatcher is nil.
+//
+// If successful, future multicast forwarding events will be sent to the
+// provided event dispatcher.
+func (s *Stack) EnableMulticastForwardingForProtocol(protocol tcpip.NetworkProtocolNumber, disp MulticastForwardingEventDispatcher) (bool, tcpip.Error) {
+	netProto, ok := s.networkProtocols[protocol]
+	if !ok {
+		return false, &tcpip.ErrUnknownProtocol{}
+	}
+
+	forwardingNetProto, ok := netProto.(MulticastForwardingNetworkProtocol)
+	if !ok {
+		return false, &tcpip.ErrNotSupported{}
+	}
+
+	return forwardingNetProto.EnableMulticastForwarding(disp)
+}
+
+// DisableMulticastForwardingForProtocol disables multicast forwarding for the
+// provided protocol.
+//
+// Returns an error if the provided protocol is not found or if it does not
+// support multicast forwarding.
+func (s *Stack) DisableMulticastForwardingForProtocol(protocol tcpip.NetworkProtocolNumber) tcpip.Error {
+	netProto, ok := s.networkProtocols[protocol]
+	if !ok {
+		return &tcpip.ErrUnknownProtocol{}
+	}
+
+	forwardingNetProto, ok := netProto.(MulticastForwardingNetworkProtocol)
+	if !ok {
+		return &tcpip.ErrNotSupported{}
+	}
+
+	forwardingNetProto.DisableMulticastForwarding()
+	return nil
+}
+
+// SetNICMulticastForwarding enables or disables multicast packet forwarding on
+// the specified NIC for the passed protocol.
+//
+// Returns the previous configuration on the NIC.
+//
+// TODO(https://gvisor.dev/issue/7338): Implement support for multicast
+// forwarding. Currently, setting this value is a no-op and is not ready for
+// use.
+func (s *Stack) SetNICMulticastForwarding(id tcpip.NICID, protocol tcpip.NetworkProtocolNumber, enable bool) (bool, tcpip.Error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	nic, ok := s.nics[id]
+	if !ok {
+		return false, &tcpip.ErrUnknownNICID{}
+	}
+
+	return nic.setMulticastForwarding(protocol, enable)
+}
+
+// NICMulticastForwarding returns the multicast forwarding configuration for
+// the specified NIC.
+func (s *Stack) NICMulticastForwarding(id tcpip.NICID, protocol tcpip.NetworkProtocolNumber) (bool, tcpip.Error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	nic, ok := s.nics[id]
+	if !ok {
+		return false, &tcpip.ErrUnknownNICID{}
+	}
+
+	return nic.multicastForwarding(protocol)
+}
+
 // PortRange returns the UDP and TCP inclusive range of ephemeral ports used in
 // both IPv4 and IPv6.
 func (s *Stack) PortRange() (uint16, uint16) {
@@ -628,6 +761,7 @@ func (s *Stack) NewEndpoint(transport tcpip.TransportProtocolNumber, network tcp
 // of address.
 func (s *Stack) NewRawEndpoint(transport tcpip.TransportProtocolNumber, network tcpip.NetworkProtocolNumber, waiterQueue *waiter.Queue, associated bool) (tcpip.Endpoint, tcpip.Error) {
 	if s.rawFactory == nil {
+		netRawMissingLogger.Infof("A process tried to create a raw socket, but --net-raw was not specified. Should runsc be run with --net-raw?")
 		return nil, &tcpip.ErrNotPermitted{}
 	}
 
@@ -843,6 +977,10 @@ type NICInfo struct {
 	// Forwarding holds the forwarding status for each network endpoint that
 	// supports forwarding.
 	Forwarding map[tcpip.NetworkProtocolNumber]bool
+
+	// MulticastForwarding holds the forwarding status for each network endpoint
+	// that supports multicast forwarding.
+	MulticastForwarding map[tcpip.NetworkProtocolNumber]bool
 }
 
 // HasNIC returns true if the NICID is defined in the stack.
@@ -857,6 +995,21 @@ func (s *Stack) HasNIC(id tcpip.NICID) bool {
 func (s *Stack) NICInfo() map[tcpip.NICID]NICInfo {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+
+	type forwardingFn func(tcpip.NetworkProtocolNumber) (bool, tcpip.Error)
+	forwardingValue := func(forwardingFn forwardingFn, proto tcpip.NetworkProtocolNumber, nicID tcpip.NICID, fnName string) (forward bool, ok bool) {
+		switch forwarding, err := forwardingFn(proto); err.(type) {
+		case nil:
+			return forwarding, true
+		case *tcpip.ErrUnknownProtocol:
+			panic(fmt.Sprintf("expected network protocol %d to be available on NIC %d", proto, nicID))
+		case *tcpip.ErrNotSupported:
+			// Not all network protocols support forwarding.
+		default:
+			panic(fmt.Sprintf("nic(id=%d).%s(%d): %s", nicID, fnName, proto, err))
+		}
+		return false, false
+	}
 
 	nics := make(map[tcpip.NICID]NICInfo)
 	for id, nic := range s.nics {
@@ -873,28 +1026,26 @@ func (s *Stack) NICInfo() map[tcpip.NICID]NICInfo {
 		}
 
 		info := NICInfo{
-			Name:              nic.name,
-			LinkAddress:       nic.NetworkLinkEndpoint.LinkAddress(),
-			ProtocolAddresses: nic.primaryAddresses(),
-			Flags:             flags,
-			MTU:               nic.NetworkLinkEndpoint.MTU(),
-			Stats:             nic.stats.local,
-			NetworkStats:      netStats,
-			Context:           nic.context,
-			ARPHardwareType:   nic.NetworkLinkEndpoint.ARPHardwareType(),
-			Forwarding:        make(map[tcpip.NetworkProtocolNumber]bool),
+			Name:                nic.name,
+			LinkAddress:         nic.NetworkLinkEndpoint.LinkAddress(),
+			ProtocolAddresses:   nic.primaryAddresses(),
+			Flags:               flags,
+			MTU:                 nic.NetworkLinkEndpoint.MTU(),
+			Stats:               nic.stats.local,
+			NetworkStats:        netStats,
+			Context:             nic.context,
+			ARPHardwareType:     nic.NetworkLinkEndpoint.ARPHardwareType(),
+			Forwarding:          make(map[tcpip.NetworkProtocolNumber]bool),
+			MulticastForwarding: make(map[tcpip.NetworkProtocolNumber]bool),
 		}
 
 		for proto := range s.networkProtocols {
-			switch forwarding, err := nic.forwarding(proto); err.(type) {
-			case nil:
+			if forwarding, ok := forwardingValue(nic.forwarding, proto, id, "forwarding"); ok {
 				info.Forwarding[proto] = forwarding
-			case *tcpip.ErrUnknownProtocol:
-				panic(fmt.Sprintf("expected network protocol %d to be available on NIC %d", proto, nic.ID()))
-			case *tcpip.ErrNotSupported:
-				// Not all network protocols support forwarding.
-			default:
-				panic(fmt.Sprintf("nic(id=%d).forwarding(%d): %s", nic.ID(), proto, err))
+			}
+
+			if multicastForwarding, ok := forwardingValue(nic.multicastForwarding, proto, id, "multicastForwarding"); ok {
+				info.MulticastForwarding[proto] = multicastForwarding
 			}
 		}
 
@@ -991,6 +1142,22 @@ func (s *Stack) getAddressEP(nic *nic, localAddr, remoteAddr tcpip.Address, netP
 		return nic.primaryEndpoint(netProto, remoteAddr)
 	}
 	return nic.findEndpoint(netProto, localAddr, CanBePrimaryEndpoint)
+}
+
+// NewRouteForMulticast returns a Route that may be used to forward multicast
+// packets.
+//
+// Returns nil if validation fails.
+func (s *Stack) NewRouteForMulticast(nicID tcpip.NICID, remoteAddr tcpip.Address, netProto tcpip.NetworkProtocolNumber) *Route {
+	nic, ok := s.nics[nicID]
+	if !ok || !nic.Enabled() {
+		return nil
+	}
+
+	if addressEndpoint := s.getAddressEP(nic, "" /* localAddr */, remoteAddr, netProto); addressEndpoint != nil {
+		return constructAndValidateRoute(netProto, addressEndpoint, nic, nic, "" /* gateway */, "" /* localAddr */, remoteAddr, s.handleLocal, false /* multicastLoop */)
+	}
+	return nil
 }
 
 // findLocalRouteFromNICRLocked is like findLocalRouteRLocked but finds a route
@@ -1555,6 +1722,13 @@ func (s *Stack) Wait() {
 	}
 }
 
+// Pause pauses any protocol level background workers.
+func (s *Stack) Pause() {
+	for _, p := range s.transportProtocols {
+		p.proto.Pause()
+	}
+}
+
 // Resume restarts the stack after a restore. This must be called after the
 // entire system has been restored.
 func (s *Stack) Resume() {
@@ -1566,6 +1740,10 @@ func (s *Stack) Resume() {
 	s.mu.Unlock()
 	for _, e := range eps {
 		e.Resume(s)
+	}
+	// Now resume any protocol level background workers.
+	for _, p := range s.transportProtocols {
+		p.proto.Resume()
 	}
 }
 
@@ -1629,7 +1807,7 @@ func (s *Stack) unregisterPacketEndpointLocked(nicID tcpip.NICID, netProto tcpip
 
 // WritePacketToRemote writes a payload on the specified NIC using the provided
 // network protocol and remote link address.
-func (s *Stack) WritePacketToRemote(nicID tcpip.NICID, remote tcpip.LinkAddress, netProto tcpip.NetworkProtocolNumber, payload buffer.VectorisedView) tcpip.Error {
+func (s *Stack) WritePacketToRemote(nicID tcpip.NICID, remote tcpip.LinkAddress, netProto tcpip.NetworkProtocolNumber, payload buffer.Buffer) tcpip.Error {
 	s.mu.Lock()
 	nic, ok := s.nics[nicID]
 	s.mu.Unlock()
@@ -1638,7 +1816,7 @@ func (s *Stack) WritePacketToRemote(nicID tcpip.NICID, remote tcpip.LinkAddress,
 	}
 	pkt := NewPacketBuffer(PacketBufferOptions{
 		ReserveHeaderBytes: int(nic.MaxHeaderLength()),
-		Data:               payload,
+		Payload:            payload,
 	})
 	defer pkt.DecRef()
 	pkt.NetworkProtocolNumber = netProto
@@ -1647,7 +1825,7 @@ func (s *Stack) WritePacketToRemote(nicID tcpip.NICID, remote tcpip.LinkAddress,
 
 // WriteRawPacket writes data directly to the specified NIC without adding any
 // headers.
-func (s *Stack) WriteRawPacket(nicID tcpip.NICID, proto tcpip.NetworkProtocolNumber, payload buffer.VectorisedView) tcpip.Error {
+func (s *Stack) WriteRawPacket(nicID tcpip.NICID, proto tcpip.NetworkProtocolNumber, payload buffer.Buffer) tcpip.Error {
 	s.mu.RLock()
 	nic, ok := s.nics[nicID]
 	s.mu.RUnlock()
@@ -1656,7 +1834,7 @@ func (s *Stack) WriteRawPacket(nicID tcpip.NICID, proto tcpip.NetworkProtocolNum
 	}
 
 	pkt := NewPacketBuffer(PacketBufferOptions{
-		Data: payload,
+		Payload: payload,
 	})
 	defer pkt.DecRef()
 	pkt.NetworkProtocolNumber = proto

@@ -15,8 +15,7 @@
 package vfs
 
 import (
-	"sync/atomic"
-
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sync"
@@ -29,33 +28,33 @@ import (
 //
 // Dentry is loosely analogous to Linux's struct dentry, but:
 //
-// - VFS does not associate Dentries with inodes. gVisor interacts primarily
-// with filesystems that are accessed through filesystem APIs (as opposed to
-// raw block devices); many such APIs support only paths and file descriptors,
-// and not inodes. Furthermore, when parties outside the scope of VFS can
-// rename inodes on such filesystems, VFS generally cannot "follow" the rename,
-// both due to synchronization issues and because it may not even be able to
-// name the destination path; this implies that it would in fact be incorrect
-// for Dentries to be associated with inodes on such filesystems. Consequently,
-// operations that are inode operations in Linux are FilesystemImpl methods
-// and/or FileDescriptionImpl methods in gVisor's VFS. Filesystems that do
-// support inodes may store appropriate state in implementations of DentryImpl.
+//   - VFS does not associate Dentries with inodes. gVisor interacts primarily
+//     with filesystems that are accessed through filesystem APIs (as opposed to
+//     raw block devices); many such APIs support only paths and file descriptors,
+//     and not inodes. Furthermore, when parties outside the scope of VFS can
+//     rename inodes on such filesystems, VFS generally cannot "follow" the rename,
+//     both due to synchronization issues and because it may not even be able to
+//     name the destination path; this implies that it would in fact be incorrect
+//     for Dentries to be associated with inodes on such filesystems. Consequently,
+//     operations that are inode operations in Linux are FilesystemImpl methods
+//     and/or FileDescriptionImpl methods in gVisor's VFS. Filesystems that do
+//     support inodes may store appropriate state in implementations of DentryImpl.
 //
-// - VFS does not require that Dentries are instantiated for all paths accessed
-// through VFS, only those that are tracked beyond the scope of a single
-// Filesystem operation. This includes file descriptions, mount points, mount
-// roots, process working directories, and chroots. This avoids instantiation
-// of Dentries for operations on mutable remote filesystems that can't actually
-// cache any state in the Dentry.
+//   - VFS does not require that Dentries are instantiated for all paths accessed
+//     through VFS, only those that are tracked beyond the scope of a single
+//     Filesystem operation. This includes file descriptions, mount points, mount
+//     roots, process working directories, and chroots. This avoids instantiation
+//     of Dentries for operations on mutable remote filesystems that can't actually
+//     cache any state in the Dentry.
 //
-// - VFS does not track filesystem structure (i.e. relationships between
-// Dentries), since both the relevant state and synchronization are
-// filesystem-specific.
+//   - VFS does not track filesystem structure (i.e. relationships between
+//     Dentries), since both the relevant state and synchronization are
+//     filesystem-specific.
 //
-// - For the reasons above, VFS is not directly responsible for managing Dentry
-// lifetime. Dentry reference counts only indicate the extent to which VFS
-// requires Dentries to exist; Filesystems may elect to cache or discard
-// Dentries with zero references.
+//   - For the reasons above, VFS is not directly responsible for managing Dentry
+//     lifetime. Dentry reference counts only indicate the extent to which VFS
+//     requires Dentries to exist; Filesystems may elect to cache or discard
+//     Dentries with zero references.
 //
 // +stateify savable
 type Dentry struct {
@@ -68,8 +67,7 @@ type Dentry struct {
 	dead bool
 
 	// mounts is the number of Mounts for which this Dentry is Mount.point.
-	// mounts is accessed using atomic memory operations.
-	mounts uint32
+	mounts atomicbitops.Uint32
 
 	// impl is the DentryImpl associated with this Dentry. impl is immutable.
 	// This should be the last field in Dentry.
@@ -166,7 +164,7 @@ func (d *Dentry) IsDead() bool {
 }
 
 func (d *Dentry) isMounted() bool {
-	return atomic.LoadUint32(&d.mounts) != 0
+	return d.mounts.Load() != 0
 }
 
 // InotifyWithParent notifies all watches on the targets represented by d and
@@ -248,8 +246,9 @@ func (vfs *VirtualFilesystem) InvalidateDentry(ctx context.Context, d *Dentry) {
 // CommitRenameExchangeDentry depending on the rename's outcome.
 //
 // Preconditions:
-// * If to is not nil, it must be a child Dentry from the same Filesystem.
-// * from != to.
+//   - If to is not nil, it must be a child Dentry from the same Filesystem.
+//   - from != to.
+//
 // +checklocksacquire:from.mu
 // +checklocksacquire:to.mu
 func (vfs *VirtualFilesystem) PrepareRenameDentry(mntns *MountNamespace, from, to *Dentry) error {

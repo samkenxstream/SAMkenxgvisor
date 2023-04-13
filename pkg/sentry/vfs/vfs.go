@@ -16,19 +16,19 @@
 //
 // Lock order:
 //
-// EpollInstance.interestMu
-//   FileDescription.epollMu
-//     Locks acquired by FilesystemImpl/FileDescriptionImpl methods
-//       VirtualFilesystem.mountMu
-//         Dentry.mu
-//           Locks acquired by FilesystemImpls between Prepare{Delete,Rename}Dentry and Commit{Delete,Rename*}Dentry
-//         VirtualFilesystem.filesystemsMu
-//       fdnotifier.notifier.mu
-//         EpollInstance.readyMu
-//       Inotify.mu
-//         Watches.mu
-//           Inotify.evMu
-// VirtualFilesystem.fsTypesMu
+//	EpollInstance.interestMu
+//		FileDescription.epollMu
+//		  Locks acquired by FilesystemImpl/FileDescriptionImpl methods
+//		    VirtualFilesystem.mountMu
+//		      Dentry.mu
+//		        Locks acquired by FilesystemImpls between Prepare{Delete,Rename}Dentry and Commit{Delete,Rename*}Dentry
+//		      VirtualFilesystem.filesystemsMu
+//		    fdnotifier.notifier.mu
+//		      EpollInstance.readyMu
+//		    Inotify.mu
+//		      Watches.mu
+//		        Inotify.evMu
+//	VirtualFilesystem.fsTypesMu
 //
 // Locking Dentry.mu in multiple Dentries requires holding
 // VirtualFilesystem.mountMu. Locking EpollInstance.interestMu in multiple
@@ -40,6 +40,7 @@ import (
 	"path"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fspath"
@@ -59,7 +60,7 @@ type VirtualFilesystem struct {
 	// mountMu serializes mount mutations.
 	//
 	// mountMu is analogous to Linux's namespace_sem.
-	mountMu sync.Mutex `state:"nosave"`
+	mountMu virtualFilesystemMutex `state:"nosave"`
 
 	// mounts maps (mount parent, mount point) pairs to mounts. (Since mounts
 	// are uniquely namespaced, including mount parent in the key correctly
@@ -90,7 +91,7 @@ type VirtualFilesystem struct {
 
 	// lastMountID is the last allocated mount ID. lastMountID is accessed
 	// using atomic memory operations.
-	lastMountID uint64
+	lastMountID atomicbitops.Uint64
 
 	// anonMount is a Mount, not included in mounts or mountpoints,
 	// representing an anonFilesystem. anonMount is used to back
@@ -382,10 +383,10 @@ func (vfs *VirtualFilesystem) OpenAt(ctx context.Context, creds *auth.Credential
 
 	// Remove:
 	//
-	// - O_CLOEXEC, which affects file descriptors and therefore must be
-	// handled outside of VFS.
+	//	- O_CLOEXEC, which affects file descriptors and therefore must be
+	//		handled outside of VFS.
 	//
-	// - Unknown flags.
+	//	- Unknown flags.
 	opts.Flags &= linux.O_ACCMODE | linux.O_CREAT | linux.O_EXCL | linux.O_NOCTTY | linux.O_TRUNC | linux.O_APPEND | linux.O_NONBLOCK | linux.O_DSYNC | linux.O_ASYNC | linux.O_DIRECT | linux.O_LARGEFILE | linux.O_DIRECTORY | linux.O_NOFOLLOW | linux.O_NOATIME | linux.O_SYNC | linux.O_PATH | linux.O_TMPFILE
 	// Linux's __O_SYNC (which we call linux.O_SYNC) implies O_DSYNC.
 	if opts.Flags&linux.O_SYNC != 0 {
@@ -416,21 +417,12 @@ func (vfs *VirtualFilesystem) OpenAt(ctx context.Context, creds *auth.Credential
 	if opts.Flags&linux.O_NOFOLLOW != 0 {
 		pop.FollowFinalSymlink = false
 	}
+	if opts.Flags&linux.O_PATH != 0 {
+		return vfs.openOPathFD(ctx, creds, pop, opts.Flags)
+	}
 	rp := vfs.getResolvingPath(creds, pop)
 	if opts.Flags&linux.O_DIRECTORY != 0 {
 		rp.mustBeDir = true
-	}
-	if opts.Flags&linux.O_PATH != 0 {
-		vd, err := vfs.GetDentryAt(ctx, creds, pop, &GetDentryOptions{})
-		if err != nil {
-			return nil, err
-		}
-		fd := &opathFD{}
-		if err := fd.vfsfd.Init(fd, opts.Flags, vd.Mount(), vd.Dentry(), &FileDescriptionOptions{}); err != nil {
-			return nil, err
-		}
-		vd.DecRef(ctx)
-		return &fd.vfsfd, err
 	}
 	for {
 		fd, err := rp.mount.fs.impl.OpenAt(ctx, rp, *opts)

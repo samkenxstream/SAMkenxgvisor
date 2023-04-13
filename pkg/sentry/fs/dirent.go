@@ -17,10 +17,10 @@ package fs
 import (
 	"fmt"
 	"path"
-	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/refs"
@@ -118,7 +118,7 @@ type Dirent struct {
 	parent *Dirent
 
 	// deleted may be set atomically when removed.
-	deleted int32
+	deleted atomicbitops.Int32
 
 	// mounted is true if Dirent is a mount point, similar to include/linux/dcache.h:DCACHE_MOUNTED.
 	mounted bool
@@ -254,13 +254,13 @@ func (d *Dirent) IsNegative() bool {
 // Returns (*WeakRef, true) if hashing child caused a Dirent to be unhashed. The caller must
 // validate the returned unhashed weak reference. Common cases:
 //
-// * Remove: hashing a negative Dirent unhashes a positive Dirent (unimplemented).
-// * Create: hashing a positive Dirent unhashes a negative Dirent.
-// * Lookup: hashing any Dirent should not unhash any other Dirent.
+//   - Remove: hashing a negative Dirent unhashes a positive Dirent (unimplemented).
+//   - Create: hashing a positive Dirent unhashes a negative Dirent.
+//   - Lookup: hashing any Dirent should not unhash any other Dirent.
 //
 // Preconditions:
-// * d.mu must be held.
-// * child must be a root Dirent.
+//   - d.mu must be held.
+//   - child must be a root Dirent.
 func (d *Dirent) hashChild(child *Dirent) (*refs.WeakRef, bool) {
 	if !child.IsRoot() {
 		panic("hashChild must be a root Dirent")
@@ -373,7 +373,7 @@ func (d *Dirent) fullName(root *Dirent) (string, bool) {
 	d.parent.mu.Unlock()
 	parentName, reachable := d.parent.fullName(root)
 	s := path.Join(parentName, name)
-	if atomic.LoadInt32(&d.deleted) != 0 {
+	if d.deleted.Load() != 0 {
 		return s + " (deleted)", reachable
 	}
 	return s, reachable
@@ -413,9 +413,9 @@ func (d *Dirent) descendantOf(p *Dirent) bool {
 // Inode.Lookup, otherwise walk will keep d.mu locked.
 //
 // Preconditions:
-// * renameMu must be held for reading.
-// * d.mu must be held.
-// * name must must not contain "/"s.
+//   - renameMu must be held for reading.
+//   - d.mu must be held.
+//   - name must must not contain "/"s.
 func (d *Dirent) walk(ctx context.Context, root *Dirent, name string, walkMayUnlock bool) (*Dirent, error) {
 	if !IsDir(d.Inode.StableAttr) {
 		return nil, unix.ENOTDIR
@@ -577,9 +577,9 @@ func (d *Dirent) Walk(ctx context.Context, root *Dirent, name string) (*Dirent, 
 // exists returns true if name exists in relation to d.
 //
 // Preconditions:
-// * renameMu must be held for reading.
-// * d.mu must be held.
-// * name must must not contain "/"s.
+//   - renameMu must be held for reading.
+//   - d.mu must be held.
+//   - name must must not contain "/"s.
 func (d *Dirent) exists(ctx context.Context, root *Dirent, name string) bool {
 	child, err := d.walk(ctx, root, name, false /* may unlock */)
 	if err != nil {
@@ -835,11 +835,11 @@ type DirIterator interface {
 //
 // Arguments:
 //
-// * d:		the Dirent of the directory being read; required to provide "." and "..".
-// * it:	the directory iterator; which represents an open directory handle.
-// * root: 	fs root; if d is equal to the root, then '..' will refer to d.
-// * ctx: 	context provided to file systems in order to select and serialize entries.
-// * offset:	the current directory offset.
+//   - d:		the Dirent of the directory being read; required to provide "." and "..".
+//   - it:	the directory iterator; which represents an open directory handle.
+//   - root: 	fs root; if d is equal to the root, then '..' will refer to d.
+//   - ctx: 	context provided to file systems in order to select and serialize entries.
+//   - offset:	the current directory offset.
 //
 // Returns the offset of the *next* element which was not serialized.
 func DirentReaddir(ctx context.Context, d *Dirent, it DirIterator, root *Dirent, dirCtx *DirCtx, offset int64) (int64, error) {
@@ -961,7 +961,7 @@ func (d *Dirent) isMountPointLocked() bool {
 // Precondition: must be called with mm.withMountLocked held on `d`.
 func (d *Dirent) mount(ctx context.Context, inode *Inode) (newChild *Dirent, err error) {
 	// Did we race with deletion?
-	if atomic.LoadInt32(&d.deleted) != 0 {
+	if d.deleted.Load() != 0 {
 		return nil, linuxerr.ENOENT
 	}
 
@@ -996,7 +996,7 @@ func (d *Dirent) mount(ctx context.Context, inode *Inode) (newChild *Dirent, err
 // Precondition: must be called with mm.withMountLocked held on `d`.
 func (d *Dirent) unmount(ctx context.Context, replacement *Dirent) error {
 	// Did we race with deletion?
-	if atomic.LoadInt32(&d.deleted) != 0 {
+	if d.deleted.Load() != 0 {
 		return linuxerr.ENOENT
 	}
 
@@ -1058,7 +1058,7 @@ func (d *Dirent) Remove(ctx context.Context, root *Dirent, name string, dirPath 
 	child.Inode.Watches.Notify("", linux.IN_ATTRIB, 0)
 
 	// Mark name as deleted and remove from children.
-	atomic.StoreInt32(&child.deleted, 1)
+	child.deleted.Store(1)
 	if w, ok := d.children[name]; ok {
 		delete(d.children, name)
 		w.Drop(ctx)
@@ -1124,7 +1124,7 @@ func (d *Dirent) RemoveDirectory(ctx context.Context, root *Dirent, name string)
 	}
 
 	// Mark name as deleted and remove from children.
-	atomic.StoreInt32(&child.deleted, 1)
+	child.deleted.Store(1)
 	if w, ok := d.children[name]; ok {
 		delete(d.children, name)
 		w.Drop(ctx)
@@ -1277,14 +1277,13 @@ func lockForRename(oldParent *Dirent, oldName string, newParent *Dirent, newName
 
 	// Renaming between directories is a bit subtle:
 	//
-	// - A concurrent cross-directory Rename may try to lock in the opposite
-	// order; take renameMu to prevent this from happening.
-	//
-	// - If either directory is an ancestor of the other, then a concurrent
-	// Remove may lock the descendant (in DecRef -> closeAll) while holding a
-	// lock on the ancestor; to avoid this, ensure we take locks in the same
-	// ancestor-to-descendant order. (Holding renameMu prevents this
-	// relationship from changing.)
+	//	- A concurrent cross-directory Rename may try to lock in the opposite
+	//		order; take renameMu to prevent this from happening.
+	//	- If either directory is an ancestor of the other, then a concurrent
+	//		Remove may lock the descendant (in DecRef -> closeAll) while holding a
+	//		lock on the ancestor; to avoid this, ensure we take locks in the same
+	//		ancestor-to-descendant order. (Holding renameMu prevents this
+	//		relationship from changing.)
 
 	// First check if newParent is a descendant of oldParent.
 	child := newParent

@@ -50,6 +50,10 @@ func (s *TestStack) Interfaces() map[int32]Interface {
 	return s.InterfacesMap
 }
 
+// Destroy implements Stack.
+func (s *TestStack) Destroy() {
+}
+
 // RemoveInterface implements Stack.
 func (s *TestStack) RemoveInterface(idx int32) error {
 	delete(s.InterfacesMap, idx)
@@ -143,6 +147,9 @@ func (s *TestStack) Statistics(stat interface{}, arg string) error {
 func (s *TestStack) RouteTable() []Route {
 	return s.RouteList
 }
+
+// Pause implements Stack.
+func (s *TestStack) Pause() {}
 
 // Resume implements Stack.
 func (s *TestStack) Resume() {}

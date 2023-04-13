@@ -33,17 +33,17 @@ import (
 	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/runsc/cmd"
+	"gvisor.dev/gvisor/runsc/cmd/trace"
+	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
 
 var (
-	// Although these flags are not part of the OCI spec, they are used by
+	// Although this flags is not part of the OCI spec, it is used by
 	// Docker, and thus should not be changed.
-	// TODO(gvisor.dev/issue/193): support systemd cgroups
-	systemdCgroup = flag.Bool("systemd-cgroup", false, "Use systemd for cgroups. NOT SUPPORTED.")
-	showVersion   = flag.Bool("version", false, "show version and exit.")
+	showVersion = flag.Bool("version", false, "show version and exit.")
 
 	// These flags are unique to runsc, and are used to configure parts of the
 	// system that are not covered by the runtime spec.
@@ -81,14 +81,14 @@ func Main(version string) {
 	subcommands.Register(new(cmd.Spec), "")
 	subcommands.Register(new(cmd.Start), "")
 	subcommands.Register(new(cmd.State), "")
-	subcommands.Register(new(cmd.VerityPrepare), "")
 	subcommands.Register(new(cmd.Wait), "")
 
-	// Installation helpers.
+	// Helpers.
 	const helperGroup = "helpers"
 	subcommands.Register(new(cmd.Install), helperGroup)
 	subcommands.Register(new(cmd.Mitigate), helperGroup)
 	subcommands.Register(new(cmd.Uninstall), helperGroup)
+	subcommands.Register(new(trace.Trace), helperGroup)
 
 	const debugGroup = "debug"
 	subcommands.Register(new(cmd.Debug), debugGroup)
@@ -117,13 +117,7 @@ func Main(version string) {
 	// Create a new Config from the flags.
 	conf, err := config.NewFromFlags(flag.CommandLine)
 	if err != nil {
-		cmd.Fatalf(err.Error())
-	}
-
-	// TODO(gvisor.dev/issue/193): support systemd cgroups
-	if *systemdCgroup {
-		fmt.Fprintln(os.Stderr, "systemd cgroup flag passed, but systemd cgroups not supported. See gvisor.dev/issue/193")
-		os.Exit(1)
+		util.Fatalf(err.Error())
 	}
 
 	var errorLogger io.Writer
@@ -137,13 +131,13 @@ func Main(version string) {
 		var err error
 		errorLogger, err = os.OpenFile(conf.LogFilename, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
 		if err != nil {
-			cmd.Fatalf("error opening log file %q: %v", conf.LogFilename, err)
+			util.Fatalf("error opening log file %q: %v", conf.LogFilename, err)
 		}
 	}
-	cmd.ErrorLogger = errorLogger
+	util.ErrorLogger = errorLogger
 
 	if _, err := platform.Lookup(conf.Platform); err != nil {
-		cmd.Fatalf("%v", err)
+		util.Fatalf("%v", err)
 	}
 
 	// Sets the reference leak check mode. Also set it in config below to
@@ -178,7 +172,7 @@ func Main(version string) {
 	} else if conf.DebugLog != "" {
 		f, err := specutils.DebugLogFile(conf.DebugLog, subcommand, "" /* name */)
 		if err != nil {
-			cmd.Fatalf("error opening debug log file in %q: %v", conf.DebugLog, err)
+			util.Fatalf("error opening debug log file in %q: %v", conf.DebugLog, err)
 		}
 		e = newEmitter(conf.DebugLogFormat, f)
 
@@ -196,7 +190,7 @@ func Main(version string) {
 		// Quick sanity check to make sure no other commands get passed
 		// a log fd (they should use log dir instead).
 		if subcommand != "boot" && subcommand != "gofer" {
-			cmd.Fatalf("flags --debug-log-fd and --panic-log-fd should only be passed to 'boot' and 'gofer' command, but was passed to %q", subcommand)
+			util.Fatalf("flags --debug-log-fd and --panic-log-fd should only be passed to 'boot' and 'gofer' command, but was passed to %q", subcommand)
 		}
 
 		// If we are the boot process, then we own our stdio FDs and can do what we
@@ -204,7 +198,7 @@ func Main(version string) {
 		// dup our stderr to the provided log FD so that panics will appear in the
 		// logs, rather than just disappear.
 		if err := unix.Dup3(fd, int(os.Stderr.Fd()), 0); err != nil {
-			cmd.Fatalf("error dup'ing fd %d to stderr: %v", fd, err)
+			util.Fatalf("error dup'ing fd %d to stderr: %v", fd, err)
 		}
 	} else if conf.AlsoLogToStderr {
 		e = &log.MultiEmitter{e, newEmitter(conf.DebugLogFormat, os.Stderr)}
@@ -229,8 +223,9 @@ func Main(version string) {
 	log.Infof("\t\tFileAccess: %v, overlay: %t", conf.FileAccess, conf.Overlay)
 	log.Infof("\t\tNetwork: %v, logging: %t", conf.Network, conf.LogPackets)
 	log.Infof("\t\tStrace: %t, max size: %d, syscalls: %s", conf.Strace, conf.StraceLogSize, conf.StraceSyscalls)
-	log.Infof("\t\tVFS2 enabled: %t, LISAFS: %t", conf.VFS2, conf.Lisafs)
+	log.Infof("\t\tLISAFS: %t", conf.Lisafs)
 	log.Infof("\t\tDebug: %v", conf.Debug)
+	log.Infof("\t\tSystemd: %v", conf.SystemdCgroup)
 	log.Infof("***************************")
 
 	if conf.TestOnlyAllowRunAsCurrentUserWithoutChroot {
@@ -269,6 +264,6 @@ func newEmitter(format string, logFile io.Writer) log.Emitter {
 	case "json-k8s":
 		return log.K8sJSONEmitter{&log.Writer{Next: logFile}}
 	}
-	cmd.Fatalf("invalid log format %q, must be 'text', 'json', or 'json-k8s'", format)
+	util.Fatalf("invalid log format %q, must be 'text', 'json', or 'json-k8s'", format)
 	panic("unreachable")
 }

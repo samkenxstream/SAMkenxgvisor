@@ -50,7 +50,7 @@ const cgroupParentAnnotation = "dev.gvisor.spec.cgroup-parent"
 // validateID validates the container id.
 func validateID(id string) error {
 	// See libcontainer/factory_linux.go.
-	idRegex := regexp.MustCompile(`^[\w+-\.]+$`)
+	idRegex := regexp.MustCompile(`^[\w+\.-]+$`)
 	if !idRegex.MatchString(id) {
 		return fmt.Errorf("invalid container id: %v", id)
 	}
@@ -219,7 +219,7 @@ func New(conf *config.Config, args Args) (*Container, error) {
 	// Lock the container metadata file to prevent concurrent creations of
 	// containers with the same id.
 	if err := c.Saver.lockForNew(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("cannot lock container metadata file: %w", err)
 	}
 	defer c.Saver.unlockOrDie()
 
@@ -252,14 +252,14 @@ func New(conf *config.Config, args Args) (*Container, error) {
 			// part of the cgroup from the start (and all their children processes).
 			parentCgroup, subCgroup, err = c.setupCgroupForRoot(conf, args.Spec)
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("cannot set up cgroup for root: %w", err)
 			}
 		}
 		c.CompatCgroup = cgroup.CgroupJSON{Cgroup: subCgroup}
 		if err := runInCgroup(parentCgroup, func() error {
 			ioFiles, specFile, err := c.createGoferProcess(args.Spec, conf, args.BundleDir, args.Attached)
 			if err != nil {
-				return err
+				return fmt.Errorf("cannot create gofer process: %w", err)
 			}
 
 			// Start a new sandbox for this container. Any errors after this point
@@ -277,7 +277,7 @@ func New(conf *config.Config, args Args) (*Container, error) {
 			}
 			sand, err := sandbox.New(conf, sandArgs)
 			if err != nil {
-				return err
+				return fmt.Errorf("cannot create sandbox: %w", err)
 			}
 			c.Sandbox = sand
 			return nil
@@ -295,7 +295,7 @@ func New(conf *config.Config, args Args) (*Container, error) {
 		}
 		sb, err := Load(conf.RootDir, fullID, LoadOpts{Exact: true})
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("cannot load sandbox: %w", err)
 		}
 		c.Sandbox = sb.Sandbox
 
@@ -320,7 +320,7 @@ func New(conf *config.Config, args Args) (*Container, error) {
 		}
 
 		if err := c.Sandbox.CreateSubcontainer(conf, c.ID, tty); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("cannot create subcontainer: %w", err)
 		}
 	}
 	c.changeStatus(Created)
@@ -740,9 +740,9 @@ func (c *Container) Destroy() error {
 	sb := c.Sandbox
 
 	// We must perform the following cleanup steps:
-	// * stop the container and gofer processes,
-	// * remove the container filesystem on the host, and
-	// * delete the container metadata directory.
+	//	* stop the container and gofer processes,
+	//	* remove the container filesystem on the host, and
+	//	* delete the container metadata directory.
 	//
 	// It's possible for one or more of these steps to fail, but we should
 	// do our best to perform all of the cleanups. Hence, we keep a slice
@@ -938,7 +938,7 @@ func (c *Container) createGoferProcess(spec *specs.Spec, conf *config.Config, bu
 	// Add root mount and then add any other additional mounts.
 	mountCount := 1
 	for _, m := range spec.Mounts {
-		if specutils.IsGoferMount(m, conf.VFS2) {
+		if specutils.IsGoferMount(m) {
 			mountCount++
 		}
 	}
@@ -1226,13 +1226,13 @@ func (c *Container) setupCgroupForRoot(conf *config.Config, spec *specs.Spec) (c
 	var parentCgroup cgroup.Cgroup
 	if parentPath, ok := spec.Annotations[cgroupParentAnnotation]; ok {
 		var err error
-		parentCgroup, err = cgroup.NewFromPath(parentPath)
+		parentCgroup, err = cgroup.NewFromPath(parentPath, conf.SystemdCgroup)
 		if err != nil {
 			return nil, nil, err
 		}
 	} else {
 		var err error
-		parentCgroup, err = cgroup.NewFromSpec(spec)
+		parentCgroup, err = cgroup.NewFromSpec(spec, conf.SystemdCgroup)
 		if parentCgroup == nil || err != nil {
 			return nil, nil, err
 		}
@@ -1263,7 +1263,7 @@ func (c *Container) setupCgroupForSubcontainer(conf *config.Config, spec *specs.
 		}
 	}
 
-	cg, err := cgroup.NewFromSpec(spec)
+	cg, err := cgroup.NewFromSpec(spec, conf.SystemdCgroup)
 	if cg == nil || err != nil {
 		return nil, err
 	}
@@ -1279,7 +1279,7 @@ func (c *Container) setupCgroupForSubcontainer(conf *config.Config, spec *specs.
 func cgroupInstall(conf *config.Config, cg cgroup.Cgroup, res *specs.LinuxResources) (cgroup.Cgroup, error) {
 	if err := cg.Install(res); err != nil {
 		switch {
-		case errors.Is(err, unix.EACCES) && conf.Rootless:
+		case (errors.Is(err, unix.EACCES) || errors.Is(err, unix.EROFS)) && conf.Rootless:
 			log.Warningf("Skipping cgroup configuration in rootless mode: %v", err)
 			return nil, nil
 		default:

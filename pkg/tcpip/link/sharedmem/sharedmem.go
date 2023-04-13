@@ -25,13 +25,13 @@ package sharedmem
 
 import (
 	"fmt"
-	"sync/atomic"
 
+	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/eventfd"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/rawfile"
 	"gvisor.dev/gvisor/pkg/tcpip/link/sharedmem/queue"
@@ -167,9 +167,8 @@ type endpoint struct {
 	// rx is the receive queue.
 	rx rx
 
-	// stopRequested is to be accessed atomically only, and determines if
-	// the worker goroutines should stop.
-	stopRequested uint32
+	// stopRequested  determines whether the worker goroutines should stop.
+	stopRequested atomicbitops.Uint32
 
 	// Wait group used to indicate that all workers have stopped.
 	completed sync.WaitGroup
@@ -236,7 +235,7 @@ func New(opts Options) (stack.LinkEndpoint, error) {
 func (e *endpoint) Close() {
 	// Tell dispatch goroutine to stop, then write to the eventfd so that
 	// it wakes up in case it's sleeping.
-	atomic.StoreUint32(&e.stopRequested, 1)
+	e.stopRequested.Store(1)
 	e.rx.eventFD.Notify()
 
 	// Cleanup the queues inline if the worker hasn't started yet; we also
@@ -261,7 +260,7 @@ func (e *endpoint) Wait() {
 // reads packets from the rx queue.
 func (e *endpoint) Attach(dispatcher stack.NetworkDispatcher) {
 	e.mu.Lock()
-	if !e.workerStarted && atomic.LoadUint32(&e.stopRequested) == 0 {
+	if !e.workerStarted && e.stopRequested.Load() == 0 {
 		e.workerStarted = true
 		e.completed.Add(1)
 
@@ -344,8 +343,10 @@ func (e *endpoint) writePacketLocked(r stack.RouteInfo, protocol tcpip.NetworkPr
 		e.AddVirtioNetHeader(pkt)
 	}
 
-	views := pkt.Views()
+	views := pkt.Slices()
 	// Transmit the packet.
+	// TODO(b/231582970): Change transmit() to take a buffer.Buffer instead of a
+	// collection of slices.
 	ok := e.tx.transmit(views...)
 	if !ok {
 		return &tcpip.ErrWouldBlock{}
@@ -360,7 +361,7 @@ func (e *endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) 
 	var err tcpip.Error
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	for pkt := pkts.Front(); pkt != nil; pkt = pkt.Next() {
+	for _, pkt := range pkts.AsSlice() {
 		if err = e.writePacketLocked(pkt.EgressRoute, pkt.NetworkProtocolNumber, pkt); err != nil {
 			break
 		}
@@ -396,7 +397,7 @@ func (e *endpoint) dispatchLoop(d stack.NetworkDispatcher) {
 
 	// Read in a loop until a stop is requested.
 	var rxb []queue.RxBuffer
-	for atomic.LoadUint32(&e.stopRequested) == 0 {
+	for e.stopRequested.Load() == 0 {
 		var n uint32
 		rxb, n = e.rx.postAndReceive(rxb, &e.stopRequested)
 
@@ -412,7 +413,7 @@ func (e *endpoint) dispatchLoop(d stack.NetworkDispatcher) {
 		}
 
 		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-			Data: buffer.View(b).ToVectorisedView(),
+			Payload: buffer.NewWithData(b),
 		})
 
 		if e.virtioNetHeaderRequired {

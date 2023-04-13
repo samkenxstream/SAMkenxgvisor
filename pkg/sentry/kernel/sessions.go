@@ -202,11 +202,11 @@ func (pg *ProcessGroup) handleOrphan() {
 		if tg.processGroup != pg {
 			return
 		}
-		tg.signalHandlers.mu.Lock()
+		tg.signalHandlers.mu.NestedLock()
 		if tg.groupStopComplete {
 			hasStopped = true
 		}
-		tg.signalHandlers.mu.Unlock()
+		tg.signalHandlers.mu.NestedUnlock()
 	})
 	if !hasStopped {
 		return
@@ -217,10 +217,10 @@ func (pg *ProcessGroup) handleOrphan() {
 		if tg.processGroup != pg {
 			return
 		}
-		tg.signalHandlers.mu.Lock()
+		tg.signalHandlers.mu.NestedLock()
 		tg.leader.sendSignalLocked(SignalInfoPriv(linux.SIGHUP), true /* group */)
 		tg.leader.sendSignalLocked(SignalInfoPriv(linux.SIGCONT), true /* group */)
-		tg.signalHandlers.mu.Unlock()
+		tg.signalHandlers.mu.NestedUnlock()
 	})
 
 	return
@@ -232,7 +232,7 @@ func (pg *ProcessGroup) Session() *Session {
 }
 
 // SendSignal sends a signal to all processes inside the process group. It is
-// analagous to kernel/signal.c:kill_pgrp.
+// analogous to kernel/signal.c:kill_pgrp.
 func (pg *ProcessGroup) SendSignal(info *linux.SignalInfo) error {
 	tasks := pg.originator.TaskSet()
 	tasks.mu.RLock()

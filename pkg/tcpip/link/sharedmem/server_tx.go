@@ -18,12 +18,10 @@
 package sharedmem
 
 import (
-	"sync/atomic"
-
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/eventfd"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/link/sharedmem/pipe"
 	"gvisor.dev/gvisor/pkg/tcpip/link/sharedmem/queue"
 )
@@ -50,7 +48,7 @@ type serverTx struct {
 
 	// sharedEventFDState is the memory region in sharedData used to enable/disable
 	// notifications on eventFD.
-	sharedEventFDState *uint32
+	sharedEventFDState *atomicbitops.Uint32
 }
 
 // init initializes all tstate needed by the serverTx queue based on the
@@ -115,7 +113,7 @@ func (s *serverTx) cleanup() {
 
 // acquireBuffers acquires enough buffers to hold all the data in views or
 // returns nil if not enough buffers are currently available.
-func (s *serverTx) acquireBuffers(views []buffer.View, buffers []queue.RxBuffer) (acquiredBuffers []queue.RxBuffer) {
+func (s *serverTx) acquireBuffers(views [][]byte, buffers []queue.RxBuffer) (acquiredBuffers []queue.RxBuffer) {
 	acquiredBuffers = buffers[:0]
 	wantBytes := 0
 	for i := range views {
@@ -140,10 +138,10 @@ func (s *serverTx) acquireBuffers(views []buffer.View, buffers []queue.RxBuffer)
 //
 // To avoid allocations the filledBuffers are appended to the buffers slice
 // which will be grown as required.
-func (s *serverTx) fillPacket(views []buffer.View, buffers []queue.RxBuffer) (filledBuffers []queue.RxBuffer, totalCopied uint32) {
+func (s *serverTx) fillPacket(views [][]byte, buffers []queue.RxBuffer) (filledBuffers []queue.RxBuffer, totalCopied uint32) {
 	// fillBuffer copies as much of the views as possible into the provided buffer
 	// and returns any left over views (if any).
-	fillBuffer := func(buffer *queue.RxBuffer, views []buffer.View) (left []buffer.View) {
+	fillBuffer := func(buffer *queue.RxBuffer, views [][]byte) (left [][]byte) {
 		if len(views) == 0 {
 			return nil
 		}
@@ -153,8 +151,8 @@ func (s *serverTx) fillPacket(views []buffer.View, buffers []queue.RxBuffer) (fi
 			n := copy(s.data[buffer.Offset+copied:][:uint64(buffer.Size)-copied], views[0])
 			copied += uint64(n)
 			availBytes -= uint32(n)
-			views[0].TrimFront(n)
-			if !views[0].IsEmpty() {
+			views[0] = views[0][n:]
+			if len(views[0]) != 0 {
 				break
 			}
 			views = views[1:]
@@ -175,7 +173,7 @@ func (s *serverTx) fillPacket(views []buffer.View, buffers []queue.RxBuffer) (fi
 	return bufs, totalCopied
 }
 
-func (s *serverTx) transmit(views []buffer.View) bool {
+func (s *serverTx) transmit(views [][]byte) bool {
 	buffers := make([]queue.RxBuffer, 8)
 	buffers, totalCopied := s.fillPacket(views, buffers)
 	if totalCopied == 0 {
@@ -198,7 +196,7 @@ func (s *serverTx) transmit(views []buffer.View) bool {
 
 func (s *serverTx) notificationsEnabled() bool {
 	// notifications are considered to be enabled unless explicitly disabled.
-	return atomic.LoadUint32(s.sharedEventFDState) != queue.EventFDDisabled
+	return s.sharedEventFDState.Load() != queue.EventFDDisabled
 }
 
 func (s *serverTx) notify() {

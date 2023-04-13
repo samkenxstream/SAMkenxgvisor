@@ -16,12 +16,15 @@ package kernel
 
 import (
 	"fmt"
-	"sync/atomic"
 
+	"google.golang.org/protobuf/proto"
 	"gvisor.dev/gvisor/pkg/abi"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/bits"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/seccheck"
+	pb "gvisor.dev/gvisor/pkg/sentry/seccheck/points/points_go_proto"
 	"gvisor.dev/gvisor/pkg/sync"
 )
 
@@ -31,7 +34,9 @@ const (
 	// The types below create fast lookup slices for all syscalls. This maximum
 	// serves as a sanity check that we don't allocate huge slices for a very large
 	// syscall. This is checked during registration.
+	// LINT.IfChange
 	maxSyscallNum = 2000
+	// LINT.ThenChange(../seccheck/syscall.go)
 )
 
 // SyscallSupportLevel is a syscall support levels.
@@ -77,6 +82,11 @@ type Syscall struct {
 	Note string
 	// URLs is set of URLs to any relevant bugs or issues.
 	URLs []string
+	// PointCallback is an optional callback that converts syscall arguments
+	// to a proto that can be used with seccheck.Checker.
+	// Callback functions must follow this naming convention:
+	//   PointSyscallNameInCamelCase, e.g. PointReadat, PointRtSigaction.
+	PointCallback SyscallToProto
 }
 
 // SyscallFn is a syscall implementation.
@@ -121,10 +131,10 @@ type SyscallFlagsTable struct {
 	//
 	// missing syscalls have the same value in enable as missingEnable to
 	// avoid an extra branch in Word.
-	enable [maxSyscallNum + 1]uint32
+	enable [maxSyscallNum + 1]atomicbitops.Uint32
 
 	// missingEnable contains the enable bits for missing syscalls.
-	missingEnable uint32
+	missingEnable atomicbitops.Uint32
 }
 
 // Init initializes the struct, with all syscalls in table set to enable.
@@ -132,17 +142,17 @@ type SyscallFlagsTable struct {
 // max is the largest syscall number in table.
 func (e *SyscallFlagsTable) init(table map[uintptr]Syscall) {
 	for num := range table {
-		e.enable[num] = syscallPresent
+		e.enable[num] = atomicbitops.FromUint32(syscallPresent)
 	}
 }
 
 // Word returns the enable bitfield for sysno.
 func (e *SyscallFlagsTable) Word(sysno uintptr) uint32 {
 	if sysno <= maxSyscallNum {
-		return atomic.LoadUint32(&e.enable[sysno])
+		return e.enable[sysno].Load()
 	}
 
-	return atomic.LoadUint32(&e.missingEnable)
+	return e.missingEnable.Load()
 }
 
 // Enable sets enable bit bit for all syscalls based on s.
@@ -158,19 +168,19 @@ func (e *SyscallFlagsTable) Enable(bit uint32, s map[uintptr]bool, missingEnable
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	missingVal := atomic.LoadUint32(&e.missingEnable)
+	missingVal := e.missingEnable.Load()
 	if missingEnable {
 		missingVal |= bit
 	} else {
 		missingVal &^= bit
 	}
-	atomic.StoreUint32(&e.missingEnable, missingVal)
+	e.missingEnable.Store(missingVal)
 
 	for num := range e.enable {
-		val := atomic.LoadUint32(&e.enable[num])
+		val := e.enable[num].Load()
 		if !bits.IsOn32(val, syscallPresent) {
 			// Missing.
-			atomic.StoreUint32(&e.enable[num], missingVal)
+			e.enable[num].Store(missingVal)
 			continue
 		}
 
@@ -179,7 +189,7 @@ func (e *SyscallFlagsTable) Enable(bit uint32, s map[uintptr]bool, missingEnable
 		} else {
 			val &^= bit
 		}
-		atomic.StoreUint32(&e.enable[num], val)
+		e.enable[num].Store(val)
 	}
 }
 
@@ -188,20 +198,20 @@ func (e *SyscallFlagsTable) EnableAll(bit uint32) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	missingVal := atomic.LoadUint32(&e.missingEnable)
+	missingVal := e.missingEnable.Load()
 	missingVal |= bit
-	atomic.StoreUint32(&e.missingEnable, missingVal)
+	e.missingEnable.Store(missingVal)
 
 	for num := range e.enable {
-		val := atomic.LoadUint32(&e.enable[num])
+		val := e.enable[num].Load()
 		if !bits.IsOn32(val, syscallPresent) {
 			// Missing.
-			atomic.StoreUint32(&e.enable[num], missingVal)
+			e.enable[num].Store(missingVal)
 			continue
 		}
 
 		val |= bit
-		atomic.StoreUint32(&e.enable[num], val)
+		e.enable[num].Store(val)
 	}
 }
 
@@ -241,6 +251,11 @@ type SyscallTable struct {
 	// lookup is a fixed-size array that holds the syscalls (indexed by
 	// their numbers). It is used for fast look ups.
 	lookup [maxSyscallNum + 1]SyscallFn
+
+	// pointCallbacks is a fixed-size array that holds SyscallToProto callbacks
+	// (indexed by syscall numbers). It is used for fast lookups when
+	// seccheck.Point is enabled for the syscall.
+	pointCallbacks [maxSyscallNum + 1]SyscallToProto
 
 	// Emulate is a collection of instruction addresses to emulate. The
 	// keys are addresses, and the values are system call numbers.
@@ -320,9 +335,12 @@ func (s *SyscallTable) Init() {
 		s.Emulate = make(map[hostarch.Addr]uintptr)
 	}
 
-	// Initialize the fast-lookup table.
+	// Initialize the fast-lookup tables.
 	for num, sc := range s.Table {
 		s.lookup[num] = sc.Fn
+	}
+	for num, sc := range s.Table {
+		s.pointCallbacks[num] = sc.PointCallback
 	}
 
 	// Initialize all features.
@@ -368,4 +386,26 @@ func (s *SyscallTable) mapLookup(sysno uintptr) SyscallFn {
 		return sc.Fn
 	}
 	return nil
+}
+
+// LookupSyscallToProto looks up the SyscallToProto callback for the given
+// syscall. It may return nil if none is registered.
+func (s *SyscallTable) LookupSyscallToProto(sysno uintptr) SyscallToProto {
+	if sysno > maxSyscallNum {
+		return nil
+	}
+	return s.pointCallbacks[sysno]
+}
+
+// SyscallToProto is a callback function that converts generic syscall data to
+// schematized protobuf for the corresponding syscall.
+type SyscallToProto func(*Task, seccheck.FieldSet, *pb.ContextData, SyscallInfo) (proto.Message, pb.MessageType)
+
+// SyscallInfo provides generic information about the syscall.
+type SyscallInfo struct {
+	Exit  bool
+	Sysno uintptr
+	Args  arch.SyscallArguments
+	Rval  uintptr
+	Errno int
 }

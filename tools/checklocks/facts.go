@@ -167,6 +167,9 @@ type globalGuard struct {
 	// ObjectName indicates the object from which resolution should occur.
 	ObjectName string
 
+	// PackageName is the package where the object lives.
+	PackageName string
+
 	// FieldList is the traversal path from object.
 	FieldList fieldList
 }
@@ -179,7 +182,11 @@ type ssaPackager interface {
 // resolveCommon implements resolution for all cases.
 func (g *globalGuard) resolveCommon(pc *passContext, ls *lockState) resolvedValue {
 	state := pc.pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
-	v := state.Pkg.Members[g.ObjectName].(ssa.Value)
+	pkg := state.Pkg
+	if g.PackageName != "" && g.PackageName != state.Pkg.Pkg.Path() {
+		pkg = state.Pkg.Prog.ImportedPackage(g.PackageName)
+	}
+	v := pkg.Members[g.ObjectName].(ssa.Value)
 	return makeResolvedValue(v, g.FieldList)
 }
 
@@ -469,9 +476,9 @@ func (pc *passContext) findField(structType *types.Struct, fieldName string) (fl
 }
 
 var (
-	mutexRE   = regexp.MustCompile("((.*/)|^)sync.(CrossGoroutineMutex|Mutex)")
-	rwMutexRE = regexp.MustCompile("((.*/)|^)sync.(CrossGoroutineRWMutex|RWMutex)")
-	lockerRE  = regexp.MustCompile("((.*/)|^)sync.Locker")
+	mutexRE   = regexp.MustCompile(".*Mutex")
+	rwMutexRE = regexp.MustCompile(".*RWMutex")
+	lockerRE  = regexp.MustCompile(".*sync.Locker")
 )
 
 // validateMutex validates the mutex type.
@@ -482,15 +489,15 @@ func (pc *passContext) validateMutex(pos token.Pos, obj types.Object, exclusive 
 	// Check that it is indeed a mutex.
 	s := obj.Type().String()
 	switch {
+	case rwMutexRE.MatchString(s):
+		// Safe for all cases.
+		return true
 	case mutexRE.MatchString(s), lockerRE.MatchString(s):
 		// Safe for exclusive cases.
 		if !exclusive {
 			pc.maybeFail(pos, "field %s must be a RWMutex", obj.Name())
 			return false
 		}
-		return true
-	case rwMutexRE.MatchString(s):
-		// Safe for all cases.
 		return true
 	default:
 		// Not a mutex at all?
@@ -627,8 +634,9 @@ func (pc *passContext) findGlobalGuard(pos token.Pos, guardName string) (*global
 		return nil, false
 	}
 	return &globalGuard{
-		ObjectName: parts[0],
-		FieldList:  fl,
+		ObjectName:  parts[0],
+		PackageName: pc.pass.Pkg.Path(),
+		FieldList:   fl,
 	}, true
 }
 

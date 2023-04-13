@@ -20,6 +20,7 @@ import (
 	"math"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -30,11 +31,13 @@ import (
 // +stateify savable
 type memoryController struct {
 	controllerCommon
-	controllerNoopMigrate
+	controllerStateless
+	controllerNoResource
 
-	limitBytes            int64
-	softLimitBytes        int64
-	moveChargeAtImmigrate int64
+	limitBytes            atomicbitops.Int64
+	softLimitBytes        atomicbitops.Int64
+	moveChargeAtImmigrate atomicbitops.Int64
+	pressureLevel         int64
 }
 
 var _ controller = (*memoryController)(nil)
@@ -45,13 +48,13 @@ func newMemoryController(fs *filesystem, defaults map[string]int64) *memoryContr
 		// which is ~ 2**63 on a 64-bit system. So essentially, inifinity. The
 		// exact value isn't very important.
 
-		limitBytes:     math.MaxInt64,
-		softLimitBytes: math.MaxInt64,
+		limitBytes:     atomicbitops.FromInt64(math.MaxInt64),
+		softLimitBytes: atomicbitops.FromInt64(math.MaxInt64),
 	}
 
-	consumeDefault := func(name string, valPtr *int64) {
+	consumeDefault := func(name string, valPtr *atomicbitops.Int64) {
 		if val, ok := defaults[name]; ok {
-			*valPtr = val
+			valPtr.Store(val)
 			delete(defaults, name)
 		}
 	}
@@ -60,27 +63,28 @@ func newMemoryController(fs *filesystem, defaults map[string]int64) *memoryContr
 	consumeDefault("memory.soft_limit_in_bytes", &c.softLimitBytes)
 	consumeDefault("memory.move_charge_at_immigrate", &c.moveChargeAtImmigrate)
 
-	c.controllerCommon.init(controllerMemory, fs)
+	c.controllerCommon.init(kernel.CgroupControllerMemory, fs)
 	return c
 }
 
 // Clone implements controller.Clone.
 func (c *memoryController) Clone() controller {
 	new := &memoryController{
-		limitBytes:            c.limitBytes,
-		softLimitBytes:        c.softLimitBytes,
-		moveChargeAtImmigrate: c.moveChargeAtImmigrate,
+		limitBytes:            atomicbitops.FromInt64(c.limitBytes.Load()),
+		softLimitBytes:        atomicbitops.FromInt64(c.softLimitBytes.Load()),
+		moveChargeAtImmigrate: atomicbitops.FromInt64(c.moveChargeAtImmigrate.Load()),
 	}
-	new.controllerCommon.cloneFrom(&c.controllerCommon)
+	new.controllerCommon.cloneFromParent(c)
 	return new
 }
 
 // AddControlFiles implements controller.AddControlFiles.
 func (c *memoryController) AddControlFiles(ctx context.Context, creds *auth.Credentials, _ *cgroupInode, contents map[string]kernfs.Inode) {
 	contents["memory.usage_in_bytes"] = c.fs.newControllerFile(ctx, creds, &memoryUsageInBytesData{})
-	contents["memory.limit_in_bytes"] = c.fs.newStaticControllerFile(ctx, creds, linux.FileMode(0644), fmt.Sprintf("%d\n", c.limitBytes))
-	contents["memory.soft_limit_in_bytes"] = c.fs.newStaticControllerFile(ctx, creds, linux.FileMode(0644), fmt.Sprintf("%d\n", c.softLimitBytes))
-	contents["memory.move_charge_at_immigrate"] = c.fs.newStaticControllerFile(ctx, creds, linux.FileMode(0644), fmt.Sprintf("%d\n", c.moveChargeAtImmigrate))
+	contents["memory.limit_in_bytes"] = c.fs.newStubControllerFile(ctx, creds, &c.limitBytes)
+	contents["memory.soft_limit_in_bytes"] = c.fs.newStubControllerFile(ctx, creds, &c.softLimitBytes)
+	contents["memory.move_charge_at_immigrate"] = c.fs.newStubControllerFile(ctx, creds, &c.moveChargeAtImmigrate)
+	contents["memory.pressure_level"] = c.fs.newStaticControllerFile(ctx, creds, linux.FileMode(0644), fmt.Sprintf("%d\n", c.pressureLevel))
 }
 
 // +stateify savable

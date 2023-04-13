@@ -825,6 +825,48 @@ func (e *ErrWouldBlock) afterLoad() {}
 func (e *ErrWouldBlock) StateLoad(stateSourceObject state.Source) {
 }
 
+func (e *ErrMissingRequiredFields) StateTypeName() string {
+	return "pkg/tcpip.ErrMissingRequiredFields"
+}
+
+func (e *ErrMissingRequiredFields) StateFields() []string {
+	return []string{}
+}
+
+func (e *ErrMissingRequiredFields) beforeSave() {}
+
+// +checklocksignore
+func (e *ErrMissingRequiredFields) StateSave(stateSinkObject state.Sink) {
+	e.beforeSave()
+}
+
+func (e *ErrMissingRequiredFields) afterLoad() {}
+
+// +checklocksignore
+func (e *ErrMissingRequiredFields) StateLoad(stateSourceObject state.Source) {
+}
+
+func (e *ErrMulticastInputCannotBeOutput) StateTypeName() string {
+	return "pkg/tcpip.ErrMulticastInputCannotBeOutput"
+}
+
+func (e *ErrMulticastInputCannotBeOutput) StateFields() []string {
+	return []string{}
+}
+
+func (e *ErrMulticastInputCannotBeOutput) beforeSave() {}
+
+// +checklocksignore
+func (e *ErrMulticastInputCannotBeOutput) StateSave(stateSinkObject state.Sink) {
+	e.beforeSave()
+}
+
+func (e *ErrMulticastInputCannotBeOutput) afterLoad() {}
+
+// +checklocksignore
+func (e *ErrMulticastInputCannotBeOutput) StateLoad(stateSourceObject state.Source) {
+}
+
 func (l *sockErrorList) StateTypeName() string {
 	return "pkg/tcpip.sockErrorList"
 }
@@ -907,12 +949,14 @@ func (so *SocketOptions) StateFields() []string {
 		"delayOptionEnabled",
 		"corkOptionEnabled",
 		"receiveOriginalDstAddress",
-		"recvErrEnabled",
+		"ipv4RecvErrEnabled",
+		"ipv6RecvErrEnabled",
 		"errQueue",
 		"bindToDevice",
 		"sendBufferSize",
 		"receiveBufferSize",
 		"linger",
+		"rcvlowat",
 	}
 }
 
@@ -941,12 +985,14 @@ func (so *SocketOptions) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(17, &so.delayOptionEnabled)
 	stateSinkObject.Save(18, &so.corkOptionEnabled)
 	stateSinkObject.Save(19, &so.receiveOriginalDstAddress)
-	stateSinkObject.Save(20, &so.recvErrEnabled)
-	stateSinkObject.Save(21, &so.errQueue)
-	stateSinkObject.Save(22, &so.bindToDevice)
-	stateSinkObject.Save(23, &so.sendBufferSize)
-	stateSinkObject.Save(24, &so.receiveBufferSize)
-	stateSinkObject.Save(25, &so.linger)
+	stateSinkObject.Save(20, &so.ipv4RecvErrEnabled)
+	stateSinkObject.Save(21, &so.ipv6RecvErrEnabled)
+	stateSinkObject.Save(22, &so.errQueue)
+	stateSinkObject.Save(23, &so.bindToDevice)
+	stateSinkObject.Save(24, &so.sendBufferSize)
+	stateSinkObject.Save(25, &so.receiveBufferSize)
+	stateSinkObject.Save(26, &so.linger)
+	stateSinkObject.Save(27, &so.rcvlowat)
 }
 
 func (so *SocketOptions) afterLoad() {}
@@ -973,12 +1019,14 @@ func (so *SocketOptions) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(17, &so.delayOptionEnabled)
 	stateSourceObject.Load(18, &so.corkOptionEnabled)
 	stateSourceObject.Load(19, &so.receiveOriginalDstAddress)
-	stateSourceObject.Load(20, &so.recvErrEnabled)
-	stateSourceObject.Load(21, &so.errQueue)
-	stateSourceObject.Load(22, &so.bindToDevice)
-	stateSourceObject.Load(23, &so.sendBufferSize)
-	stateSourceObject.Load(24, &so.receiveBufferSize)
-	stateSourceObject.Load(25, &so.linger)
+	stateSourceObject.Load(20, &so.ipv4RecvErrEnabled)
+	stateSourceObject.Load(21, &so.ipv6RecvErrEnabled)
+	stateSourceObject.Load(22, &so.errQueue)
+	stateSourceObject.Load(23, &so.bindToDevice)
+	stateSourceObject.Load(24, &so.sendBufferSize)
+	stateSourceObject.Load(25, &so.receiveBufferSize)
+	stateSourceObject.Load(26, &so.linger)
+	stateSourceObject.Load(27, &so.rcvlowat)
 }
 
 func (l *LocalSockError) StateTypeName() string {
@@ -1139,6 +1187,8 @@ func (s *SendableControlMessages) StateFields() []string {
 		"TTL",
 		"HasHopLimit",
 		"HopLimit",
+		"HasIPv6PacketInfo",
+		"IPv6PacketInfo",
 	}
 }
 
@@ -1151,6 +1201,8 @@ func (s *SendableControlMessages) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(1, &s.TTL)
 	stateSinkObject.Save(2, &s.HasHopLimit)
 	stateSinkObject.Save(3, &s.HopLimit)
+	stateSinkObject.Save(4, &s.HasIPv6PacketInfo)
+	stateSinkObject.Save(5, &s.IPv6PacketInfo)
 }
 
 func (s *SendableControlMessages) afterLoad() {}
@@ -1161,6 +1213,8 @@ func (s *SendableControlMessages) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(1, &s.TTL)
 	stateSourceObject.Load(2, &s.HasHopLimit)
 	stateSourceObject.Load(3, &s.HopLimit)
+	stateSourceObject.Load(4, &s.HasIPv6PacketInfo)
+	stateSourceObject.Load(5, &s.IPv6PacketInfo)
 }
 
 func (c *ReceivableControlMessages) StateTypeName() string {
@@ -1613,6 +1667,8 @@ func init() {
 	state.Register((*ErrUnknownProtocol)(nil))
 	state.Register((*ErrUnknownProtocolOption)(nil))
 	state.Register((*ErrWouldBlock)(nil))
+	state.Register((*ErrMissingRequiredFields)(nil))
+	state.Register((*ErrMulticastInputCannotBeOutput)(nil))
 	state.Register((*sockErrorList)(nil))
 	state.Register((*sockErrorEntry)(nil))
 	state.Register((*SocketOptions)(nil))

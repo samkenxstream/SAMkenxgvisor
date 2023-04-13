@@ -57,7 +57,7 @@ func NewVFS2(t *kernel.Task, skType linux.SockType, protocol Protocol) (*SocketV
 
 	// Bind the endpoint for good measure so we can connect to it. The
 	// bound address will never be exposed.
-	if err := ep.Bind(tcpip.FullAddress{Addr: "dummy"}, nil); err != nil {
+	if err := ep.Bind(tcpip.FullAddress{Addr: "dummy"}); err != nil {
 		ep.Close(t)
 		return nil, err
 	}
@@ -132,9 +132,14 @@ func (s *SocketVFS2) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.
 	if dst.NumBytes() == 0 {
 		return 0, nil
 	}
-	return dst.CopyOutFrom(ctx, &unix.EndpointReader{
+	r := unix.EndpointReader{
 		Endpoint: s.ep,
-	})
+	}
+	n, err := dst.CopyOutFrom(ctx, &r)
+	if r.Notify != nil {
+		r.Notify()
+	}
+	return n, err
 }
 
 // PWrite implements vfs.FileDescriptionImpl.

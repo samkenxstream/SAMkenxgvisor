@@ -16,16 +16,15 @@ package fs
 
 import (
 	"io"
-	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/uniqueid"
-	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
@@ -34,7 +33,8 @@ import (
 // inotify_init1(2). Inotify implements the FileOperations interface.
 //
 // Lock ordering:
-//   Inotify.mu -> Inode.Watches.mu -> Watch.mu -> Inotify.evMu
+//
+//	Inotify.mu -> Inode.Watches.mu -> Watch.mu -> Inotify.evMu
 //
 // +stateify savable
 type Inotify struct {
@@ -49,7 +49,7 @@ type Inotify struct {
 	// while queuing events, a watch needs to lock the event queue, and using mu
 	// for that would violate lock ordering since at that point the calling
 	// goroutine already holds Watch.target.Watches.mu.
-	evMu sync.Mutex `state:"nosave"`
+	evMu inotifyEventMutex `state:"nosave"`
 
 	// A list of pending events for this inotify instance. Protected by evMu.
 	events eventList
@@ -59,7 +59,7 @@ type Inotify struct {
 	scratch []byte
 
 	// mu protects the fields below.
-	mu sync.Mutex `state:"nosave"`
+	mu inotifyMutex `state:"nosave"`
 
 	// The next watch descriptor number to use for this inotify instance. Note
 	// that Linux starts numbering watch descriptors from 1.
@@ -258,7 +258,7 @@ func (i *Inotify) newWatchLocked(target *Dirent, mask uint32) *Watch {
 	watch := &Watch{
 		owner:  i,
 		wd:     wd,
-		mask:   mask,
+		mask:   atomicbitops.FromUint32(mask),
 		target: target.Inode,
 		pins:   make(map[*Dirent]bool),
 	}
@@ -307,9 +307,9 @@ func (i *Inotify) AddWatch(target *Dirent, mask uint32) int32 {
 		if mergeMask := mask&linux.IN_MASK_ADD != 0; mergeMask {
 			// "Add (OR) events to watch mask for this pathname if it already
 			// exists (instead of replacing mask)." -- inotify(7)
-			newmask |= atomic.LoadUint32(&existing.mask)
+			newmask |= existing.mask.Load()
 		}
-		atomic.StoreUint32(&existing.mask, newmask)
+		existing.mask.Store(newmask)
 		return existing.wd
 	}
 

@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
@@ -198,7 +197,7 @@ type TransportProtocol interface {
 
 	// ParsePorts returns the source and destination ports stored in a
 	// packet of this protocol.
-	ParsePorts(v buffer.View) (src, dst uint16, err tcpip.Error)
+	ParsePorts(v []byte) (src, dst uint16, err tcpip.Error)
 
 	// HandleUnknownDestinationPacket handles packets targeted at this
 	// protocol that don't match any existing endpoint. For example,
@@ -224,6 +223,13 @@ type TransportProtocol interface {
 
 	// Wait waits for any worker goroutines owned by the protocol to stop.
 	Wait()
+
+	// Pause requests that any protocol level background workers pause.
+	Pause()
+
+	// Resume resumes any protocol level background workers that were
+	// previously paused by Pause.
+	Resume()
 
 	// Parse sets pkt.TransportHeader and trims pkt.Data appropriately. It does
 	// neither and returns false if pkt.Data is too small, i.e. pkt.Data.Size() <
@@ -691,6 +697,21 @@ type ForwardingNetworkEndpoint interface {
 	SetForwarding(bool) bool
 }
 
+// MulticastForwardingNetworkEndpoint is a network endpoint that may forward
+// multicast packets.
+type MulticastForwardingNetworkEndpoint interface {
+	ForwardingNetworkEndpoint
+
+	// MulticastForwarding returns true if multicast forwarding is enabled.
+	// Otherwise, returns false.
+	MulticastForwarding() bool
+
+	// SetMulticastForwarding sets the multicast forwarding configuration.
+	//
+	// Returns the previous forwarding configuration.
+	SetMulticastForwarding(bool) bool
+}
+
 // NetworkProtocol is the interface that needs to be implemented by network
 // protocols (e.g., ipv4, ipv6) that want to be part of the networking stack.
 type NetworkProtocol interface {
@@ -704,7 +725,7 @@ type NetworkProtocol interface {
 
 	// ParseAddresses returns the source and destination addresses stored in a
 	// packet of this protocol.
-	ParseAddresses(v buffer.View) (src, dst tcpip.Address)
+	ParseAddresses(v []byte) (src, dst tcpip.Address)
 
 	// NewEndpoint creates a new endpoint of this protocol.
 	NewEndpoint(nic NetworkInterface, dispatcher TransportDispatcher) NetworkEndpoint
@@ -728,11 +749,114 @@ type NetworkProtocol interface {
 
 	// Parse sets pkt.NetworkHeader and trims pkt.Data appropriately. It
 	// returns:
-	// - The encapsulated protocol, if present.
-	// - Whether there is an encapsulated transport protocol payload (e.g. ARP
-	//   does not encapsulate anything).
-	// - Whether pkt.Data was large enough to parse and set pkt.NetworkHeader.
+	//	- The encapsulated protocol, if present.
+	//	- Whether there is an encapsulated transport protocol payload (e.g. ARP
+	//		does not encapsulate anything).
+	//	- Whether pkt.Data was large enough to parse and set pkt.NetworkHeader.
 	Parse(pkt *PacketBuffer) (proto tcpip.TransportProtocolNumber, hasTransportHdr bool, ok bool)
+}
+
+// UnicastSourceAndMulticastDestination is a tuple that represents a unicast
+// source address and a multicast destination address.
+type UnicastSourceAndMulticastDestination struct {
+	// Source represents a unicast source address.
+	Source tcpip.Address
+	// Destination represents a multicast destination address.
+	Destination tcpip.Address
+}
+
+// MulticastRouteOutgoingInterface represents an outgoing interface in a
+// multicast route.
+type MulticastRouteOutgoingInterface struct {
+	// ID corresponds to the outgoing NIC.
+	ID tcpip.NICID
+
+	// MinTTL represents the minumum TTL/HopLimit a multicast packet must have to
+	// be sent through the outgoing interface.
+	//
+	// Note: a value of 0 allows all packets to be forwarded.
+	MinTTL uint8
+}
+
+// MulticastRoute is a multicast route.
+type MulticastRoute struct {
+	// ExpectedInputInterface is the interface on which packets using this route
+	// are expected to ingress.
+	ExpectedInputInterface tcpip.NICID
+
+	// OutgoingInterfaces is the set of interfaces that a multicast packet should
+	// be forwarded out of.
+	//
+	// This field should not be empty.
+	OutgoingInterfaces []MulticastRouteOutgoingInterface
+}
+
+// MulticastForwardingNetworkProtocol is the interface that needs to be
+// implemented by the network protocols that support multicast forwarding.
+type MulticastForwardingNetworkProtocol interface {
+	NetworkProtocol
+
+	// AddMulticastRoute adds a route to the multicast routing table such that
+	// packets matching the addresses will be forwarded using the provided route.
+	//
+	// Returns an error if the addresses or route is invalid.
+	AddMulticastRoute(UnicastSourceAndMulticastDestination, MulticastRoute) tcpip.Error
+
+	// RemoveMulticastRoute removes the route matching the provided addresses
+	// from the multicast routing table.
+	//
+	// Returns an error if the addresses are invalid or a matching route is not
+	// found.
+	RemoveMulticastRoute(UnicastSourceAndMulticastDestination) tcpip.Error
+
+	// MulticastRouteLastUsedTime returns a monotonic timestamp that
+	// represents the last time that the route matching the provided addresses
+	// was used or updated.
+	//
+	// Returns an error if the addresses are invalid or a matching route was not
+	// found.
+	MulticastRouteLastUsedTime(UnicastSourceAndMulticastDestination) (tcpip.MonotonicTime, tcpip.Error)
+
+	// EnableMulticastForwarding enables multicast forwarding for the protocol.
+	//
+	// Returns an error if the provided multicast forwarding event dispatcher is
+	// nil. Otherwise, returns true if the multicast forwarding was already
+	// enabled.
+	EnableMulticastForwarding(MulticastForwardingEventDispatcher) (bool, tcpip.Error)
+
+	// DisableMulticastForwarding disables multicast forwarding for the protocol.
+	DisableMulticastForwarding()
+}
+
+// MulticastPacketContext is the context in which a multicast packet triggered
+// a multicast forwarding event.
+type MulticastPacketContext struct {
+	// SourceAndDestination contains the unicast source address and the multicast
+	// destination address found in the relevant multicast packet.
+	SourceAndDestination UnicastSourceAndMulticastDestination
+	// InputInterface is the interface on which the relevant multicast packet
+	// arrived.
+	InputInterface tcpip.NICID
+}
+
+// MulticastForwardingEventDispatcher is the interface that integrators should
+// implement to handle multicast routing events.
+type MulticastForwardingEventDispatcher interface {
+	// OnMissingRoute is called when an incoming multicast packet does not match
+	// any installed route.
+	//
+	// The packet that triggered this event may be queued so that it can be
+	// transmitted once a route is installed. Even then, it may still be dropped
+	// as per the routing table's GC/eviction policy.
+	OnMissingRoute(MulticastPacketContext)
+
+	// OnUnexpectedInputInterface is called when a multicast packet arrives at an
+	// interface that does not match the installed route's expected input
+	// interface.
+	//
+	// This may be an indication of a routing loop. The packet that triggered
+	// this event is dropped without being forwarded.
+	OnUnexpectedInputInterface(context MulticastPacketContext, expectedInputInterface tcpip.NICID)
 }
 
 // NetworkDispatcher contains the methods used by the network stack to deliver
@@ -1044,9 +1168,9 @@ const (
 	GSOTCPv4
 	GSOTCPv6
 
-	// GSOSW is used for software GSO segments which have to be sent by
+	// GSOGvisor is used for gVisor GSO segments which have to be sent by
 	// endpoint.WritePackets.
-	GSOSW
+	GSOGvisor
 )
 
 // GSO contains generic segmentation offload properties.
@@ -1069,20 +1193,22 @@ type GSO struct {
 	MaxSize uint32
 }
 
-// SupportedGSO returns the type of segmentation offloading supported.
+// SupportedGSO is the type of segmentation offloading supported.
 type SupportedGSO int
 
 const (
 	// GSONotSupported indicates that segmentation offloading is not supported.
 	GSONotSupported SupportedGSO = iota
 
-	// HWGSOSupported indicates that segmentation offloading may be performed by
-	// the hardware.
-	HWGSOSupported
+	// HostGSOSupported indicates that segmentation offloading may be performed
+	// by the host. This is typically true when netstack is attached to a host
+	// AF_PACKET socket, and not true when attached to a unix socket or other
+	// non-networking data layer.
+	HostGSOSupported
 
-	// SWGSOSupported indicates that segmentation offloading may be performed in
-	// software.
-	SWGSOSupported
+	// GvisorGSOSupported indicates that segmentation offloading may be performed
+	// in gVisor.
+	GvisorGSOSupported
 )
 
 // GSOEndpoint provides access to GSO properties.
@@ -1094,6 +1220,6 @@ type GSOEndpoint interface {
 	SupportedGSO() SupportedGSO
 }
 
-// SoftwareGSOMaxSize is a maximum allowed size of a software GSO segment.
+// GvisorGSOMaxSize is a maximum allowed size of a software GSO segment.
 // This isn't a hard limit, because it is never set into packet headers.
-const SoftwareGSOMaxSize = 1 << 16
+const GvisorGSOMaxSize = 1 << 16

@@ -18,15 +18,15 @@
 //
 // Lock order:
 //
-// directoryFD.mu / regularFileFD.mu
-//   filesystem.renameMu
-//     dentry.dirMu
-//       dentry.copyMu
-//         filesystem.devMu
-//         *** "memmap.Mappable locks" below this point
-//         dentry.mapsMu
-//           *** "memmap.Mappable locks taken by Translate" below this point
-//           dentry.dataMu
+//	directoryFD.mu / regularFileFD.mu
+//		filesystem.renameMu
+//			dentry.dirMu
+//		    dentry.copyMu
+//		      filesystem.devMu
+//		      *** "memmap.Mappable locks" below this point
+//		      dentry.mapsMu
+//		        *** "memmap.Mappable locks taken by Translate" below this point
+//		        dentry.dataMu
 //
 // Locking dentry.dirMu in multiple dentries requires that parent dentries are
 // locked before child dentries, and that filesystem.renameMu is locked to
@@ -36,9 +36,9 @@ package overlay
 import (
 	"fmt"
 	"strings"
-	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fspath"
@@ -97,35 +97,46 @@ type filesystem struct {
 	// used for accesses to the filesystem's layers. creds is immutable.
 	creds *auth.Credentials
 
-	// privateDevMinors maps device numbers from layer filesystems to device
-	// minor numbers assigned to files originating from that filesystem.
-	//
-	// For non-directory files, this remapping is necessary for lower layers
-	// because a file on a lower layer, and that same file on an overlay, are
-	// distinguishable because they will diverge after copy-up. (Once a
-	// non-directory file has been copied up, its contents on the upper layer
-	// completely determine its contents in the overlay, so this is no longer
-	// true; but we still do the mapping for consistency.)
-	//
-	// For directories, this remapping may be necessary even if the directory
-	// exists on the upper layer due to directory merging; rather than make the
-	// mapping conditional on whether the directory is opaque, we again
-	// unconditionally apply the mapping unconditionally.
-	//
-	// privateDevMinors is protected by devMu.
-	devMu            sync.Mutex `state:"nosave"`
-	privateDevMinors map[layerDevNumber]uint32
+	// dirDevMinor is the device minor number used for directories. dirDevMinor
+	// is immutable.
+	dirDevMinor uint32
+
+	// lowerDevMinors maps device numbers from lower layer filesystems to
+	// device minor numbers assigned to non-directory files originating from
+	// that filesystem. (This remapping is necessary for lower layers because a
+	// file on a lower layer, and that same file on an overlay, are
+	// distinguishable because they will diverge after copy-up; this isn't true
+	// for non-directory files already on the upper layer.) lowerDevMinors is
+	// protected by devMu.
+	devMu          devMutex `state:"nosave"`
+	lowerDevMinors map[layerDevNumber]uint32
 
 	// renameMu synchronizes renaming with non-renaming operations in order to
 	// ensure consistent lock ordering between dentry.dirMu in different
 	// dentries.
-	renameMu sync.RWMutex `state:"nosave"`
+	renameMu renameRWMutex `state:"nosave"`
+
+	// dirInoCache caches overlay-private directory inode numbers by mapped
+	// bottommost device numbers and inode number. dirInoCache is protected by
+	// dirInoCacheMu.
+	dirInoCacheMu dirInoCacheMutex `state:"nosave"`
+	dirInoCache   map[layerDevNoAndIno]uint64
+
+	// lastDirIno is the last inode number assigned to a directory. lastDirIno
+	// is protected by dirInoCacheMu.
+	lastDirIno uint64
 }
 
 // +stateify savable
 type layerDevNumber struct {
 	major uint32
 	minor uint32
+}
+
+// +stateify savable
+type layerDevNoAndIno struct {
+	layerDevNumber
+	ino uint64
 }
 
 // GetFilesystem implements vfs.FilesystemType.GetFilesystem.
@@ -233,6 +244,12 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		return nil, nil, linuxerr.EINVAL
 	}
 
+	// Allocate dirDevMinor. lowerDevMinors are allocated dynamically.
+	dirDevMinor, err := vfsObj.GetAnonBlockDevMinor()
+	if err != nil {
+		return nil, nil, err
+	}
+
 	// Take extra references held by the filesystem.
 	if fsopts.UpperRoot.Ok() {
 		fsopts.UpperRoot.IncRef()
@@ -242,18 +259,20 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	}
 
 	fs := &filesystem{
-		opts:             fsopts,
-		creds:            creds.Fork(),
-		privateDevMinors: make(map[layerDevNumber]uint32),
+		opts:           fsopts,
+		creds:          creds.Fork(),
+		dirDevMinor:    dirDevMinor,
+		lowerDevMinors: make(map[layerDevNumber]uint32),
+		dirInoCache:    make(map[layerDevNoAndIno]uint64),
 	}
 	fs.vfsfs.Init(vfsObj, &fstype, fs)
 
 	// Construct the root dentry.
 	root := fs.newDentry()
-	root.refs = 1
+	root.refs = atomicbitops.FromInt64(1)
 	if fs.opts.UpperRoot.Ok() {
 		fs.opts.UpperRoot.IncRef()
-		root.copiedUp = 1
+		root.copiedUp = atomicbitops.FromUint32(1)
 		root.upperVD = fs.opts.UpperRoot
 	}
 	for _, lowerRoot := range fs.opts.LowerRoots {
@@ -285,19 +304,31 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		fs.vfsfs.DecRef(ctx)
 		return nil, nil, linuxerr.EINVAL
 	}
-	root.mode = uint32(rootStat.Mode)
-	root.uid = rootStat.UID
-	root.gid = rootStat.GID
-	root.devMajor = linux.UNNAMED_MAJOR
-	rootDevMinor, err := fs.getPrivateDevMinor(rootStat.DevMajor, rootStat.DevMinor)
-	if err != nil {
-		ctx.Infof("overlay.FilesystemType.GetFilesystem: failed to get device number for root: %v", err)
-		root.destroyLocked(ctx)
-		fs.vfsfs.DecRef(ctx)
-		return nil, nil, err
+	root.mode = atomicbitops.FromUint32(uint32(rootStat.Mode))
+	root.uid = atomicbitops.FromUint32(rootStat.UID)
+	root.gid = atomicbitops.FromUint32(rootStat.GID)
+	if rootStat.Mode&linux.S_IFMT == linux.S_IFDIR {
+		root.devMajor = atomicbitops.FromUint32(linux.UNNAMED_MAJOR)
+		root.devMinor = atomicbitops.FromUint32(fs.dirDevMinor)
+		// For root dir, it is okay to use top most level's stat to compute inode
+		// number because we don't allow copy ups on root dentries.
+		root.ino.Store(fs.newDirIno(rootStat.DevMajor, rootStat.DevMinor, rootStat.Ino))
+	} else if !root.upperVD.Ok() {
+		root.devMajor = atomicbitops.FromUint32(linux.UNNAMED_MAJOR)
+		rootDevMinor, err := fs.getLowerDevMinor(rootStat.DevMajor, rootStat.DevMinor)
+		if err != nil {
+			ctx.Infof("overlay.FilesystemType.GetFilesystem: failed to get device number for root: %v", err)
+			root.destroyLocked(ctx)
+			fs.vfsfs.DecRef(ctx)
+			return nil, nil, err
+		}
+		root.devMinor = atomicbitops.FromUint32(rootDevMinor)
+		root.ino.Store(rootStat.Ino)
+	} else {
+		root.devMajor = atomicbitops.FromUint32(rootStat.DevMajor)
+		root.devMinor = atomicbitops.FromUint32(rootStat.DevMinor)
+		root.ino.Store(rootStat.Ino)
 	}
-	root.devMinor = rootDevMinor
-	root.ino = rootStat.Ino
 
 	return &fs.vfsfs, &root.vfsd, nil
 }
@@ -325,8 +356,9 @@ func clonePrivateMount(vfsObj *vfs.VirtualFilesystem, vd vfs.VirtualDentry, forc
 // Release implements vfs.FilesystemImpl.Release.
 func (fs *filesystem) Release(ctx context.Context) {
 	vfsObj := fs.vfsfs.VirtualFilesystem()
-	for _, devMinor := range fs.privateDevMinors {
-		vfsObj.PutAnonBlockDevMinor(devMinor)
+	vfsObj.PutAnonBlockDevMinor(fs.dirDevMinor)
+	for _, lowerDevMinor := range fs.lowerDevMinors {
+		vfsObj.PutAnonBlockDevMinor(lowerDevMinor)
 	}
 	if fs.opts.UpperRoot.Ok() {
 		fs.opts.UpperRoot.DecRef(ctx)
@@ -356,18 +388,34 @@ func (fs *filesystem) statFS(ctx context.Context) (linux.Statfs, error) {
 	return fsstat, nil
 }
 
-func (fs *filesystem) getPrivateDevMinor(layerMajor, layerMinor uint32) (uint32, error) {
+func (fs *filesystem) newDirIno(layerMajor, layerMinor uint32, layerIno uint64) uint64 {
+	fs.dirInoCacheMu.Lock()
+	defer fs.dirInoCacheMu.Unlock()
+	orig := layerDevNoAndIno{
+		layerDevNumber: layerDevNumber{layerMajor, layerMinor},
+		ino:            layerIno,
+	}
+	if ino, ok := fs.dirInoCache[orig]; ok {
+		return ino
+	}
+	fs.lastDirIno++
+	newIno := fs.lastDirIno
+	fs.dirInoCache[orig] = newIno
+	return newIno
+}
+
+func (fs *filesystem) getLowerDevMinor(layerMajor, layerMinor uint32) (uint32, error) {
 	fs.devMu.Lock()
 	defer fs.devMu.Unlock()
 	orig := layerDevNumber{layerMajor, layerMinor}
-	if minor, ok := fs.privateDevMinors[orig]; ok {
+	if minor, ok := fs.lowerDevMinors[orig]; ok {
 		return minor, nil
 	}
 	minor, err := fs.vfsfs.VirtualFilesystem().GetAnonBlockDevMinor()
 	if err != nil {
 		return 0, err
 	}
-	fs.privateDevMinors[orig] = minor
+	fs.lowerDevMinors[orig] = minor
 	return minor, nil
 }
 
@@ -377,7 +425,7 @@ func (fs *filesystem) getPrivateDevMinor(layerMajor, layerMinor uint32) (uint32,
 type dentry struct {
 	vfsd vfs.Dentry
 
-	refs int64
+	refs atomicbitops.Int64
 
 	// fs is the owning filesystem. fs is immutable.
 	fs *filesystem
@@ -385,14 +433,14 @@ type dentry struct {
 	// mode, uid, and gid are the file mode, owner, and group of the file in
 	// the topmost layer (and therefore the overlay file as well), and are used
 	// for permission checks on this dentry. These fields are protected by
-	// copyMu and accessed using atomic memory operations.
-	mode uint32
-	uid  uint32
-	gid  uint32
+	// copyMu.
+	mode atomicbitops.Uint32
+	uid  atomicbitops.Uint32
+	gid  atomicbitops.Uint32
 
 	// copiedUp is 1 if this dentry has been copied-up (i.e. upperVD.Ok()) and
-	// 0 otherwise. copiedUp is accessed using atomic memory operations.
-	copiedUp uint32
+	// 0 otherwise.
+	copiedUp atomicbitops.Uint32
 
 	// parent is the dentry corresponding to this dentry's parent directory.
 	// name is this dentry's name in parent. If this dentry is a filesystem
@@ -406,7 +454,7 @@ type dentry struct {
 	// and dirents (if not nil) is a cache of dirents as returned by
 	// directoryFDs representing this directory. children is protected by
 	// dirMu.
-	dirMu    sync.Mutex `state:"nosave"`
+	dirMu    dirMutex `state:"nosave"`
 	children map[string]*dentry
 	dirents  []vfs.Dirent
 
@@ -425,40 +473,39 @@ type dentry struct {
 	inlineLowerVDs [1]vfs.VirtualDentry
 
 	// devMajor, devMinor, and ino are the device major/minor and inode numbers
-	// used by this dentry. These fields are protected by copyMu and accessed
-	// using atomic memory operations.
-	devMajor uint32
-	devMinor uint32
-	ino      uint64
+	// used by this dentry. These fields are protected by copyMu.
+	devMajor atomicbitops.Uint32
+	devMinor atomicbitops.Uint32
+	ino      atomicbitops.Uint64
 
 	// If this dentry represents a regular file, then:
 	//
-	// - mapsMu is used to synchronize between copy-up and memmap.Mappable
-	// methods on dentry preceding mm.MemoryManager.activeMu in the lock order.
+	//	- mapsMu is used to synchronize between copy-up and memmap.Mappable
+	//		methods on dentry preceding mm.MemoryManager.activeMu in the lock order.
 	//
-	// - dataMu is used to synchronize between copy-up and
-	// dentry.(memmap.Mappable).Translate.
+	//	- dataMu is used to synchronize between copy-up and
+	//		dentry.(memmap.Mappable).Translate.
 	//
-	// - lowerMappings tracks memory mappings of the file. lowerMappings is
-	// used to invalidate mappings of the lower layer when the file is copied
-	// up to ensure that they remain coherent with subsequent writes to the
-	// file. (Note that, as of this writing, Linux overlayfs does not do this;
-	// this feature is a gVisor extension.) lowerMappings is protected by
-	// mapsMu.
+	//	- lowerMappings tracks memory mappings of the file. lowerMappings is
+	//		used to invalidate mappings of the lower layer when the file is copied
+	//		up to ensure that they remain coherent with subsequent writes to the
+	//		file. (Note that, as of this writing, Linux overlayfs does not do this;
+	//		this feature is a gVisor extension.) lowerMappings is protected by
+	//		mapsMu.
 	//
-	// - If this dentry is copied-up, then wrappedMappable is the Mappable
-	// obtained from a call to the current top layer's
-	// FileDescription.ConfigureMMap(). Once wrappedMappable becomes non-nil
-	// (from a call to regularFileFD.ensureMappable()), it cannot become nil.
-	// wrappedMappable is protected by mapsMu and dataMu.
+	//	- If this dentry is copied-up, then wrappedMappable is the Mappable
+	//		obtained from a call to the current top layer's
+	//		FileDescription.ConfigureMMap(). Once wrappedMappable becomes non-nil
+	//		(from a call to regularFileFD.ensureMappable()), it cannot become nil.
+	//		wrappedMappable is protected by mapsMu and dataMu.
 	//
-	// - isMappable is non-zero iff wrappedMappable is non-nil. isMappable is
-	// accessed using atomic memory operations.
-	mapsMu          sync.Mutex `state:"nosave"`
+	//	- isMappable is non-zero iff wrappedMappable is non-nil. isMappable is
+	//		accessed using atomic memory operations.
+	mapsMu          mapsMutex `state:"nosave"`
 	lowerMappings   memmap.MappingSet
-	dataMu          sync.RWMutex `state:"nosave"`
+	dataMu          dataRWMutex `state:"nosave"`
 	wrappedMappable memmap.Mappable
-	isMappable      uint32
+	isMappable      atomicbitops.Uint32
 
 	locks vfs.FileLocks
 
@@ -488,7 +535,7 @@ func (fs *filesystem) newDentry() *dentry {
 func (d *dentry) IncRef() {
 	// d.refs may be 0 if d.fs.renameMu is locked, which serializes against
 	// d.checkDropLocked().
-	r := atomic.AddInt64(&d.refs, 1)
+	r := d.refs.Add(1)
 	if d.LogRefs() {
 		refsvfs2.LogIncRef(d, r)
 	}
@@ -497,11 +544,11 @@ func (d *dentry) IncRef() {
 // TryIncRef implements vfs.DentryImpl.TryIncRef.
 func (d *dentry) TryIncRef() bool {
 	for {
-		r := atomic.LoadInt64(&d.refs)
+		r := d.refs.Load()
 		if r <= 0 {
 			return false
 		}
-		if atomic.CompareAndSwapInt64(&d.refs, r, r+1) {
+		if d.refs.CompareAndSwap(r, r+1) {
 			if d.LogRefs() {
 				refsvfs2.LogTryIncRef(d, r+1)
 			}
@@ -512,7 +559,7 @@ func (d *dentry) TryIncRef() bool {
 
 // DecRef implements vfs.DentryImpl.DecRef.
 func (d *dentry) DecRef(ctx context.Context) {
-	r := atomic.AddInt64(&d.refs, -1)
+	r := d.refs.Add(-1)
 	if d.LogRefs() {
 		refsvfs2.LogDecRef(d, r)
 	}
@@ -526,7 +573,7 @@ func (d *dentry) DecRef(ctx context.Context) {
 }
 
 func (d *dentry) decRefLocked(ctx context.Context) {
-	r := atomic.AddInt64(&d.refs, -1)
+	r := d.refs.Add(-1)
 	if d.LogRefs() {
 		refsvfs2.LogDecRef(d, r)
 	}
@@ -547,7 +594,7 @@ func (d *dentry) checkDropLocked(ctx context.Context) {
 	// resolution, which requires renameMu, so if d.refs is zero then it will
 	// remain zero while we hold renameMu for writing.) Dentries with a
 	// negative reference count have already been destroyed.
-	if atomic.LoadInt64(&d.refs) != 0 {
+	if d.refs.Load() != 0 {
 		return
 	}
 
@@ -566,13 +613,13 @@ func (d *dentry) checkDropLocked(ctx context.Context) {
 // destroyLocked destroys the dentry.
 //
 // Preconditions:
-// * d.fs.renameMu must be locked for writing.
-// * d.refs == 0.
+//   - d.fs.renameMu must be locked for writing.
+//   - d.refs == 0.
 func (d *dentry) destroyLocked(ctx context.Context) {
-	switch atomic.LoadInt64(&d.refs) {
+	switch d.refs.Load() {
 	case 0:
 		// Mark the dentry destroyed.
-		atomic.StoreInt64(&d.refs, -1)
+		d.refs.Store(-1)
 	case -1:
 		panic("overlay.dentry.destroyLocked() called on already destroyed dentry")
 	default:
@@ -608,7 +655,7 @@ func (d *dentry) RefType() string {
 
 // LeakMessage implements refsvfs2.CheckedObject.LeakMessage.
 func (d *dentry) LeakMessage() string {
-	return fmt.Sprintf("[overlay.dentry %p] reference count of %d instead of -1", d, atomic.LoadInt64(&d.refs))
+	return fmt.Sprintf("[overlay.dentry %p] reference count of %d instead of -1", d, d.refs.Load())
 }
 
 // LogRefs implements refsvfs2.CheckedObject.LogRefs.
@@ -645,7 +692,7 @@ func (d *dentry) Watches() *vfs.Watches {
 
 // OnZeroWatches implements vfs.DentryImpl.OnZeroWatches.
 func (d *dentry) OnZeroWatches(ctx context.Context) {
-	if atomic.LoadInt64(&d.refs) == 0 {
+	if d.refs.Load() == 0 {
 		d.fs.renameMu.Lock()
 		d.checkDropLocked(ctx)
 		d.fs.renameMu.Unlock()
@@ -687,13 +734,13 @@ func (d *dentry) topLookupLayer() lookupLayer {
 }
 
 func (d *dentry) checkPermissions(creds *auth.Credentials, ats vfs.AccessTypes) error {
-	return vfs.GenericCheckPermissions(creds, ats, linux.FileMode(atomic.LoadUint32(&d.mode)), auth.KUID(atomic.LoadUint32(&d.uid)), auth.KGID(atomic.LoadUint32(&d.gid)))
+	return vfs.GenericCheckPermissions(creds, ats, linux.FileMode(d.mode.Load()), auth.KUID(d.uid.Load()), auth.KGID(d.gid.Load()))
 }
 
 func (d *dentry) checkXattrPermissions(creds *auth.Credentials, name string, ats vfs.AccessTypes) error {
-	mode := linux.FileMode(atomic.LoadUint32(&d.mode))
-	kuid := auth.KUID(atomic.LoadUint32(&d.uid))
-	kgid := auth.KGID(atomic.LoadUint32(&d.gid))
+	mode := linux.FileMode(d.mode.Load())
+	kuid := auth.KUID(d.uid.Load())
+	kgid := auth.KGID(d.gid.Load())
 	if err := vfs.GenericCheckPermissions(creds, ats, mode, kuid, kgid); err != nil {
 		return err
 	}
@@ -715,34 +762,34 @@ func (d *dentry) statInternalTo(ctx context.Context, opts *vfs.StatOptions, stat
 		// and some of our tests expect this.
 		stat.Nlink = 2
 	}
-	stat.UID = atomic.LoadUint32(&d.uid)
-	stat.GID = atomic.LoadUint32(&d.gid)
-	stat.Mode = uint16(atomic.LoadUint32(&d.mode))
-	stat.Ino = atomic.LoadUint64(&d.ino)
-	stat.DevMajor = atomic.LoadUint32(&d.devMajor)
-	stat.DevMinor = atomic.LoadUint32(&d.devMinor)
+	stat.UID = d.uid.Load()
+	stat.GID = d.gid.Load()
+	stat.Mode = uint16(d.mode.Load())
+	stat.Ino = d.ino.Load()
+	stat.DevMajor = d.devMajor.Load()
+	stat.DevMinor = d.devMinor.Load()
 }
 
 // Preconditions: d.copyMu must be locked for writing.
 func (d *dentry) updateAfterSetStatLocked(opts *vfs.SetStatOptions) {
 	if opts.Stat.Mask&linux.STATX_MODE != 0 {
-		atomic.StoreUint32(&d.mode, (d.mode&linux.S_IFMT)|uint32(opts.Stat.Mode&^linux.S_IFMT))
+		d.mode.Store((d.mode.RacyLoad() & linux.S_IFMT) | uint32(opts.Stat.Mode&^linux.S_IFMT))
 	}
 	if opts.Stat.Mask&linux.STATX_UID != 0 {
-		atomic.StoreUint32(&d.uid, opts.Stat.UID)
+		d.uid.Store(opts.Stat.UID)
 	}
 	if opts.Stat.Mask&linux.STATX_GID != 0 {
-		atomic.StoreUint32(&d.gid, opts.Stat.GID)
+		d.gid.Store(opts.Stat.GID)
 	}
 }
 
 func (d *dentry) mayDelete(creds *auth.Credentials, child *dentry) error {
 	return vfs.CheckDeleteSticky(
 		creds,
-		linux.FileMode(atomic.LoadUint32(&d.mode)),
-		auth.KUID(atomic.LoadUint32(&d.uid)),
-		auth.KUID(atomic.LoadUint32(&child.uid)),
-		auth.KGID(atomic.LoadUint32(&child.gid)),
+		linux.FileMode(d.mode.Load()),
+		auth.KUID(d.uid.Load()),
+		auth.KUID(child.uid.Load()),
+		auth.KGID(child.gid.Load()),
 	)
 }
 
@@ -757,8 +804,8 @@ func (d *dentry) newChildOwnerStat(mode linux.FileMode, creds *auth.Credentials)
 	// Set GID and possibly the SGID bit if the parent is an SGID directory.
 	d.copyMu.RLock()
 	defer d.copyMu.RUnlock()
-	if atomic.LoadUint32(&d.mode)&linux.ModeSetGID == linux.ModeSetGID {
-		stat.GID = atomic.LoadUint32(&d.gid)
+	if d.mode.Load()&linux.ModeSetGID == linux.ModeSetGID {
+		stat.GID = d.gid.Load()
 		if stat.Mode&linux.ModeDirectory == linux.ModeDirectory {
 			stat.Mode = uint16(mode) | linux.ModeSetGID
 			stat.Mask |= linux.STATX_MODE

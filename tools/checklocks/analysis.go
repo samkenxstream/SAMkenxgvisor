@@ -268,6 +268,10 @@ func (pc *passContext) checkGuards(inst almostInst, from ssa.Value, accessObj ty
 			pc.maybeFail(inst.Pos(), "non-atomic write of field %s, writes must still be atomic with locks held (locks: %s)", accessObj.Name(), ls.String())
 		}
 	case atomicDisallow:
+		// If atomic analysis is not enabled, skip.
+		if !enableAtomic {
+			break
+		}
 		// Check that this is *not* used atomically.
 		if refs := inst.Referrers(); refs != nil {
 			for _, otherInst := range *refs {
@@ -322,9 +326,17 @@ func (pc *passContext) checkFieldAccess(inst almostInst, structObj ssa.Value, fi
 	pc.checkGuards(inst, structObj, fieldObj, ls, isWrite)
 }
 
+// noReferrers wraps an instruction as an almostInst.
+type noReferrers struct {
+	ssa.Instruction
+}
+
+// Referrers implements almostInst.Referrers.
+func (noReferrers) Referrers() *[]ssa.Instruction { return nil }
+
 // checkGlobalAccess checks the validity of a global access.
-func (pc *passContext) checkGlobalAccess(g *ssa.Global, ls *lockState, isWrite bool) {
-	pc.checkGuards(g, g, g.Object(), ls, isWrite)
+func (pc *passContext) checkGlobalAccess(inst ssa.Instruction, g *ssa.Global, ls *lockState, isWrite bool) {
+	pc.checkGuards(noReferrers{inst}, g, g.Object(), ls, isWrite)
 }
 
 func (pc *passContext) checkCall(call callCommon, lff *lockFunctionFacts, ls *lockState) {
@@ -474,11 +486,12 @@ func (pc *passContext) checkFunctionCall(call callCommon, fn *types.Func, lff *l
 
 	// Check if it's a method dispatch for something in the sync package.
 	// See: https://godoc.org/golang.org/x/tools/go/ssa#Function
-	if fn.Pkg() != nil && fn.Pkg().Name() == "sync" && len(args) > 0 {
+
+	if (lockerRE.MatchString(fn.FullName()) || mutexRE.MatchString(fn.FullName())) && len(args) > 0 {
 		rv := makeResolvedValue(args[0], nil)
 		isExclusive := false
 		switch fn.Name() {
-		case "Lock":
+		case "Lock", "NestedLock":
 			isExclusive = true
 			fallthrough
 		case "RLock":
@@ -488,7 +501,7 @@ func (pc *passContext) checkFunctionCall(call callCommon, fn *types.Func, lff *l
 					pc.maybeFail(call.Pos(), "%s already locked (locks: %s)", s, ls.String())
 				}
 			}
-		case "Unlock":
+		case "Unlock", "NestedUnlock":
 			isExclusive = true
 			fallthrough
 		case "RUnlock":
@@ -591,7 +604,7 @@ func (pc *passContext) checkInstruction(inst ssa.Instruction, lff *lockFunctionF
 			continue
 		}
 		_, isWrite := inst.(*ssa.Store)
-		pc.checkGlobalAccess(g, ls, isWrite)
+		pc.checkGlobalAccess(inst, g, ls, isWrite)
 	}
 
 	// Process the instruction.

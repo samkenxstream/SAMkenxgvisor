@@ -15,9 +15,9 @@
 // Package raw provides the implementation of raw sockets (see raw(7)). Raw
 // sockets allow applications to:
 //
-//   * manually write and inspect transport layer headers and payloads
-//   * receive all traffic of a given transport protocol (e.g. ICMP or UDP)
-//   * optionally write and inspect network layer headers of packets
+//   - manually write and inspect transport layer headers and payloads
+//   - receive all traffic of a given transport protocol (e.g. ICMP or UDP)
+//   - optionally write and inspect network layer headers of packets
 //
 // Raw sockets don't have any notion of ports, and incoming packets are
 // demultiplexed solely by protocol number. Thus, a raw UDP endpoint will
@@ -30,9 +30,9 @@ import (
 	"io"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport"
@@ -45,8 +45,8 @@ type rawPacket struct {
 	rawPacketEntry
 	// data holds the actual packet data, including any headers and
 	// payload.
-	data       buffer.VectorisedView `state:".(buffer.VectorisedView)"`
-	receivedAt time.Time             `state:".(int64)"`
+	data       *stack.PacketBuffer
+	receivedAt time.Time `state:".(int64)"`
 	// senderAddr is the network address of the sender.
 	senderAddr tcpip.FullAddress
 	packetInfo tcpip.IPPacketInfo
@@ -62,8 +62,9 @@ type rawPacket struct {
 // have goroutines make concurrent calls into the endpoint.
 //
 // Lock order:
-//   endpoint.mu
-//     endpoint.rcvMu
+//
+//	endpoint.mu
+//	  endpoint.rcvMu
 //
 // +stateify savable
 type endpoint struct {
@@ -130,10 +131,11 @@ func newEndpoint(s *stack.Stack, netProto tcpip.NetworkProtocolNumber, transProt
 		ipv6ChecksumOffset: ipv6ChecksumOffset,
 	}
 	e.ops.InitHandler(e, e.stack, tcpip.GetStackSendBufferLimits, tcpip.GetStackReceiveBufferLimits)
+	e.ops.SetMulticastLoop(true)
 	e.ops.SetHeaderIncluded(!associated)
 	e.ops.SetSendBufferSize(32*1024, false /* notify */)
 	e.ops.SetReceiveBufferSize(32*1024, false /* notify */)
-	e.net.Init(s, netProto, transProto, &e.ops)
+	e.net.Init(s, netProto, transProto, &e.ops, waiterQueue)
 
 	// Override with stack defaults.
 	var ss tcpip.SendBufferSizeOption
@@ -160,6 +162,11 @@ func newEndpoint(s *stack.Stack, netProto tcpip.NetworkProtocolNumber, transProt
 	}
 
 	return e, nil
+}
+
+// WakeupWriters implements tcpip.SocketOptionsHandler.
+func (e *endpoint) WakeupWriters() {
+	e.net.MaybeSignalWritable()
 }
 
 // HasNIC implements tcpip.SocketOptionsHandler.
@@ -196,7 +203,9 @@ func (e *endpoint) Close() {
 	e.rcvClosed = true
 	e.rcvBufSize = 0
 	for !e.rcvList.Empty() {
-		e.rcvList.Remove(e.rcvList.Front())
+		p := e.rcvList.Front()
+		e.rcvList.Remove(p)
+		p.data.DecRef()
 	}
 
 	e.waiterQueue.Notify(waiter.EventHUp | waiter.EventErr | waiter.ReadableEvents | waiter.WritableEvents)
@@ -228,7 +237,8 @@ func (e *endpoint) Read(dst io.Writer, opts tcpip.ReadOptions) (tcpip.ReadResult
 	pkt := e.rcvList.Front()
 	if !opts.Peek {
 		e.rcvList.Remove(pkt)
-		e.rcvBufSize -= pkt.data.Size()
+		defer pkt.data.DecRef()
+		e.rcvBufSize -= pkt.data.Data().Size()
 	}
 
 	e.rcvMu.Unlock()
@@ -276,14 +286,14 @@ func (e *endpoint) Read(dst io.Writer, opts tcpip.ReadOptions) (tcpip.ReadResult
 	}
 
 	res := tcpip.ReadResult{
-		Total:           pkt.data.Size(),
+		Total:           pkt.data.Data().Size(),
 		ControlMessages: cm,
 	}
 	if opts.NeedRemoteAddr {
 		res.RemoteAddr = pkt.senderAddr
 	}
 
-	n, err := pkt.data.ReadTo(dst, opts.Peek)
+	n, err := pkt.data.Data().ReadTo(dst, opts.Peek)
 	if n == 0 && err != nil {
 		return res, &tcpip.ErrBadBuffer{}
 	}
@@ -335,6 +345,10 @@ func (e *endpoint) write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, tcp
 		return 0, err
 	}
 
+	if p.Len() > int(ctx.MTU()) {
+		return 0, &tcpip.ErrMessageTooLong{}
+	}
+
 	// TODO(https://gvisor.dev/issue/6538): Avoid this allocation.
 	payloadBytes := make([]byte, p.Len())
 	if _, err := io.ReadFull(p, payloadBytes); err != nil {
@@ -353,10 +367,10 @@ func (e *endpoint) write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, tcp
 		header.PutChecksum(payloadBytes[ipv6ChecksumOffset:], ^xsum)
 	}
 
-	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-		ReserveHeaderBytes: int(ctx.PacketInfo().MaxHeaderLength),
-		Data:               buffer.View(payloadBytes).ToVectorisedView(),
-	})
+	pkt := ctx.TryNewPacketBuffer(int(ctx.PacketInfo().MaxHeaderLength), buffer.NewWithData(payloadBytes))
+	if pkt == nil {
+		return 0, &tcpip.ErrWouldBlock{}
+	}
 	defer pkt.DecRef()
 
 	if err := ctx.WritePacket(pkt, e.ops.GetHeaderIncluded()); err != nil {
@@ -443,8 +457,11 @@ func (*endpoint) GetRemoteAddress() (tcpip.FullAddress, tcpip.Error) {
 
 // Readiness implements tcpip.Endpoint.Readiness.
 func (e *endpoint) Readiness(mask waiter.EventMask) waiter.EventMask {
-	// The endpoint is always writable.
-	result := waiter.WritableEvents & mask
+	var result waiter.EventMask
+
+	if e.net.HasSendSpace() {
+		result |= waiter.WritableEvents & mask
+	}
 
 	// Determine whether the endpoint is readable.
 	if (mask & waiter.ReadableEvents) != 0 {
@@ -540,7 +557,7 @@ func (e *endpoint) GetSockOptInt(opt tcpip.SockOptInt) (int, tcpip.Error) {
 		e.rcvMu.Lock()
 		if !e.rcvList.Empty() {
 			p := e.rcvList.Front()
-			v = p.data.Size()
+			v = p.data.Data().Size()
 		}
 		e.rcvMu.Unlock()
 		return v, nil
@@ -654,15 +671,16 @@ func (e *endpoint) HandlePacket(pkt *stack.PacketBuffer) {
 		// TODO(https://gvisor.dev/issue/6517): Avoid the copy once S/R supports
 		// overlapping slices.
 		transportHeader := pkt.TransportHeader().View()
-		var combinedVV buffer.VectorisedView
+		var combinedBuf buffer.Buffer
 		switch info.NetProto {
 		case header.IPv4ProtocolNumber:
 			networkHeader := pkt.NetworkHeader().View()
-			headers := make(buffer.View, 0, len(networkHeader)+len(transportHeader))
+			headers := make([]byte, 0, len(networkHeader)+len(transportHeader))
 			headers = append(headers, networkHeader...)
 			headers = append(headers, transportHeader...)
-			combinedVV = headers.ToVectorisedView()
-			combinedVV.Append(pkt.Data().ExtractVV())
+			combinedBuf = buffer.NewWithData(headers)
+			pktBuf := pkt.Data().AsBuffer()
+			combinedBuf.Merge(&pktBuf)
 		case header.IPv6ProtocolNumber:
 			if e.transProto == header.ICMPv6ProtocolNumber {
 				if len(transportHeader) < header.ICMPv6MinimumSize {
@@ -674,18 +692,19 @@ func (e *endpoint) HandlePacket(pkt *stack.PacketBuffer) {
 				}
 			}
 
-			combinedVV = append(buffer.View(nil), transportHeader...).ToVectorisedView()
-			combinedVV.Append(pkt.Data().ExtractVV())
+			combinedBuf = buffer.NewWithData(transportHeader)
+			pktBuf := pkt.Data().AsBuffer()
+			combinedBuf.Merge(&pktBuf)
 
 			if checksumOffset := e.ipv6ChecksumOffset; checksumOffset >= 0 {
-				vvSize := combinedVV.Size()
-				if vvSize < checksumOffset+header.ChecksumSize {
+				bufSize := int(combinedBuf.Size())
+				if bufSize < checksumOffset+header.ChecksumSize {
 					// Message too small to fit checksum.
 					return false
 				}
 
-				xsum := header.PseudoHeaderChecksum(e.transProto, srcAddr, dstAddr, uint16(vvSize))
-				xsum = header.ChecksumVV(combinedVV, xsum)
+				xsum := header.PseudoHeaderChecksum(e.transProto, srcAddr, dstAddr, uint16(bufSize))
+				xsum = header.ChecksumBuffer(combinedBuf, xsum)
 				if xsum != 0xFFFF {
 					// Invalid checksum.
 					return false
@@ -695,11 +714,11 @@ func (e *endpoint) HandlePacket(pkt *stack.PacketBuffer) {
 			panic(fmt.Sprintf("unrecognized protocol number = %d", info.NetProto))
 		}
 
-		packet.data = combinedVV
+		packet.data = stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: combinedBuf})
 		packet.receivedAt = e.stack.Clock().Now()
 
 		e.rcvList.PushBack(packet)
-		e.rcvBufSize += packet.data.Size()
+		e.rcvBufSize += packet.data.Data().Size()
 		e.stats.PacketsReceived.Increment()
 
 		// Notify waiters that there is data to be read now.

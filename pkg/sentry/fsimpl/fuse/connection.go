@@ -18,6 +18,7 @@ import (
 	"sync"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/log"
@@ -40,9 +41,9 @@ const (
 // connection is the struct by which the sentry communicates with the FUSE server daemon.
 //
 // Lock order:
-// - conn.fd.mu
-// - conn.mu
-// - conn.asyncMu
+//   - conn.fd.mu
+//   - conn.mu
+//   - conn.asyncMu
 //
 // +stateify savable
 type connection struct {
@@ -52,29 +53,29 @@ type connection struct {
 	mu sync.Mutex `state:"nosave"`
 
 	// attributeVersion is the version of connection's attributes.
-	attributeVersion uint64
+	attributeVersion atomicbitops.Uint64
 
 	// We target FUSE 7.23.
 	// The following FUSE_INIT flags are currently unsupported by this implementation:
-	// - FUSE_EXPORT_SUPPORT
-	// - FUSE_POSIX_LOCKS: requires POSIX locks
-	// - FUSE_FLOCK_LOCKS: requires POSIX locks
-	// - FUSE_AUTO_INVAL_DATA: requires page caching eviction
-	// - FUSE_DO_READDIRPLUS/FUSE_READDIRPLUS_AUTO: requires FUSE_READDIRPLUS implementation
-	// - FUSE_ASYNC_DIO
-	// - FUSE_PARALLEL_DIROPS (7.25)
-	// - FUSE_HANDLE_KILLPRIV (7.26)
-	// - FUSE_POSIX_ACL: affects defaultPermissions, posixACL, xattr handler (7.26)
-	// - FUSE_ABORT_ERROR (7.27)
-	// - FUSE_CACHE_SYMLINKS (7.28)
-	// - FUSE_NO_OPENDIR_SUPPORT (7.29)
-	// - FUSE_EXPLICIT_INVAL_DATA: requires page caching eviction (7.30)
-	// - FUSE_MAP_ALIGNMENT (7.31)
+	//	- FUSE_EXPORT_SUPPORT
+	//	- FUSE_POSIX_LOCKS: requires POSIX locks
+	//	- FUSE_FLOCK_LOCKS: requires POSIX locks
+	//	- FUSE_AUTO_INVAL_DATA: requires page caching eviction
+	//	- FUSE_DO_READDIRPLUS/FUSE_READDIRPLUS_AUTO: requires FUSE_READDIRPLUS implementation
+	//	- FUSE_ASYNC_DIO
+	//	- FUSE_PARALLEL_DIROPS (7.25)
+	//	- FUSE_HANDLE_KILLPRIV (7.26)
+	//	- FUSE_POSIX_ACL: affects defaultPermissions, posixACL, xattr handler (7.26)
+	//	- FUSE_ABORT_ERROR (7.27)
+	//	- FUSE_CACHE_SYMLINKS (7.28)
+	//	- FUSE_NO_OPENDIR_SUPPORT (7.29)
+	//	- FUSE_EXPLICIT_INVAL_DATA: requires page caching eviction (7.30)
+	//	- FUSE_MAP_ALIGNMENT (7.31)
 
 	// initialized after receiving FUSE_INIT reply.
 	// Until it's set, suspend sending FUSE requests.
 	// Use SetInitialized() and IsInitialized() for atomic access.
-	initialized int32
+	initialized atomicbitops.Int32
 
 	// initializedChan is used to block requests before initialization.
 	initializedChan chan struct{} `state:".(bool)"`
@@ -109,9 +110,9 @@ type connection struct {
 
 	// Terminology note:
 	//
-	// - `asyncNumMax` is the `MaxBackground` in the FUSE_INIT_IN struct.
+	//	- `asyncNumMax` is the `MaxBackground` in the FUSE_INIT_IN struct.
 	//
-	// - `asyncCongestionThreshold` is the `CongestionThreshold` in the FUSE_INIT_IN struct.
+	//	- `asyncCongestionThreshold` is the `CongestionThreshold` in the FUSE_INIT_IN struct.
 	//
 	// We call the "background" requests in unix term as async requests.
 	// The "async requests" in unix term is our async requests that expect a reply,
@@ -201,6 +202,7 @@ func (conn *connection) loadInitializedChan(closed bool) {
 }
 
 // newFUSEConnection creates a FUSE connection to fuseFD.
+// +checklocks:fuseFD.mu
 func newFUSEConnection(_ context.Context, fuseFD *DeviceFD, opts *filesystemOptions) (*connection, error) {
 	// Mark the device as ready so it can be used.
 	// FIXME(gvisor.dev/issue/4813): fuseFD's fields are accessed without
@@ -209,12 +211,10 @@ func newFUSEConnection(_ context.Context, fuseFD *DeviceFD, opts *filesystemOpti
 
 	// Create the writeBuf for the header to be stored in.
 	hdrLen := uint32((*linux.FUSEHeaderOut)(nil).SizeBytes())
-	fuseFD.mu.Lock()
 	fuseFD.writeBuf = make([]byte, hdrLen)
 	fuseFD.completions = make(map[linux.FUSEOpID]*futureResponse)
 	fuseFD.fullQueueCh = make(chan struct{}, opts.maxActiveRequests)
 	fuseFD.writeCursor = 0
-	fuseFD.mu.Unlock()
 
 	return &connection{
 		fd:                       fuseFD,

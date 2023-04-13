@@ -17,9 +17,9 @@ package gofer
 import (
 	"fmt"
 	"io"
-	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fdnotifier"
@@ -81,8 +81,8 @@ func (fs *filesystem) PrepareSave(ctx context.Context) error {
 }
 
 // Preconditions:
-// * fd represents a pipe.
-// * fd is readable.
+//   - fd represents a pipe.
+//   - fd is readable.
 func (fd *specialFileFD) savePipeData(ctx context.Context) error {
 	fd.bufMu.Lock()
 	defer fd.bufMu.Unlock()
@@ -100,7 +100,7 @@ func (fd *specialFileFD) savePipeData(ctx context.Context) error {
 		}
 	}
 	if len(fd.buf) != 0 {
-		atomic.StoreUint32(&fd.haveBuf, 1)
+		fd.haveBuf.Store(1)
 	}
 	return nil
 }
@@ -149,10 +149,10 @@ func (d *dentry) beforeSave() {
 
 // afterLoad is invoked by stateify.
 func (d *dentry) afterLoad() {
-	d.readFD = -1
-	d.writeFD = -1
-	d.mmapFD = -1
-	if atomic.LoadInt64(&d.refs) != -1 {
+	d.readFD = atomicbitops.FromInt32(-1)
+	d.writeFD = atomicbitops.FromInt32(-1)
+	d.mmapFD = atomicbitops.FromInt32(-1)
+	if d.refs.Load() != -1 {
 		refsvfs2.Register(d)
 	}
 }
@@ -261,11 +261,11 @@ func (d *dentry) restoreFile(ctx context.Context, file p9file, qid p9.QID, attrM
 
 	// Gofers do not preserve QID across checkpoint/restore, so:
 	//
-	// - We must assume that the remote filesystem did not change in a way that
-	// would invalidate dentries, since we can't revalidate dentries by
-	// checking QIDs.
+	//	- We must assume that the remote filesystem did not change in a way that
+	//		would invalidate dentries, since we can't revalidate dentries by
+	//		checking QIDs.
 	//
-	// - We need to associate the new QID.Path with the existing d.ino.
+	//	- We need to associate the new QID.Path with the existing d.ino.
 	d.qidPath = qid.Path
 	d.fs.inoMu.Lock()
 	d.fs.inoByQIDPath[qid.Path] = d.ino
@@ -279,16 +279,16 @@ func (d *dentry) restoreFile(ctx context.Context, file p9file, qid p9.QID, attrM
 			if !attrMask.Size {
 				return vfs.ErrCorruption{fmt.Errorf("gofer.dentry(%q).restoreFile: file size validation failed: file size not available", genericDebugPathname(d))}
 			}
-			if d.size != attr.Size {
-				return vfs.ErrCorruption{fmt.Errorf("gofer.dentry(%q).restoreFile: file size validation failed: size changed from %d to %d", genericDebugPathname(d), d.size, attr.Size)}
+			if d.size.Load() != attr.Size {
+				return vfs.ErrCorruption{fmt.Errorf("gofer.dentry(%q).restoreFile: file size validation failed: size changed from %d to %d", genericDebugPathname(d), d.size.Load(), attr.Size)}
 			}
 		}
 		if opts.ValidateFileModificationTimestamps {
 			if !attrMask.MTime {
 				return vfs.ErrCorruption{fmt.Errorf("gofer.dentry(%q).restoreFile: mtime validation failed: mtime not available", genericDebugPathname(d))}
 			}
-			if want := dentryTimestampFromP9(attr.MTimeSeconds, attr.MTimeNanoSeconds); d.mtime != want {
-				return vfs.ErrCorruption{fmt.Errorf("gofer.dentry(%q).restoreFile: mtime validation failed: mtime changed from %+v to %+v", genericDebugPathname(d), linux.NsecToStatxTimestamp(d.mtime), linux.NsecToStatxTimestamp(want))}
+			if want := dentryTimestampFromP9(attr.MTimeSeconds, attr.MTimeNanoSeconds); d.mtime.Load() != want {
+				return vfs.ErrCorruption{fmt.Errorf("gofer.dentry(%q).restoreFile: mtime validation failed: mtime changed from %+v to %+v", genericDebugPathname(d), linux.NsecToStatxTimestamp(d.mtime.Load()), linux.NsecToStatxTimestamp(want))}
 			}
 		}
 	}
@@ -310,11 +310,11 @@ func (d *dentry) restoreFileLisa(ctx context.Context, inode *lisafs.Inode, opts 
 
 	// Gofers do not preserve inoKey across checkpoint/restore, so:
 	//
-	// - We must assume that the remote filesystem did not change in a way that
-	// would invalidate dentries, since we can't revalidate dentries by
-	// checking inoKey.
+	//	- We must assume that the remote filesystem did not change in a way that
+	//		would invalidate dentries, since we can't revalidate dentries by
+	//		checking inoKey.
 	//
-	// - We need to associate the new inoKey with the existing d.ino.
+	//	- We need to associate the new inoKey with the existing d.ino.
 	d.inoKey = inoKeyFromStat(&inode.Stat)
 	d.fs.inoMu.Lock()
 	d.fs.inoByKey[d.inoKey] = d.ino
@@ -328,16 +328,16 @@ func (d *dentry) restoreFileLisa(ctx context.Context, inode *lisafs.Inode, opts 
 			if inode.Stat.Mask&linux.STATX_SIZE == 0 {
 				return vfs.ErrCorruption{fmt.Errorf("gofer.dentry(%q).restoreFile: file size validation failed: file size not available", genericDebugPathname(d))}
 			}
-			if d.size != inode.Stat.Size {
-				return vfs.ErrCorruption{fmt.Errorf("gofer.dentry(%q).restoreFile: file size validation failed: size changed from %d to %d", genericDebugPathname(d), d.size, inode.Stat.Size)}
+			if d.size.RacyLoad() != inode.Stat.Size {
+				return vfs.ErrCorruption{fmt.Errorf("gofer.dentry(%q).restoreFile: file size validation failed: size changed from %d to %d", genericDebugPathname(d), d.size.Load(), inode.Stat.Size)}
 			}
 		}
 		if opts.ValidateFileModificationTimestamps {
 			if inode.Stat.Mask&linux.STATX_MTIME != 0 {
 				return vfs.ErrCorruption{fmt.Errorf("gofer.dentry(%q).restoreFile: mtime validation failed: mtime not available", genericDebugPathname(d))}
 			}
-			if want := dentryTimestampFromLisa(inode.Stat.Mtime); d.mtime != want {
-				return vfs.ErrCorruption{fmt.Errorf("gofer.dentry(%q).restoreFile: mtime validation failed: mtime changed from %+v to %+v", genericDebugPathname(d), linux.NsecToStatxTimestamp(d.mtime), linux.NsecToStatxTimestamp(want))}
+			if want := dentryTimestampFromLisa(inode.Stat.Mtime); d.mtime.RacyLoad() != want {
+				return vfs.ErrCorruption{fmt.Errorf("gofer.dentry(%q).restoreFile: mtime validation failed: mtime changed from %+v to %+v", genericDebugPathname(d), linux.NsecToStatxTimestamp(d.mtime.RacyLoad()), linux.NsecToStatxTimestamp(want))}
 			}
 		}
 	}

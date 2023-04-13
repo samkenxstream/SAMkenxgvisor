@@ -48,7 +48,8 @@ import (
 // loopback interface only.
 //
 // Run the following container to test it:
-//  docker run -di --runtime=runsc -p 8080:80 -v $PWD:/usr/local/apache2/htdocs/ httpd:2.4
+//
+//	docker run -di --runtime=runsc -p 8080:80 -v $PWD:/usr/local/apache2/htdocs/ httpd:2.4
 func setupNetwork(conn *urpc.Client, pid int, conf *config.Config) error {
 	log.Infof("Setting up network")
 
@@ -62,7 +63,7 @@ func setupNetwork(conn *urpc.Client, pid int, conf *config.Config) error {
 		// Build the path to the net namespace of the sandbox process.
 		// This is what we will copy.
 		nsPath := filepath.Join("/proc", strconv.Itoa(pid), "ns/net")
-		if err := createInterfacesAndRoutesFromNS(conn, nsPath, conf.HardwareGSO, conf.SoftwareGSO, conf.TXChecksumOffload, conf.RXChecksumOffload, conf.NumNetworkChannels, conf.QDisc); err != nil {
+		if err := createInterfacesAndRoutesFromNS(conn, nsPath, conf.HostGSO, conf.GvisorGSO, conf.TXChecksumOffload, conf.RXChecksumOffload, conf.NumNetworkChannels, conf.QDisc); err != nil {
 			return fmt.Errorf("creating interfaces from net namespace %q: %v", nsPath, err)
 		}
 	case config.NetworkHost:
@@ -115,7 +116,7 @@ func isRootNS() (bool, error) {
 // createInterfacesAndRoutesFromNS scrapes the interface and routes from the
 // net namespace with the given path, creates them in the sandbox, and removes
 // them from the host.
-func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string, hardwareGSO bool, softwareGSO bool, txChecksumOffload bool, rxChecksumOffload bool, numNetworkChannels int, qDisc config.QueueingDiscipline) error {
+func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string, hostGSO bool, gvisorGSO bool, txChecksumOffload bool, rxChecksumOffload bool, numNetworkChannels int, qDisc config.QueueingDiscipline) error {
 	// Join the network namespace that we will be copying.
 	restore, err := joinNetNS(nsPath)
 	if err != nil {
@@ -234,7 +235,7 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string, hardwareG
 		// Create the socket for the device.
 		for i := 0; i < link.NumChannels; i++ {
 			log.Debugf("Creating Channel %d", i)
-			socketEntry, err := createSocket(iface, ifaceLink, hardwareGSO)
+			socketEntry, err := createSocket(iface, ifaceLink, hostGSO)
 			if err != nil {
 				return fmt.Errorf("failed to createSocket for %s : %w", iface.Name, err)
 			}
@@ -249,10 +250,10 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string, hardwareG
 			args.FilePayload.Files = append(args.FilePayload.Files, socketEntry.deviceFile)
 		}
 
-		if link.GSOMaxSize == 0 && softwareGSO {
-			// Hardware GSO is disabled. Let's enable software GSO.
-			link.GSOMaxSize = stack.SoftwareGSOMaxSize
-			link.SoftwareGSOEnabled = true
+		if link.GSOMaxSize == 0 && gvisorGSO {
+			// Host GSO is disabled. Let's enable gVisor GSO.
+			link.GSOMaxSize = stack.GvisorGSOMaxSize
+			link.GvisorGSOEnabled = true
 		}
 
 		// Collect the addresses for the interface, enable forwarding,
@@ -263,6 +264,13 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string, hardwareG
 
 			// Steal IP address from NIC.
 			if err := removeAddress(ifaceLink, addr.String()); err != nil {
+				// If we encounter an error while deleting the ip,
+				// verify the ip is still present on the interface.
+				if present, err := isAddressOnInterface(iface.Name, addr); err != nil {
+					return fmt.Errorf("checking if address %v is on interface %q: %w", addr, iface.Name, err)
+				} else if !present {
+					continue
+				}
 				return fmt.Errorf("removing address %v from device %q: %w", addr, iface.Name, err)
 			}
 		}
@@ -275,6 +283,29 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string, hardwareG
 		return fmt.Errorf("creating links and routes: %w", err)
 	}
 	return nil
+}
+
+// isAddressOnInterface checks if an address is on an interface
+func isAddressOnInterface(ifaceName string, addr *net.IPNet) (bool, error) {
+	iface, err := net.InterfaceByName(ifaceName)
+	if err != nil {
+		return false, fmt.Errorf("getting interface by name %q: %w", ifaceName, err)
+	}
+	ifaceAddrs, err := iface.Addrs()
+	if err != nil {
+		return false, fmt.Errorf("fetching interface addresses for %q: %w", iface.Name, err)
+	}
+	for _, ifaceAddr := range ifaceAddrs {
+		ipNet, ok := ifaceAddr.(*net.IPNet)
+		if !ok {
+			log.Warningf("Can't cast address to *net.IPNet, skipping: %+v", ifaceAddr)
+			continue
+		}
+		if ipNet.String() == addr.String() {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 type socketEntry struct {
@@ -433,7 +464,8 @@ func routesForIface(iface net.Interface) ([]boot.Route, *boot.Route, *boot.Route
 }
 
 // removeAddress removes IP address from network device. It's equivalent to:
-//   ip addr del <ipAndMask> dev <name>
+//
+//	ip addr del <ipAndMask> dev <name>
 func removeAddress(source netlink.Link, ipAndMask string) error {
 	addr, err := netlink.ParseAddr(ipAndMask)
 	if err != nil {

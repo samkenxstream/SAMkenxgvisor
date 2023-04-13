@@ -84,10 +84,9 @@ func (q *queue) Write(pkt *stack.PacketBuffer) tcpip.Error {
 		return &tcpip.ErrClosedForSend{}
 	}
 
-	pkt.IncRef()
 	wrote := false
 	select {
-	case q.c <- pkt:
+	case q.c <- pkt.IncRef():
 		wrote = true
 	default:
 		pkt.DecRef()
@@ -242,7 +241,7 @@ func (e *Endpoint) LinkAddress() tcpip.LinkAddress {
 // Multiple concurrent calls are permitted.
 func (e *Endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
 	n := 0
-	for pkt := pkts.Front(); pkt != nil; pkt = pkt.Next() {
+	for _, pkt := range pkts.AsSlice() {
 		if err := e.q.Write(pkt); err != nil {
 			if _, ok := err.(*tcpip.ErrNoBufferSpace); !ok && n == 0 {
 				return 0, err

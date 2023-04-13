@@ -19,12 +19,14 @@ import (
 	"runtime"
 	gosync "sync"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/metric"
 	"gvisor.dev/gvisor/pkg/procid"
 	"gvisor.dev/gvisor/pkg/ring0"
 	"gvisor.dev/gvisor/pkg/ring0/pagetables"
@@ -44,9 +46,9 @@ type machine struct {
 
 	// nextSlot is the next slot for setMemoryRegion.
 	//
-	// This must be accessed atomically. If nextSlot is ^uint32(0), then
-	// slots are currently being updated, and the caller should retry.
-	nextSlot uint32
+	// If nextSlot is ^uint32(0), then slots are currently being updated, and the
+	// caller should retry.
+	nextSlot atomicbitops.Uint32
 
 	// upperSharedPageTables tracks the read-only shared upper of all the pagetables.
 	upperSharedPageTables *pagetables.PageTables
@@ -101,6 +103,39 @@ const (
 	vCPUWaiter uint32 = 1 << 2
 )
 
+var (
+	// hostExitCounter is a metric that tracks how many times the sentry
+	// performed a host to guest world switch.
+	hostExitCounter = metric.MustCreateNewUint64Metric(
+		"/kvm/host_exits", false, "The number of times the sentry performed a host to guest world switch.")
+
+	// userExitCounter is a metric that tracks how many times the sentry has
+	// had an exit from userspace. Analogous to vCPU.userExits.
+	userExitCounter = metric.MustCreateNewUint64Metric(
+		"/kvm/user_exits", false, "The number of times the sentry has had an exit from userspace.")
+
+	// interruptCounter is a metric that tracks how many times execution returned
+	// to the KVM host to handle a pending signal.
+	interruptCounter = metric.MustCreateNewUint64Metric(
+		"/kvm/interrupts", false, "The number of times the signal handler was invoked.")
+
+	// mmapCallCounter is a metric that tracks how many times the function
+	// seccompMmapSyscall has been called.
+	mmapCallCounter = metric.MustCreateNewUint64Metric(
+		"/kvm/mmap_calls", false, "The number of times seccompMmapSyscall has been called.")
+
+	// getVCPUCounter is a metric that tracks how many times different paths of
+	// machine.Get() are triggered.
+	getVCPUCounter = metric.MustCreateNewUint64Metric(
+		"/kvm/get_vcpu", false, "The number of times that machine.Get() was called, split by path the function took.",
+		metric.NewField("acquisition_type", []string{"fast_reused", "reused", "unused", "stolen"}))
+
+	// asInvalidateDuration are durations of calling addressSpace.invalidate().
+	asInvalidateDuration = metric.MustRegisterTimerMetric("/kvm/address_space_invalidate",
+		metric.NewExponentialBucketer(15, uint64(time.Nanosecond*100), 1, 2),
+		"Duration of calling addressSpace.invalidate().")
+)
+
 // vCPU is a single KVM vCPU.
 type vCPU struct {
 	// CPU is the kernel CPU data.
@@ -116,13 +151,13 @@ type vCPU struct {
 	fd int
 
 	// tid is the last set tid.
-	tid uint64
+	tid atomicbitops.Uint64
 
 	// userExits is the count of user exits.
-	userExits uint64
+	userExits atomicbitops.Uint64
 
 	// guestExits is the count of guest to host world switches.
-	guestExits uint64
+	guestExits atomicbitops.Uint64
 
 	// faults is a count of world faults (informational only).
 	faults uint32
@@ -130,7 +165,7 @@ type vCPU struct {
 	// state is the vCPU state.
 	//
 	// This is a bitmask of the three fields (vCPU*) described above.
-	state uint32
+	state atomicbitops.Uint32
 
 	// runData for this vCPU.
 	runData *runData
@@ -283,6 +318,10 @@ func newMachine(vm int) (*machine, error) {
 		}
 	}
 
+	// handleBluepillFault takes the slot spinlock and it is called from
+	// seccompMmapHandler, so here we have to guarantee that mmap is not
+	// called while we hold the slot spinlock.
+	disableAsyncPreemption()
 	applyVirtualRegions(func(vr virtualRegion) {
 		if excludeVirtualRegion(vr) {
 			return // skip region.
@@ -296,6 +335,7 @@ func newMachine(vm int) (*machine, error) {
 		mapRegion(vr, 0)
 
 	})
+	enableAsyncPreemption()
 
 	// Initialize architecture state.
 	if err := m.initArchState(); err != nil {
@@ -314,7 +354,7 @@ func newMachine(vm int) (*machine, error) {
 //
 //go:nosplit
 func (m *machine) hasSlot(physical uintptr) bool {
-	slotLen := int(atomic.LoadUint32(&m.nextSlot))
+	slotLen := int(m.nextSlot.Load())
 	// When slots are being updated, nextSlot is ^uint32(0). As this situation
 	// is less likely happen, we just set the slotLen to m.maxSlots, and scan
 	// the whole usedSlots array.
@@ -413,6 +453,7 @@ func (m *machine) Get() *vCPU {
 	if c := m.vCPUsByTID[tid]; c != nil {
 		c.lock()
 		m.mu.RUnlock()
+		getVCPUCounter.Increment("fast_reused")
 		return c
 	}
 
@@ -432,21 +473,11 @@ func (m *machine) Get() *vCPU {
 	if c := m.vCPUsByTID[tid]; c != nil {
 		c.lock()
 		m.mu.Unlock()
+		getVCPUCounter.Increment("reused")
 		return c
 	}
 
 	for {
-		// Scan for an available vCPU.
-		for origTID, c := range m.vCPUsByTID {
-			if atomic.CompareAndSwapUint32(&c.state, vCPUReady, vCPUUser) {
-				delete(m.vCPUsByTID, origTID)
-				m.vCPUsByTID[tid] = c
-				m.mu.Unlock()
-				c.loadSegments(tid)
-				return c
-			}
-		}
-
 		// Get vCPU from the m.vCPUsByID pool.
 		if m.usedVCPUs < m.maxVCPUs {
 			c := m.vCPUsByID[m.usedVCPUs]
@@ -455,12 +486,25 @@ func (m *machine) Get() *vCPU {
 			m.vCPUsByTID[tid] = c
 			m.mu.Unlock()
 			c.loadSegments(tid)
+			getVCPUCounter.Increment("unused")
 			return c
+		}
+
+		// Scan for an available vCPU.
+		for origTID, c := range m.vCPUsByTID {
+			if c.state.CompareAndSwap(vCPUReady, vCPUUser) {
+				delete(m.vCPUsByTID, origTID)
+				m.vCPUsByTID[tid] = c
+				m.mu.Unlock()
+				c.loadSegments(tid)
+				getVCPUCounter.Increment("unused")
+				return c
+			}
 		}
 
 		// Scan for something not in user mode.
 		for origTID, c := range m.vCPUsByTID {
-			if !atomic.CompareAndSwapUint32(&c.state, vCPUGuest, vCPUGuest|vCPUWaiter) {
+			if !c.state.CompareAndSwap(vCPUGuest, vCPUGuest|vCPUWaiter) {
 				continue
 			}
 
@@ -471,7 +515,7 @@ func (m *machine) Get() *vCPU {
 			// just the vCPUReady state.
 			for {
 				c.waitUntilNot(vCPUGuest | vCPUWaiter)
-				if atomic.CompareAndSwapUint32(&c.state, vCPUReady, vCPUUser) {
+				if c.state.CompareAndSwap(vCPUReady, vCPUUser) {
 					break
 				}
 			}
@@ -481,6 +525,7 @@ func (m *machine) Get() *vCPU {
 			m.vCPUsByTID[tid] = c
 			m.mu.Unlock()
 			c.loadSegments(tid)
+			getVCPUCounter.Increment("stolen")
 			return c
 		}
 
@@ -505,7 +550,8 @@ func (m *machine) Put(c *vCPU) {
 // newDirtySet returns a new dirty set.
 func (m *machine) newDirtySet() *dirtySet {
 	return &dirtySet{
-		vCPUMasks: make([]uint64, (m.maxVCPUs+63)/64, (m.maxVCPUs+63)/64),
+		vCPUMasks: make([]atomicbitops.Uint64,
+			(m.maxVCPUs+63)/64, (m.maxVCPUs+63)/64),
 	}
 }
 
@@ -587,10 +633,10 @@ var pid = unix.Getpid()
 //
 // This effectively unwinds the state machine.
 func (c *vCPU) bounce(forceGuestExit bool) {
-	origGuestExits := atomic.LoadUint64(&c.guestExits)
-	origUserExits := atomic.LoadUint64(&c.userExits)
+	origGuestExits := c.guestExits.Load()
+	origUserExits := c.userExits.Load()
 	for {
-		switch state := atomic.LoadUint32(&c.state); state {
+		switch state := c.state.Load(); state {
 		case vCPUReady, vCPUWaiter:
 			// There is nothing to be done, we're already in the
 			// kernel pre-acquisition. The Bounce criteria have
@@ -601,7 +647,7 @@ func (c *vCPU) bounce(forceGuestExit bool) {
 			// transition. When the transition takes place, then we
 			// can inject an interrupt to ensure a return to host
 			// mode.
-			atomic.CompareAndSwapUint32(&c.state, state, state|vCPUWaiter)
+			c.state.CompareAndSwap(state, state|vCPUWaiter)
 		case vCPUUser | vCPUWaiter:
 			// Wait for the transition to guest mode. This should
 			// come from the bluepill handler.
@@ -614,7 +660,7 @@ func (c *vCPU) bounce(forceGuestExit bool) {
 			}
 			// The vCPU is in user or kernel mode. Attempt to
 			// register a notification on change.
-			if !atomic.CompareAndSwapUint32(&c.state, state, state|vCPUWaiter) {
+			if !c.state.CompareAndSwap(state, state|vCPUWaiter) {
 				break // Retry.
 			}
 			for {
@@ -623,7 +669,7 @@ func (c *vCPU) bounce(forceGuestExit bool) {
 				// under memory pressure. Since we already
 				// marked ourselves as a waiter, we need to
 				// ensure that a signal is actually delivered.
-				if err := unix.Tgkill(pid, int(atomic.LoadUint64(&c.tid)), bounceSignal); err == nil {
+				if err := unix.Tgkill(pid, int(c.tid.Load()), bounceSignal); err == nil {
 					break
 				} else if err.(unix.Errno) == unix.EAGAIN {
 					continue
@@ -647,8 +693,8 @@ func (c *vCPU) bounce(forceGuestExit bool) {
 
 		// Check if we've missed the state transition, but
 		// we can safely return at this point in time.
-		newGuestExits := atomic.LoadUint64(&c.guestExits)
-		newUserExits := atomic.LoadUint64(&c.userExits)
+		newGuestExits := c.guestExits.Load()
+		newUserExits := c.userExits.Load()
 		if newUserExits != origUserExits && (!forceGuestExit || newGuestExits != origGuestExits) {
 			return
 		}
@@ -706,7 +752,7 @@ const machinePoolSize = 16
 // machinePool is enumerated from the seccompMmapHandler signal handler
 var (
 	machinePool          [machinePoolSize]machineAtomicPtr
-	machinePoolLen       uint32
+	machinePoolLen       atomicbitops.Uint32
 	machinePoolMu        sync.Mutex
 	seccompMmapRulesOnce gosync.Once
 )
@@ -751,7 +797,7 @@ func seccompMmapRules(m *machine) {
 	})
 
 	machinePoolMu.Lock()
-	n := atomic.LoadUint32(&machinePoolLen)
+	n := machinePoolLen.Load()
 	i := uint32(0)
 	for ; i < n; i++ {
 		if machinePool[i].Load() == nil {
@@ -763,7 +809,7 @@ func seccompMmapRules(m *machine) {
 			machinePoolMu.Unlock()
 			panic("machinePool is full")
 		}
-		atomic.AddUint32(&machinePoolLen, 1)
+		machinePoolLen.Add(1)
 	}
 	machinePool[i].Store(m)
 	m.machinePoolIndex = i

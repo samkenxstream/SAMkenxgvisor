@@ -20,7 +20,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
@@ -40,6 +39,11 @@ import (
 type controllerCommon struct {
 	ty kernel.CgroupControllerType
 	fs *filesystem
+	// parent is the parent controller if any. Immutable.
+	//
+	// Note that we don't have to update this on renames, since cgroup
+	// directories can't be moved to a different parent directory.
+	parent controller
 }
 
 func (c *controllerCommon) init(ty kernel.CgroupControllerType, fs *filesystem) {
@@ -47,9 +51,15 @@ func (c *controllerCommon) init(ty kernel.CgroupControllerType, fs *filesystem) 
 	c.fs = fs
 }
 
-func (c *controllerCommon) cloneFrom(other *controllerCommon) {
-	c.ty = other.ty
-	c.fs = other.fs
+func (c *controllerCommon) cloneFromParent(parent controller) {
+	c.ty = parent.Type()
+	c.fs = parent.Filesystem()
+	c.parent = parent
+}
+
+// Filesystem implements controller.Filesystem.
+func (c *controllerCommon) Filesystem() *filesystem {
+	return c.fs
 }
 
 // Type implements kernel.CgroupController.Type.
@@ -64,7 +74,7 @@ func (c *controllerCommon) HierarchyID() uint32 {
 
 // NumCgroups implements kernel.CgroupController.NumCgroups.
 func (c *controllerCommon) NumCgroups() uint64 {
-	return atomic.LoadUint64(&c.fs.numCgroups)
+	return c.fs.numCgroups.Load()
 }
 
 // Enabled implements kernel.CgroupController.Enabled.
@@ -85,7 +95,10 @@ func (c *controllerCommon) RootCgroup() kernel.Cgroup {
 type controller interface {
 	kernel.CgroupController
 
-	// Clone creates a new controller based on the internal state of the current
+	// Filesystem returns the cgroupfs filesystem backing this controller.
+	Filesystem() *filesystem
+
+	// Clone creates a new controller based on the internal state of this
 	// controller. This is used to initialize a sub-cgroup based on the state of
 	// the parent.
 	Clone() controller
@@ -93,6 +106,18 @@ type controller interface {
 	// AddControlFiles should extend the contents map with inodes representing
 	// control files defined by this controller.
 	AddControlFiles(ctx context.Context, creds *auth.Credentials, c *cgroupInode, contents map[string]kernfs.Inode)
+
+	// Enter is called when a task initially moves into a cgroup. This is
+	// distinct from migration because the task isn't migrating away from a
+	// cgroup. Enter is called when a task is created and joins its initial
+	// cgroup, or when cgroupfs is mounted and existing tasks are moved into
+	// cgroups.
+	Enter(t *kernel.Task)
+
+	// Leave is called when a task leaves a cgroup. This is distinct from
+	// migration because the task isn't migrating to another cgroup. Leave is
+	// called when a task exits.
+	Leave(t *kernel.Task)
 
 	// PrepareMigrate signals the controller that a migration is about to
 	// happen. The controller should check for any conditions that would prevent
@@ -113,6 +138,10 @@ type controller interface {
 	//
 	// Precondition: Caller must call a corresponding PrepareMigrate.
 	AbortMigrate(t *kernel.Task, src controller)
+
+	// Charge charges a controller for a particular resource. The implementation
+	// should panic if passed a resource type they do not control.
+	Charge(t *kernel.Task, d *kernfs.Dentry, res kernel.CgroupResourceType, value int64) error
 }
 
 // cgroupInode implements kernel.CgroupImpl and kernfs.Inode.
@@ -137,7 +166,7 @@ type cgroupInode struct {
 
 var _ kernel.CgroupImpl = (*cgroupInode)(nil)
 
-func (fs *filesystem) newCgroupInode(ctx context.Context, creds *auth.Credentials, parent *cgroupInode) kernfs.Inode {
+func (fs *filesystem) newCgroupInode(ctx context.Context, creds *auth.Credentials, parent *cgroupInode, mode linux.FileMode) kernfs.Inode {
 	c := &cgroupInode{
 		dir:         dir{fs: fs},
 		ts:          make(map[*kernel.Task]struct{}),
@@ -146,8 +175,8 @@ func (fs *filesystem) newCgroupInode(ctx context.Context, creds *auth.Credential
 	c.dir.cgi = c
 
 	contents := make(map[string]kernfs.Inode)
-	contents["cgroup.procs"] = fs.newControllerFile(ctx, creds, &cgroupProcsData{c})
-	contents["tasks"] = fs.newControllerFile(ctx, creds, &tasksData{c})
+	contents["cgroup.procs"] = fs.newControllerWritableFile(ctx, creds, &cgroupProcsData{c})
+	contents["tasks"] = fs.newControllerWritableFile(ctx, creds, &tasksData{c})
 
 	if parent != nil {
 		for ty, ctl := range parent.controllers {
@@ -157,24 +186,31 @@ func (fs *filesystem) newCgroupInode(ctx context.Context, creds *auth.Credential
 		}
 	} else {
 		for _, ctl := range fs.controllers {
-			new := ctl.Clone()
-			// Uniqueness of controllers enforced by the filesystem on creation.
-			c.controllers[ctl.Type()] = new
-			new.AddControlFiles(ctx, creds, c, contents)
+			// Uniqueness of controllers enforced by the filesystem on
+			// creation. The root cgroup uses the controllers directly from the
+			// filesystem.
+			c.controllers[ctl.Type()] = ctl
+			ctl.AddControlFiles(ctx, creds, c, contents)
 		}
 	}
 
-	c.dir.InodeAttrs.Init(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), linux.ModeDirectory|linux.FileMode(0555))
+	c.dir.InodeAttrs.Init(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), mode)
 	c.dir.OrderedChildren.Init(kernfs.OrderedChildrenOptions{Writable: true})
 	c.dir.IncLinks(c.dir.OrderedChildren.Populate(contents))
 
-	atomic.AddUint64(&fs.numCgroups, 1)
+	fs.numCgroups.Add(1)
 
 	return c
 }
 
+// HierarchyID implements kernel.CgroupImpl.HierarchyID.
 func (c *cgroupInode) HierarchyID() uint32 {
 	return c.fs.hierarchyID
+}
+
+// Name implements kernel.CgroupImpl.Name.
+func (c *cgroupInode) Name() string {
+	return c.fs.hierarchyName
 }
 
 // Controllers implements kernel.CgroupImpl.Controllers.
@@ -186,6 +222,7 @@ func (c *cgroupInode) Controllers() []kernel.CgroupController {
 func (c *cgroupInode) tasks() []*kernel.Task {
 	c.fs.tasksMu.RLock()
 	defer c.fs.tasksMu.RUnlock()
+
 	ts := make([]*kernel.Task, 0, len(c.ts))
 	for t := range c.ts {
 		ts = append(ts, t)
@@ -196,15 +233,23 @@ func (c *cgroupInode) tasks() []*kernel.Task {
 // Enter implements kernel.CgroupImpl.Enter.
 func (c *cgroupInode) Enter(t *kernel.Task) {
 	c.fs.tasksMu.Lock()
+	defer c.fs.tasksMu.Unlock()
+
 	c.ts[t] = struct{}{}
-	c.fs.tasksMu.Unlock()
+	for _, ctl := range c.controllers {
+		ctl.Enter(t)
+	}
 }
 
 // Leave implements kernel.CgroupImpl.Leave.
 func (c *cgroupInode) Leave(t *kernel.Task) {
 	c.fs.tasksMu.Lock()
+	defer c.fs.tasksMu.Unlock()
+
+	for _, ctl := range c.controllers {
+		ctl.Leave(t)
+	}
 	delete(c.ts, t)
-	c.fs.tasksMu.Unlock()
 }
 
 // PrepareMigrate implements kernel.CgroupImpl.PrepareMigrate.
@@ -229,14 +274,14 @@ func (c *cgroupInode) PrepareMigrate(t *kernel.Task, src *kernel.Cgroup) error {
 
 // CommitMigrate implements kernel.CgroupImpl.CommitMigrate.
 func (c *cgroupInode) CommitMigrate(t *kernel.Task, src *kernel.Cgroup) {
+	c.fs.tasksMu.Lock()
+	defer c.fs.tasksMu.Unlock()
+
 	for srcType, srcCtl := range src.CgroupImpl.(*cgroupInode).controllers {
 		c.controllers[srcType].CommitMigrate(t, srcCtl)
 	}
 
 	srcI := src.CgroupImpl.(*cgroupInode)
-	c.fs.tasksMu.Lock()
-	defer c.fs.tasksMu.Unlock()
-
 	delete(srcI.ts, t)
 	c.ts[t] = struct{}{}
 }
@@ -248,11 +293,34 @@ func (c *cgroupInode) AbortMigrate(t *kernel.Task, src *kernel.Cgroup) {
 	}
 }
 
-func (c *cgroupInode) Cgroup(fd *vfs.FileDescription) kernel.Cgroup {
+// CgroupFromControlFileFD returns a cgroup object given a control file FD for the cgroup.
+func (c *cgroupInode) CgroupFromControlFileFD(fd *vfs.FileDescription) kernel.Cgroup {
+	controlFileDentry := fd.Dentry().Impl().(*kernfs.Dentry)
+	// The returned parent dentry remains valid without holding locks because in
+	// cgroupfs, the parent directory relationship of a control file is
+	// effectively immutable. Control files cannot be unlinked, renamed or
+	// destroyed independently from their parent directory.
+	parentD := controlFileDentry.Parent()
 	return kernel.Cgroup{
-		Dentry:     fd.Dentry().Impl().(*kernfs.Dentry),
+		Dentry:     parentD,
 		CgroupImpl: c,
 	}
+}
+
+// Charge implements kernel.CgroupImpl.Charge.
+//
+// Charge notifies a matching controller of a change in resource usage. Due to
+// the uniqueness of controllers, at most one controller will match. If no
+// matching controller is present in this directory, the call silently
+// succeeds. The caller should call Charge on all hierarchies to ensure any
+// matching controller across the entire system is charged.
+func (c *cgroupInode) Charge(t *kernel.Task, d *kernfs.Dentry, ctlType kernel.CgroupControllerType, res kernel.CgroupResourceType, value int64) error {
+	c.fs.tasksMu.RLock()
+	defer c.fs.tasksMu.RUnlock()
+	if ctl, ok := c.controllers[ctlType]; ok {
+		return ctl.Charge(t, d, res, value)
+	}
+	return nil
 }
 
 func sortTIDs(tids []kernel.ThreadID) {
@@ -280,7 +348,7 @@ func (d *cgroupProcsData) Generate(ctx context.Context, buf *bytes.Buffer) error
 	}
 
 	pgidList := make([]kernel.ThreadID, 0, len(pgids))
-	for pgid, _ := range pgids {
+	for pgid := range pgids {
 		pgidList = append(pgidList, pgid)
 	}
 	sortTIDs(pgidList)
@@ -301,8 +369,17 @@ func (d *cgroupProcsData) Write(ctx context.Context, fd *vfs.FileDescription, sr
 
 	t := kernel.TaskFromContext(ctx)
 	currPidns := t.ThreadGroup().PIDNamespace()
-	targetTG := currPidns.ThreadGroupWithID(kernel.ThreadID(tgid))
-	return n, targetTG.MigrateCgroup(d.Cgroup(fd))
+	var targetTG *kernel.ThreadGroup
+	if tgid != 0 {
+		targetTG = currPidns.ThreadGroupWithID(kernel.ThreadID(tgid))
+	} else {
+		targetTG = t.ThreadGroup()
+	}
+
+	if targetTG == nil {
+		return 0, linuxerr.EINVAL
+	}
+	return n, targetTG.MigrateCgroup(d.CgroupFromControlFileFD(fd))
 }
 
 // +stateify savable
@@ -340,8 +417,16 @@ func (d *tasksData) Write(ctx context.Context, fd *vfs.FileDescription, src user
 
 	t := kernel.TaskFromContext(ctx)
 	currPidns := t.ThreadGroup().PIDNamespace()
-	targetTask := currPidns.TaskWithID(kernel.ThreadID(tid))
-	return n, targetTask.MigrateCgroup(d.Cgroup(fd))
+	var targetTask *kernel.Task
+	if tid != 0 {
+		targetTask = currPidns.TaskWithID(kernel.ThreadID(tid))
+	} else {
+		targetTask = t
+	}
+	if targetTask == nil {
+		return 0, linuxerr.EINVAL
+	}
+	return n, targetTask.MigrateCgroup(d.CgroupFromControlFileFD(fd))
 }
 
 // parseInt64FromString interprets src as string encoding a int64 value, and
@@ -362,24 +447,40 @@ func parseInt64FromString(ctx context.Context, src usermem.IOSequence) (val, len
 	if err != nil {
 		// Note: This also handles zero-len writes if offset is beyond the end
 		// of src, or src is empty.
-		ctx.Warningf("cgroupfs.parseInt64FromString: failed to parse %q: %v", str, err)
+		ctx.Debugf("cgroupfs.parseInt64FromString: failed to parse %q: %v", str, err)
 		return 0, int64(n), linuxerr.EINVAL
 	}
 
 	return val, int64(n), nil
 }
 
-// controllerNoopMigrate partially implements controller. It stubs the migration
+// controllerStateless partially implements controller. It stubs the migration
 // methods with noops for a stateless controller.
-type controllerNoopMigrate struct{}
+type controllerStateless struct{}
+
+// Enter implements controller.Enter.
+func (*controllerStateless) Enter(t *kernel.Task) {}
+
+// Leave implements controller.Leave.
+func (*controllerStateless) Leave(t *kernel.Task) {}
 
 // PrepareMigrate implements controller.PrepareMigrate.
-func (*controllerNoopMigrate) PrepareMigrate(t *kernel.Task, src controller) error {
+func (*controllerStateless) PrepareMigrate(t *kernel.Task, src controller) error {
 	return nil
 }
 
 // CommitMigrate implements controller.CommitMigrate.
-func (*controllerNoopMigrate) CommitMigrate(t *kernel.Task, src controller) {}
+func (*controllerStateless) CommitMigrate(t *kernel.Task, src controller) {}
 
 // AbortMigrate implements controller.AbortMigrate.
-func (*controllerNoopMigrate) AbortMigrate(t *kernel.Task, src controller) {}
+func (*controllerStateless) AbortMigrate(t *kernel.Task, src controller) {}
+
+// controllerNoResource partially implements controller. It stubs out the Charge
+// method for controllers that don't track resource usage through the charge
+// mechanism.
+type controllerNoResource struct{}
+
+// Charge implements controller.Charge.
+func (*controllerNoResource) Charge(t *kernel.Task, d *kernfs.Dentry, res kernel.CgroupResourceType, value int64) error {
+	panic(fmt.Sprintf("cgroupfs: Attempted to charge a controller with unknown resource %v for value %v", res, value))
+}

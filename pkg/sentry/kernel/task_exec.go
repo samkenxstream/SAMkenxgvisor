@@ -69,9 +69,9 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/fs"
 	"gvisor.dev/gvisor/pkg/sentry/fsbridge"
-	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
+	pb "gvisor.dev/gvisor/pkg/sentry/seccheck/points/points_go_proto"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
@@ -97,7 +97,9 @@ func (t *Task) Execve(newImage *TaskImage, argv, env []string, executable fsbrid
 	// We can't clearly hold kernel package locks while stat'ing executable.
 	if seccheck.Global.Enabled(seccheck.PointExecve) {
 		mask, info := getExecveSeccheckInfo(t, argv, env, executable, pathname)
-		if err := seccheck.Global.Execve(t, mask, &info); err != nil {
+		if err := seccheck.Global.SendToCheckers(func(c seccheck.Checker) error {
+			return c.Execve(t, mask, info)
+		}); err != nil {
 			newImage.release()
 			return nil, err
 		}
@@ -184,14 +186,14 @@ func (r *runSyscallAfterExecStop) execute(t *Task) taskRunState {
 	//
 	// Details:
 	//
-	// - If the thread group is sharing its signal handlers with another thread
-	// group via CLONE_SIGHAND, execve forces the signal handlers to be copied
-	// (see Linux's fs/exec.c:de_thread). We're not reference-counting signal
-	// handlers, so we always make a copy.
+	//	- If the thread group is sharing its signal handlers with another thread
+	//		group via CLONE_SIGHAND, execve forces the signal handlers to be copied
+	//		(see Linux's fs/exec.c:de_thread). We're not reference-counting signal
+	//		handlers, so we always make a copy.
 	//
-	// - "Disposition" only means sigaction::sa_handler/sa_sigaction; flags,
-	// restorer (if present), and mask are always reset. (See Linux's
-	// fs/exec.c:setup_new_exec => kernel/signal.c:flush_signal_handlers.)
+	//	- "Disposition" only means sigaction::sa_handler/sa_sigaction; flags,
+	//		restorer (if present), and mask are always reset. (See Linux's
+	//		fs/exec.c:setup_new_exec => kernel/signal.c:flush_signal_handlers.)
 	t.tg.signalHandlers = t.tg.signalHandlers.CopyForExec()
 	t.endStopCond.L = &t.tg.signalHandlers.mu
 	// "Any alternate signal stack is not preserved (sigaltstack(2))." - execve(2)
@@ -259,9 +261,9 @@ func (r *runSyscallAfterExecStop) execute(t *Task) taskRunState {
 // thread group leader, promoteLocked is a no-op.
 //
 // Preconditions:
-// * All other tasks in t's thread group, including the existing leader (if it
-//   is not t), have reached TaskExitZombie.
-// * The TaskSet mutex must be locked for writing.
+//   - All other tasks in t's thread group, including the existing leader (if it
+//     is not t), have reached TaskExitZombie.
+//   - The TaskSet mutex must be locked for writing.
 func (t *Task) promoteLocked() {
 	oldLeader := t.tg.leader
 	if t == oldLeader {
@@ -302,44 +304,28 @@ func (t *Task) promoteLocked() {
 	oldLeader.exitNotifyLocked(false)
 }
 
-func getExecveSeccheckInfo(t *Task, argv, env []string, executable fsbridge.File, pathname string) (seccheck.ExecveFieldSet, seccheck.ExecveInfo) {
-	req := seccheck.Global.ExecveReq()
-	info := seccheck.ExecveInfo{
-		Credentials: t.Credentials(),
-		Argv:        argv,
-		Env:         env,
+func getExecveSeccheckInfo(t *Task, argv, env []string, executable fsbridge.File, pathname string) (seccheck.FieldSet, *pb.ExecveInfo) {
+	fields := seccheck.Global.GetFieldSet(seccheck.PointExecve)
+	info := &pb.ExecveInfo{
+		Argv: argv,
+		Env:  env,
 	}
-	var mask seccheck.ExecveFieldSet
-	mask.Add(seccheck.ExecveFieldCredentials)
-	mask.Add(seccheck.ExecveFieldArgv)
-	mask.Add(seccheck.ExecveFieldEnv)
 	if executable != nil {
 		info.BinaryPath = pathname
-		mask.Add(seccheck.ExecveFieldBinaryPath)
 		if vfs2bridgeFile, ok := executable.(*fsbridge.VFSFile); ok {
-			if req.Contains(seccheck.ExecveFieldBinaryMode) || req.Contains(seccheck.ExecveFieldBinaryUID) || req.Contains(seccheck.ExecveFieldBinaryGID) {
-				var statOpts vfs.StatOptions
-				if req.Contains(seccheck.ExecveFieldBinaryMode) {
-					statOpts.Mask |= linux.STATX_TYPE | linux.STATX_MODE
-				}
-				if req.Contains(seccheck.ExecveFieldBinaryUID) {
-					statOpts.Mask |= linux.STATX_UID
-				}
-				if req.Contains(seccheck.ExecveFieldBinaryGID) {
-					statOpts.Mask |= linux.STATX_GID
+			if fields.Local.Contains(seccheck.FieldSentryExecveBinaryInfo) {
+				statOpts := vfs.StatOptions{
+					Mask: linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_UID | linux.STATX_GID,
 				}
 				if stat, err := vfs2bridgeFile.FileDescription().Stat(t, statOpts); err == nil {
 					if stat.Mask&(linux.STATX_TYPE|linux.STATX_MODE) == (linux.STATX_TYPE | linux.STATX_MODE) {
-						info.BinaryMode = stat.Mode
-						mask.Add(seccheck.ExecveFieldBinaryMode)
+						info.BinaryMode = uint32(stat.Mode)
 					}
 					if stat.Mask&linux.STATX_UID != 0 {
-						info.BinaryUID = auth.KUID(stat.UID)
-						mask.Add(seccheck.ExecveFieldBinaryUID)
+						info.BinaryUid = stat.UID
 					}
 					if stat.Mask&linux.STATX_GID != 0 {
-						info.BinaryGID = auth.KGID(stat.GID)
-						mask.Add(seccheck.ExecveFieldBinaryGID)
+						info.BinaryGid = stat.GID
 					}
 				}
 			}
@@ -347,8 +333,10 @@ func getExecveSeccheckInfo(t *Task, argv, env []string, executable fsbridge.File
 			// SHA256, which is very expensive.
 		}
 	}
-	t.k.tasks.mu.RLock()
-	defer t.k.tasks.mu.RUnlock()
-	t.loadSeccheckInfoLocked(req.Invoker, &mask.Invoker, &info.Invoker)
-	return mask, info
+
+	if !fields.Context.Empty() {
+		info.ContextData = &pb.ContextData{}
+		LoadSeccheckData(t, fields.Context, info.ContextData)
+	}
+	return fields, info
 }

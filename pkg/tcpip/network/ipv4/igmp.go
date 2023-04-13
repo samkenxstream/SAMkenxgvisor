@@ -16,11 +16,11 @@ package ipv4
 
 import (
 	"fmt"
-	"sync/atomic"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/network/internal/ip"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -83,9 +83,8 @@ type igmpState struct {
 	// MUST be based upon whether or not an IGMPv1 query was heard in the last
 	// [Version 1 Router Present Timeout] seconds".
 	//
-	// Must be accessed with atomic operations. Holds a value of 1 when true, 0
-	// when false.
-	igmpV1Present uint32
+	// Holds a value of 1 when true, 0 when false.
+	igmpV1Present atomicbitops.Uint32
 
 	// igmpV1Job is scheduled when this interface receives an IGMPv1 style
 	// message, upon expiration the igmpV1Present flag is cleared.
@@ -149,7 +148,7 @@ func (igmp *igmpState) init(ep *endpoint) {
 		Protocol:                  igmp,
 		MaxUnsolicitedReportDelay: UnsolicitedReportIntervalMax,
 	})
-	igmp.igmpV1Present = igmpV1PresentDefault
+	igmp.igmpV1Present = atomicbitops.FromUint32(igmpV1PresentDefault)
 	igmp.igmpV1Job = tcpip.NewJob(ep.protocol.stack.Clock(), &ep.mu, func() {
 		igmp.setV1Present(false)
 	})
@@ -269,14 +268,14 @@ func (igmp *igmpState) handleIGMP(pkt *stack.PacketBuffer, hasRouterAlertOption 
 }
 
 func (igmp *igmpState) v1Present() bool {
-	return atomic.LoadUint32(&igmp.igmpV1Present) == 1
+	return igmp.igmpV1Present.Load() == 1
 }
 
 func (igmp *igmpState) setV1Present(v bool) {
 	if v {
-		atomic.StoreUint32(&igmp.igmpV1Present, 1)
+		igmp.igmpV1Present.Store(1)
 	} else {
-		atomic.StoreUint32(&igmp.igmpV1Present, 0)
+		igmp.igmpV1Present.Store(0)
 	}
 }
 
@@ -313,14 +312,14 @@ func (igmp *igmpState) handleMembershipReport(groupAddress tcpip.Address) {
 //
 // +checklocksread:igmp.ep.mu
 func (igmp *igmpState) writePacket(destAddress tcpip.Address, groupAddress tcpip.Address, igmpType header.IGMPType) (bool, tcpip.Error) {
-	igmpData := header.IGMP(buffer.NewView(header.IGMPReportMinimumSize))
+	igmpData := header.IGMP(make([]byte, header.IGMPReportMinimumSize))
 	igmpData.SetType(igmpType)
 	igmpData.SetGroupAddress(groupAddress)
 	igmpData.SetChecksum(header.IGMPCalculateChecksum(igmpData))
 
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 		ReserveHeaderBytes: int(igmp.ep.MaxHeaderLength()),
-		Data:               buffer.View(igmpData).ToVectorisedView(),
+		Payload:            buffer.NewWithData(igmpData),
 	})
 	defer pkt.DecRef()
 

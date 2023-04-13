@@ -15,17 +15,17 @@
 // Package kernfs provides the tools to implement inode-based filesystems.
 // Kernfs has two main features:
 //
-// 1. The Inode interface, which maps VFS2's path-based filesystem operations to
-//    specific filesystem nodes. Kernfs uses the Inode interface to provide a
-//    blanket implementation for the vfs.FilesystemImpl. Kernfs also serves as
-//    the synchronization mechanism for all filesystem operations by holding a
-//    filesystem-wide lock across all operations.
+//  1. The Inode interface, which maps VFS2's path-based filesystem operations to
+//     specific filesystem nodes. Kernfs uses the Inode interface to provide a
+//     blanket implementation for the vfs.FilesystemImpl. Kernfs also serves as
+//     the synchronization mechanism for all filesystem operations by holding a
+//     filesystem-wide lock across all operations.
 //
-// 2. Various utility types which provide generic implementations for various
-//    parts of the Inode and vfs.FileDescription interfaces. Client filesystems
-//    based on kernfs can embed the appropriate set of these to avoid having to
-//    reimplement common filesystem operations. See inode_impl_util.go and
-//    fd_impl_util.go.
+//  2. Various utility types which provide generic implementations for various
+//     parts of the Inode and vfs.FileDescription interfaces. Client filesystems
+//     based on kernfs can embed the appropriate set of these to avoid having to
+//     reimplement common filesystem operations. See inode_impl_util.go and
+//     fd_impl_util.go.
 //
 // Reference Model:
 //
@@ -47,19 +47,22 @@
 //
 // Lock ordering:
 //
-// kernfs.Filesystem.mu
-//   kernfs.Dentry.dirMu
-//     vfs.VirtualFilesystem.mountMu
-//       vfs.Dentry.mu
-//   (inode implementation locks, if any)
+//	kernfs.Filesystem.mu
+//		kernel.TaskSet.mu
+//	  	kernel.Task.mu
+//		kernfs.Dentry.dirMu
+//	  	vfs.VirtualFilesystem.mountMu
+//	    	vfs.Dentry.mu
+//		(inode implementation locks, if any)
+//
 // kernfs.Filesystem.deferredDecRefsMu
 package kernfs
 
 import (
 	"fmt"
-	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fspath"
@@ -77,7 +80,7 @@ import (
 type Filesystem struct {
 	vfsfs vfs.Filesystem
 
-	deferredDecRefsMu sync.Mutex `state:"nosave"`
+	deferredDecRefsMu deferredDecRefsMutex `state:"nosave"`
 
 	// deferredDecRefs is a list of dentries waiting to be DecRef()ed. This is
 	// used to defer dentry destruction until mu can be acquired for
@@ -105,11 +108,11 @@ type Filesystem struct {
 	//   defer fs.mu.RUnlock()
 	//   ...
 	//   fs.deferDecRef(dentry)
-	mu sync.RWMutex `state:"nosave"`
+	mu filesystemRWMutex `state:"nosave"`
 
 	// nextInoMinusOne is used to to allocate inode numbers on this
 	// filesystem. Must be accessed by atomic operations.
-	nextInoMinusOne uint64
+	nextInoMinusOne atomicbitops.Uint64
 
 	// cachedDentries contains all dentries with 0 references. (Due to race
 	// conditions, it may also contain dentries with non-zero references.)
@@ -184,7 +187,7 @@ func (fs *Filesystem) VFSFilesystem() *vfs.Filesystem {
 
 // NextIno allocates a new inode number on this filesystem.
 func (fs *Filesystem) NextIno() uint64 {
-	return atomic.AddUint64(&fs.nextInoMinusOne, 1)
+	return fs.nextInoMinusOne.Add(1)
 }
 
 // These consts are used in the Dentry.flags field.
@@ -214,14 +217,14 @@ type Dentry struct {
 	// added to the cache or destroyed. If refs == -1, the dentry has already
 	// been destroyed. refs are allowed to go to 0 and increase again. refs is
 	// accessed using atomic memory operations.
-	refs int64
+	refs atomicbitops.Int64
 
 	// fs is the owning filesystem. fs is immutable.
 	fs *Filesystem
 
 	// flags caches useful information about the dentry from the inode. See the
-	// dflags* consts above. Must be accessed by atomic ops.
-	flags uint32
+	// dflags* consts above.
+	flags atomicbitops.Uint32
 
 	parent *Dentry
 	name   string
@@ -247,7 +250,7 @@ type Dentry struct {
 func (d *Dentry) IncRef() {
 	// d.refs may be 0 if d.fs.mu is locked, which serializes against
 	// d.cacheLocked().
-	r := atomic.AddInt64(&d.refs, 1)
+	r := d.refs.Add(1)
 	if d.LogRefs() {
 		refsvfs2.LogIncRef(d, r)
 	}
@@ -256,11 +259,11 @@ func (d *Dentry) IncRef() {
 // TryIncRef implements vfs.DentryImpl.TryIncRef.
 func (d *Dentry) TryIncRef() bool {
 	for {
-		r := atomic.LoadInt64(&d.refs)
+		r := d.refs.Load()
 		if r <= 0 {
 			return false
 		}
-		if atomic.CompareAndSwapInt64(&d.refs, r, r+1) {
+		if d.refs.CompareAndSwap(r, r+1) {
 			if d.LogRefs() {
 				refsvfs2.LogTryIncRef(d, r+1)
 			}
@@ -271,7 +274,7 @@ func (d *Dentry) TryIncRef() bool {
 
 // DecRef implements vfs.DentryImpl.DecRef.
 func (d *Dentry) DecRef(ctx context.Context) {
-	r := atomic.AddInt64(&d.refs, -1)
+	r := d.refs.Add(-1)
 	if d.LogRefs() {
 		refsvfs2.LogDecRef(d, r)
 	}
@@ -285,7 +288,7 @@ func (d *Dentry) DecRef(ctx context.Context) {
 }
 
 func (d *Dentry) decRefLocked(ctx context.Context) {
-	r := atomic.AddInt64(&d.refs, -1)
+	r := d.refs.Add(-1)
 	if d.LogRefs() {
 		refsvfs2.LogDecRef(d, r)
 	}
@@ -309,7 +312,7 @@ func (d *Dentry) cacheLocked(ctx context.Context) {
 	// to obtain a reference on a dentry with zero references is via path
 	// resolution, which requires d.fs.mu, so if d.refs is zero then it will
 	// remain zero while we hold d.fs.mu for writing.)
-	refs := atomic.LoadInt64(&d.refs)
+	refs := d.refs.Load()
 	if refs == -1 {
 		// Dentry has already been destroyed.
 		return
@@ -359,8 +362,8 @@ func (d *Dentry) cacheLocked(ctx context.Context) {
 }
 
 // Preconditions:
-// * fs.mu must be locked for writing.
-// * fs.cachedDentriesLen != 0.
+//   - fs.mu must be locked for writing.
+//   - fs.cachedDentriesLen != 0.
 func (fs *Filesystem) evictCachedDentryLocked(ctx context.Context) {
 	// Evict the least recently used dentry because cache size is greater than
 	// max cache size (configured on mount).
@@ -370,7 +373,7 @@ func (fs *Filesystem) evictCachedDentryLocked(ctx context.Context) {
 	victim.cached = false
 	// victim.refs may have become non-zero from an earlier path resolution
 	// after it was inserted into fs.cachedDentries.
-	if atomic.LoadInt64(&victim.refs) == 0 {
+	if victim.refs.Load() == 0 {
 		if !victim.vfsd.IsDead() {
 			victim.parent.dirMu.Lock()
 			// Note that victim can't be a mount point (in any mount
@@ -388,17 +391,17 @@ func (fs *Filesystem) evictCachedDentryLocked(ctx context.Context) {
 // destroyLocked destroys the dentry.
 //
 // Preconditions:
-// * d.fs.mu must be locked for writing.
-// * d.refs == 0.
-// * d should have been removed from d.parent.children, i.e. d is not reachable
-//   by path traversal.
-// * d.vfsd.IsDead() is true.
+//   - d.fs.mu must be locked for writing.
+//   - d.refs == 0.
+//   - d should have been removed from d.parent.children, i.e. d is not reachable
+//     by path traversal.
+//   - d.vfsd.IsDead() is true.
 func (d *Dentry) destroyLocked(ctx context.Context) {
-	refs := atomic.LoadInt64(&d.refs)
+	refs := d.refs.Load()
 	switch refs {
 	case 0:
 		// Mark the dentry destroyed.
-		atomic.StoreInt64(&d.refs, -1)
+		d.refs.Store(-1)
 	case -1:
 		panic("dentry.destroyLocked() called on already destroyed dentry")
 	default:
@@ -422,7 +425,7 @@ func (d *Dentry) RefType() string {
 
 // LeakMessage implements refsvfs2.CheckedObject.LeakMessage.
 func (d *Dentry) LeakMessage() string {
-	return fmt.Sprintf("[kernfs.Dentry %p] reference count of %d instead of -1", d, atomic.LoadInt64(&d.refs))
+	return fmt.Sprintf("[kernfs.Dentry %p] reference count of %d instead of -1", d, d.refs.Load())
 }
 
 // LogRefs implements refsvfs2.CheckedObject.LogRefs.
@@ -455,13 +458,13 @@ func (d *Dentry) Init(fs *Filesystem, inode Inode) {
 	d.vfsd.Init(d)
 	d.fs = fs
 	d.inode = inode
-	atomic.StoreInt64(&d.refs, 1)
+	d.refs.Store(1)
 	ftype := inode.Mode().FileType()
 	if ftype == linux.ModeDirectory {
-		d.flags |= dflagsIsDir
+		d.flags = atomicbitops.FromUint32(d.flags.RacyLoad() | dflagsIsDir)
 	}
 	if ftype == linux.ModeSymlink {
-		d.flags |= dflagsIsSymlink
+		d.flags = atomicbitops.FromUint32(d.flags.RacyLoad() | dflagsIsSymlink)
 	}
 	refsvfs2.Register(d)
 }
@@ -473,12 +476,12 @@ func (d *Dentry) VFSDentry() *vfs.Dentry {
 
 // isDir checks whether the dentry points to a directory inode.
 func (d *Dentry) isDir() bool {
-	return atomic.LoadUint32(&d.flags)&dflagsIsDir != 0
+	return d.flags.Load()&dflagsIsDir != 0
 }
 
 // isSymlink checks whether the dentry points to a symlink inode.
 func (d *Dentry) isSymlink() bool {
-	return atomic.LoadUint32(&d.flags)&dflagsIsSymlink != 0
+	return d.flags.Load()&dflagsIsSymlink != 0
 }
 
 // InotifyWithParent implements vfs.DentryImpl.InotifyWithParent.
@@ -501,8 +504,8 @@ func (d *Dentry) OnZeroWatches(context.Context) {}
 // own isn't sufficient to insert a child into a directory.
 //
 // Preconditions:
-// * d must represent a directory inode.
-// * d.fs.mu must be locked for at least reading.
+//   - d must represent a directory inode.
+//   - d.fs.mu must be locked for at least reading.
 func (d *Dentry) insertChild(name string, child *Dentry) {
 	d.dirMu.Lock()
 	d.insertChildLocked(name, child)
@@ -513,9 +516,9 @@ func (d *Dentry) insertChild(name string, child *Dentry) {
 // preconditions.
 //
 // Preconditions:
-// * d must represent a directory inode.
-// * d.dirMu must be locked.
-// * d.fs.mu must be locked for at least reading.
+//   - d must represent a directory inode.
+//   - d.dirMu must be locked.
+//   - d.fs.mu must be locked for at least reading.
 func (d *Dentry) insertChildLocked(name string, child *Dentry) {
 	if !d.isDir() {
 		panic(fmt.Sprintf("insertChildLocked called on non-directory Dentry: %+v.", d))
@@ -600,6 +603,13 @@ func (d *Dentry) WalkDentryTree(ctx context.Context, vfsObj *vfs.VirtualFilesyst
 	return target, nil
 }
 
+// Parent returns the parent of this Dentry. This is not safe in general, the
+// filesystem may concurrently move d elsewhere. The caller is responsible for
+// ensuring the returned result remains valid while it is used.
+func (d *Dentry) Parent() *Dentry {
+	return d.parent
+}
+
 // The Inode interface maps filesystem-level operations that operate on paths to
 // equivalent operations on specific filesystem nodes.
 //
@@ -613,8 +623,8 @@ func (d *Dentry) WalkDentryTree(ctx context.Context, vfsObj *vfs.VirtualFilesyst
 // Generally, implementations are not responsible for tasks that are common to
 // all filesystems. These include:
 //
-// - Checking that dentries passed to methods are of the appropriate file type.
-// - Checking permissions.
+//   - Checking that dentries passed to methods are of the appropriate file type.
+//   - Checking permissions.
 //
 // Inode functions may be called holding filesystem wide locks and are not
 // allowed to call vfs functions that may reenter, unless otherwise noted.
@@ -776,14 +786,14 @@ type inodeSymlink interface {
 	// Getlink returns the target of a symbolic link, as used by path
 	// resolution:
 	//
-	// - If the inode is a "magic link" (a link whose target is most accurately
-	// represented as a VirtualDentry), Getlink returns (ok VirtualDentry, "",
-	// nil). A reference is taken on the returned VirtualDentry.
+	//	- If the inode is a "magic link" (a link whose target is most accurately
+	//		represented as a VirtualDentry), Getlink returns (ok VirtualDentry, "",
+	//		nil). A reference is taken on the returned VirtualDentry.
 	//
-	// - If the inode is an ordinary symlink, Getlink returns (zero-value
-	// VirtualDentry, symlink target, nil).
+	//	- If the inode is an ordinary symlink, Getlink returns (zero-value
+	//		VirtualDentry, symlink target, nil).
 	//
-	// - If the inode is not a symlink, Getlink returns (zero-value
-	// VirtualDentry, "", EINVAL).
+	//	- If the inode is not a symlink, Getlink returns (zero-value
+	//		VirtualDentry, "", EINVAL).
 	Getlink(ctx context.Context, mnt *vfs.Mount) (vfs.VirtualDentry, string, error)
 }

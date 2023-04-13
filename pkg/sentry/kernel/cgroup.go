@@ -18,12 +18,13 @@ import (
 	"bytes"
 	"fmt"
 	"sort"
-	"sync/atomic"
 
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
-	"gvisor.dev/gvisor/pkg/sync"
 )
 
 // InvalidCgroupHierarchyID indicates an uninitialized hierarchy ID.
@@ -31,6 +32,26 @@ const InvalidCgroupHierarchyID uint32 = 0
 
 // CgroupControllerType is the name of a cgroup controller.
 type CgroupControllerType string
+
+// Available cgroup controllers.
+const (
+	CgroupControllerCPU     = CgroupControllerType("cpu")
+	CgroupControllerCPUAcct = CgroupControllerType("cpuacct")
+	CgroupControllerCPUSet  = CgroupControllerType("cpuset")
+	CgroupControllerJob     = CgroupControllerType("job")
+	CgroupControllerMemory  = CgroupControllerType("memory")
+	CgroupControllerPIDs    = CgroupControllerType("pids")
+)
+
+// CgroupResourceType represents a resource type tracked by a particular
+// controller.
+type CgroupResourceType int
+
+// Resources for the cpuacct controller.
+const (
+	// CgroupResourcePID represents a charge for pids.current.
+	CgroupResourcePID CgroupResourceType = iota
+)
 
 // CgroupController is the common interface to cgroup controllers available to
 // the entire sentry. The controllers themselves are defined by cgroupfs.
@@ -71,6 +92,8 @@ type Cgroup struct {
 	CgroupImpl
 }
 
+// decRef drops a reference on the cgroup. This must happen outside a Task.mu
+// critical section.
 func (c *Cgroup) decRef() {
 	c.Dentry.DecRef(context.Background())
 }
@@ -78,12 +101,6 @@ func (c *Cgroup) decRef() {
 // Path returns the absolute path of c, relative to its hierarchy root.
 func (c *Cgroup) Path() string {
 	return c.FSLocalPath()
-}
-
-// HierarchyID returns the id of the hierarchy that contains this cgroup.
-func (c *Cgroup) HierarchyID() uint32 {
-	// Note: a cgroup is guaranteed to have at least one controller.
-	return c.Controllers()[0].HierarchyID()
 }
 
 // CgroupMigrationContext represents an in-flight cgroup migration for
@@ -102,12 +119,26 @@ func (ctx *CgroupMigrationContext) Abort() {
 // Commit completes a migration.
 func (ctx *CgroupMigrationContext) Commit() {
 	ctx.dst.CommitMigrate(ctx.t, &ctx.src)
+
+	ctx.t.mu.Lock()
+	delete(ctx.t.cgroups, ctx.src)
+	ctx.src.DecRef(ctx.t)
+	ctx.dst.IncRef()
+	ctx.t.cgroups[ctx.dst] = struct{}{}
+	ctx.t.mu.Unlock()
 }
 
 // CgroupImpl is the common interface to cgroups.
 type CgroupImpl interface {
 	// Controllers lists the controller associated with this cgroup.
 	Controllers() []CgroupController
+
+	// HierarchyID returns the id of the hierarchy that contains this cgroup.
+	HierarchyID() uint32
+
+	// Name returns the name for this cgroup, if any. If no name was provided
+	// when the hierarchy was created, returns "".
+	Name() string
 
 	// Enter moves t into this cgroup.
 	Enter(t *Task)
@@ -126,6 +157,18 @@ type CgroupImpl interface {
 	// AbortMigrate cancels an in-flight migration. See
 	// cgroupfs.controller.AbortMigrate.
 	AbortMigrate(t *Task, src *Cgroup)
+
+	// Charge charges a controller in this cgroup for a particular resource. key
+	// must match a valid resource for the specified controller type.
+	//
+	// The implementer should silently succeed if no matching controllers are
+	// found.
+	//
+	// The underlying implementaion will panic if passed an incompatible
+	// resource type for a given controller.
+	//
+	// See cgroupfs.controller.Charge.
+	Charge(t *Task, d *kernfs.Dentry, ctl CgroupControllerType, res CgroupResourceType, value int64) error
 }
 
 // hierarchy represents a cgroupfs filesystem instance, with a unique set of
@@ -134,7 +177,8 @@ type CgroupImpl interface {
 //
 // +stateify savable
 type hierarchy struct {
-	id uint32
+	id   uint32
+	name string
 	// These are a subset of the controllers in CgroupRegistry.controllers,
 	// grouped here by hierarchy for conveninent lookup.
 	controllers map[CgroupControllerType]CgroupController
@@ -173,46 +217,77 @@ type cgroupFS interface {
 // +stateify savable
 type CgroupRegistry struct {
 	// lastHierarchyID is the id of the last allocated cgroup hierarchy. Valid
-	// ids are from 1 to math.MaxUint32. Must be accessed through atomic ops.
+	// ids are from 1 to math.MaxUint32.
 	//
-	lastHierarchyID uint32
+	lastHierarchyID atomicbitops.Uint32
 
-	mu sync.Mutex `state:"nosave"`
+	mu cgroupMutex `state:"nosave"`
 
 	// controllers is the set of currently known cgroup controllers on the
-	// system. Protected by mu.
+	// system.
 	//
 	// +checklocks:mu
 	controllers map[CgroupControllerType]CgroupController
 
-	// hierarchies is the active set of cgroup hierarchies. Protected by mu.
+	// hierarchies is the active set of cgroup hierarchies. This contains all
+	// hierarchies on the system.
 	//
 	// +checklocks:mu
 	hierarchies map[uint32]hierarchy
+
+	// hierarchiesByName is a map of named hierarchies. Only named hierarchies
+	// are tracked on this map.
+	//
+	// +checklocks:mu
+	hierarchiesByName map[string]hierarchy
 }
 
 func newCgroupRegistry() *CgroupRegistry {
 	return &CgroupRegistry{
-		controllers: make(map[CgroupControllerType]CgroupController),
-		hierarchies: make(map[uint32]hierarchy),
+		controllers:       make(map[CgroupControllerType]CgroupController),
+		hierarchies:       make(map[uint32]hierarchy),
+		hierarchiesByName: make(map[string]hierarchy),
 	}
 }
 
 // nextHierarchyID returns a newly allocated, unique hierarchy ID.
 func (r *CgroupRegistry) nextHierarchyID() (uint32, error) {
-	if hid := atomic.AddUint32(&r.lastHierarchyID, 1); hid != 0 {
+	if hid := r.lastHierarchyID.Add(1); hid != 0 {
 		return hid, nil
 	}
 	return InvalidCgroupHierarchyID, fmt.Errorf("cgroup hierarchy ID overflow")
 }
 
 // FindHierarchy returns a cgroup filesystem containing exactly the set of
-// controllers named in names. If no such FS is found, FindHierarchy return
-// nil. FindHierarchy takes a reference on the returned FS, which is transferred
-// to the caller.
-func (r *CgroupRegistry) FindHierarchy(ctypes []CgroupControllerType) *vfs.Filesystem {
+// controllers named in ctypes, and optionally the name specified in name if it
+// isn't empty. If no such FS is found, FindHierarchy return nil. FindHierarchy
+// takes a reference on the returned FS, which is transferred to the caller.
+func (r *CgroupRegistry) FindHierarchy(name string, ctypes []CgroupControllerType) (*vfs.Filesystem, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	// If we have a hierarchy name, lookup by name.
+	if name != "" {
+		h, ok := r.hierarchiesByName[name]
+		if !ok {
+			// Name not found.
+			return nil, nil
+		}
+
+		if h.match(ctypes) {
+			if !h.fs.TryIncRef() {
+				// May be racing with filesystem destruction, see below.
+				r.unregisterLocked(h.id)
+				return nil, nil
+			}
+			return h.fs, nil
+		}
+
+		// Name matched, but controllers didn't. Fail per linux
+		// kernel/cgroup.c:cgroup_mount().
+		log.Debugf("cgroupfs: Registry lookup for name=%s controllers=%v failed; named matched but controllers didn't (have controllers=%v)", name, ctypes, h.controllers)
+		return nil, linuxerr.EBUSY
+	}
 
 	for _, h := range r.hierarchies {
 		if h.match(ctypes) {
@@ -232,31 +307,35 @@ func (r *CgroupRegistry) FindHierarchy(ctypes []CgroupControllerType) *vfs.Files
 				// dying hierarchy now. The eventual unregister by the FS
 				// teardown will become a no-op.
 				r.unregisterLocked(h.id)
-				return nil
+				return nil, nil
 			}
-			return h.fs
+			return h.fs, nil
 		}
 	}
 
-	return nil
+	return nil, nil
 }
 
 // Register registers the provided set of controllers with the registry as a new
 // hierarchy. If any controller is already registered, the function returns an
 // error without modifying the registry. Register sets the hierarchy ID for the
 // filesystem on success.
-func (r *CgroupRegistry) Register(cs []CgroupController, fs cgroupFS) error {
+func (r *CgroupRegistry) Register(name string, cs []CgroupController, fs cgroupFS) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if len(cs) == 0 {
-		return fmt.Errorf("can't register hierarchy with no controllers")
+	if name == "" && len(cs) == 0 {
+		return fmt.Errorf("can't register hierarchy with both no controllers and no name")
 	}
 
 	for _, c := range cs {
 		if _, ok := r.controllers[c.Type()]; ok {
 			return fmt.Errorf("controllers may only be mounted on a single hierarchy")
 		}
+	}
+
+	if _, ok := r.hierarchiesByName[name]; name != "" && ok {
+		return fmt.Errorf("hierarchy named %q already exists", name)
 	}
 
 	hid, err := r.nextHierarchyID()
@@ -270,6 +349,7 @@ func (r *CgroupRegistry) Register(cs []CgroupController, fs cgroupFS) error {
 
 	h := hierarchy{
 		id:          hid,
+		name:        name,
 		controllers: make(map[CgroupControllerType]CgroupController),
 		fs:          fs.VFSFilesystem(),
 	}
@@ -279,6 +359,9 @@ func (r *CgroupRegistry) Register(cs []CgroupController, fs cgroupFS) error {
 		h.controllers[n] = c
 	}
 	r.hierarchies[hid] = h
+	if name != "" {
+		r.hierarchiesByName[name] = h
+	}
 	return nil
 }
 
@@ -294,7 +377,7 @@ func (r *CgroupRegistry) Unregister(hid uint32) {
 // +checklocks:r.mu
 func (r *CgroupRegistry) unregisterLocked(hid uint32) {
 	if h, ok := r.hierarchies[hid]; ok {
-		for name, _ := range h.controllers {
+		for name := range h.controllers {
 			delete(r.controllers, name)
 		}
 		delete(r.hierarchies, hid)
@@ -311,7 +394,7 @@ func (r *CgroupRegistry) computeInitialGroups(inherit map[Cgroup]struct{}) map[C
 	cgset := make(map[Cgroup]struct{})
 
 	// Remember controllers from the inherited cgroups set...
-	for cg, _ := range inherit {
+	for cg := range inherit {
 		cg.IncRef() // Ref transferred to caller.
 		for _, ctl := range cg.Controllers() {
 			ctlSet[ctl.Type()] = ctl

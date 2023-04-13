@@ -17,8 +17,9 @@ package stack
 import (
 	"fmt"
 	"reflect"
-	"sync/atomic"
 
+	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -61,9 +62,7 @@ type nic struct {
 	duplicateAddressDetectors map[tcpip.NetworkProtocolNumber]DuplicateAddressDetector
 
 	// enabled is set to 1 when the NIC is enabled and 0 when it is disabled.
-	//
-	// Must be accessed using atomic operations.
-	enabled uint32
+	enabled atomicbitops.Uint32
 
 	// linkResQueue holds packets that are waiting for link resolution to
 	// complete.
@@ -221,7 +220,7 @@ func (n *nic) getNetworkEndpoint(proto tcpip.NetworkProtocolNumber) NetworkEndpo
 
 // Enabled implements NetworkInterface.
 func (n *nic) Enabled() bool {
-	return atomic.LoadUint32(&n.enabled) == 1
+	return n.enabled.Load() == 1
 }
 
 // setEnabled sets the enabled status for the NIC.
@@ -229,9 +228,9 @@ func (n *nic) Enabled() bool {
 // Returns true if the enabled status was updated.
 func (n *nic) setEnabled(v bool) bool {
 	if v {
-		return atomic.SwapUint32(&n.enabled, 1) == 0
+		return n.enabled.Swap(1) == 0
 	}
-	return atomic.SwapUint32(&n.enabled, 0) == 1
+	return n.enabled.Swap(0) == 1
 }
 
 // disable disables n.
@@ -396,6 +395,9 @@ func (n *nic) writePacket(pkt *PacketBuffer) tcpip.Error {
 
 func (n *nic) writeRawPacket(pkt *PacketBuffer) tcpip.Error {
 	if err := n.qDisc.WritePacket(pkt); err != nil {
+		if _, ok := err.(*tcpip.ErrNoBufferSpace); ok {
+			n.stats.txPacketsDroppedNoBufferSpace.Increment()
+		}
 		return err
 	}
 
@@ -764,12 +766,12 @@ func (n *nic) DeliverLinkPacket(protocol tcpip.NetworkProtocolNumber, pkt *Packe
 			// overlapping slices (e.g. by passing a shallow copy of pkt to the packet
 			// endpoint).
 			packetEPPkt = NewPacketBuffer(PacketBufferOptions{
-				Data: PayloadSince(pkt.LinkHeader()).ToVectorisedView(),
+				Payload: buffer.NewWithData(PayloadSince(pkt.LinkHeader())),
 			})
 			// If a link header was populated in the original packet buffer, then
 			// populate it in the packet buffer we provide to packet endpoints as
 			// packet endpoints inspect link headers.
-			packetEPPkt.LinkHeader().Consume(pkt.LinkHeader().View().Size())
+			packetEPPkt.LinkHeader().Consume(len(pkt.LinkHeader().View()))
 
 			if incoming {
 				packetEPPkt.PktType = tcpip.PacketHost
@@ -810,7 +812,7 @@ func (n *nic) DeliverTransportPacket(protocol tcpip.TransportProtocolNumber, pkt
 
 	transProto := state.proto
 
-	if pkt.TransportHeader().View().IsEmpty() {
+	if len(pkt.TransportHeader().View()) == 0 {
 		n.stats.malformedL4RcvdPackets.Increment()
 		return TransportPacketHandled
 	}
@@ -893,7 +895,7 @@ func (n *nic) DeliverRawPacket(protocol tcpip.TransportProtocolNumber, pkt *Pack
 	// For ICMPv4 only we validate the header length for compatibility with
 	// raw(7) ICMP_FILTER. The same check is made in Linux here:
 	// https://github.com/torvalds/linux/blob/70585216/net/ipv4/raw.c#L189.
-	if protocol == header.ICMPv4ProtocolNumber && pkt.TransportHeader().View().Size()+pkt.Data().Size() < header.ICMPv4MinimumSize {
+	if protocol == header.ICMPv4ProtocolNumber && len(pkt.TransportHeader().View())+pkt.Data().Size() < header.ICMPv4MinimumSize {
 		return
 	}
 	n.stack.demux.deliverRawPacket(protocol, pkt)
@@ -1039,4 +1041,36 @@ func (n *nic) forwarding(protocol tcpip.NetworkProtocolNumber) (bool, tcpip.Erro
 	}
 
 	return forwardingEP.Forwarding(), nil
+}
+
+func (n *nic) multicastForwardingEndpoint(protocol tcpip.NetworkProtocolNumber) (MulticastForwardingNetworkEndpoint, tcpip.Error) {
+	ep := n.getNetworkEndpoint(protocol)
+	if ep == nil {
+		return nil, &tcpip.ErrUnknownProtocol{}
+	}
+
+	forwardingEP, ok := ep.(MulticastForwardingNetworkEndpoint)
+	if !ok {
+		return nil, &tcpip.ErrNotSupported{}
+	}
+
+	return forwardingEP, nil
+}
+
+func (n *nic) setMulticastForwarding(protocol tcpip.NetworkProtocolNumber, enable bool) (bool, tcpip.Error) {
+	ep, err := n.multicastForwardingEndpoint(protocol)
+	if err != nil {
+		return false, err
+	}
+
+	return ep.SetMulticastForwarding(enable), nil
+}
+
+func (n *nic) multicastForwarding(protocol tcpip.NetworkProtocolNumber) (bool, tcpip.Error) {
+	ep, err := n.multicastForwardingEndpoint(protocol)
+	if err != nil {
+		return false, err
+	}
+
+	return ep.MulticastForwarding(), nil
 }

@@ -42,12 +42,12 @@ package fdbased
 
 import (
 	"fmt"
-	"sync/atomic"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/rawfile"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -192,8 +192,8 @@ type Options struct {
 	// disabled.
 	GSOMaxSize uint32
 
-	// SoftwareGSOEnabled indicates whether software GSO is enabled or not.
-	SoftwareGSOEnabled bool
+	// GvisorGSOEnabled indicates whether Gvisor GSO is enabled or not.
+	GvisorGSOEnabled bool
 
 	// PacketDispatchMode specifies the type of inbound dispatcher to be
 	// used for this endpoint.
@@ -223,9 +223,7 @@ type Options struct {
 // Since fanoutID must be unique within the network namespace, we start with
 // the PID to avoid collisions. The only way to be sure of avoiding collisions
 // is to run in a new network namespace.
-//
-// Must be accessed using atomic operations.
-var fanoutID int32 = int32(unix.Getpid())
+var fanoutID atomicbitops.Int32 = atomicbitops.FromInt32(int32(unix.Getpid()))
 
 // New creates a new fd-based endpoint.
 //
@@ -282,7 +280,7 @@ func New(opts *Options) (stack.LinkEndpoint, error) {
 
 	// Increment fanoutID to ensure that we don't re-use the same fanoutID for
 	// the next endpoint.
-	fid := atomic.AddInt32(&fanoutID, 1)
+	fid := fanoutID.Add(1)
 
 	// Create per channel dispatchers.
 	for _, fd := range opts.FDs {
@@ -297,10 +295,10 @@ func New(opts *Options) (stack.LinkEndpoint, error) {
 		e.fds = append(e.fds, fdInfo{fd: fd, isSocket: isSocket})
 		if isSocket {
 			if opts.GSOMaxSize != 0 {
-				if opts.SoftwareGSOEnabled {
-					e.gsoKind = stack.SWGSOSupported
+				if opts.GvisorGSOEnabled {
+					e.gsoKind = stack.GvisorGSOSupported
 				} else {
-					e.gsoKind = stack.HWGSOSupported
+					e.gsoKind = stack.HostGSOSupported
 				}
 				e.gsoMaxSize = opts.GSOMaxSize
 			}
@@ -508,7 +506,7 @@ func (e *endpoint) writePacket(pkt *stack.PacketBuffer) tcpip.Error {
 	fdInfo := e.fds[pkt.Hash%uint32(len(e.fds))]
 	fd := fdInfo.fd
 	var vnetHdrBuf []byte
-	if e.gsoKind == stack.HWGSOSupported {
+	if e.gsoKind == stack.HostGSOSupported {
 		vnetHdr := virtioNetHdr{}
 		if pkt.GSOOptions.Type != stack.GSONone {
 			vnetHdr.hdrLen = uint16(pkt.HeaderSize())
@@ -532,7 +530,7 @@ func (e *endpoint) writePacket(pkt *stack.PacketBuffer) tcpip.Error {
 		vnetHdrBuf = vnetHdr.marshal()
 	}
 
-	views := pkt.Views()
+	views := pkt.Slices()
 	numIovecs := len(views)
 	if len(vnetHdrBuf) != 0 {
 		numIovecs++
@@ -579,7 +577,7 @@ func (e *endpoint) sendBatch(batchFDInfo fdInfo, pkts []*stack.PacketBuffer) (in
 		syscallHeaderBytes := uintptr(0)
 		for _, pkt := range batch {
 			var vnetHdrBuf []byte
-			if e.gsoKind == stack.HWGSOSupported {
+			if e.gsoKind == stack.HostGSOSupported {
 				vnetHdr := virtioNetHdr{}
 				if pkt.GSOOptions.Type != stack.GSONone {
 					vnetHdr.hdrLen = uint16(pkt.HeaderSize())
@@ -603,7 +601,7 @@ func (e *endpoint) sendBatch(batchFDInfo fdInfo, pkts []*stack.PacketBuffer) (in
 				vnetHdrBuf = vnetHdr.marshal()
 			}
 
-			views := pkt.Views()
+			views := pkt.Slices()
 			numIovecs := len(views)
 			if len(vnetHdrBuf) != 0 {
 				numIovecs++
@@ -667,19 +665,19 @@ func (e *endpoint) sendBatch(batchFDInfo fdInfo, pkts []*stack.PacketBuffer) (in
 //
 // Being a batch API, each packet in pkts should have the following
 // fields populated:
-//  - pkt.EgressRoute
-//  - pkt.GSOOptions
-//  - pkt.NetworkProtocolNumber
+//   - pkt.EgressRoute
+//   - pkt.GSOOptions
+//   - pkt.NetworkProtocolNumber
 func (e *endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
 	// Preallocate to avoid repeated reallocation as we append to batch.
-	// batchSz is 47 because when SWGSO is in use then a single 65KB TCP
+	// batchSz is 47 because when GvisorGSO is in use then a single 65KB TCP
 	// segment can get split into 46 segments of 1420 bytes and a single 216
 	// byte segment.
 	const batchSz = 47
 	batch := make([]*stack.PacketBuffer, 0, batchSz)
 	batchFDInfo := fdInfo{fd: -1, isSocket: false}
 	sentPackets := 0
-	for pkt := pkts.Front(); pkt != nil; pkt = pkt.Next() {
+	for _, pkt := range pkts.AsSlice() {
 		if len(batch) == 0 {
 			batchFDInfo = e.fds[pkt.Hash%uint32(len(e.fds))]
 		}

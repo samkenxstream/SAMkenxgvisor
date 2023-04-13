@@ -88,6 +88,7 @@ var Metrics = tcpip.Stats{
 			Packets: mustCreateMetric("/netstack/nic/tx/packets", "Number of packets transmitted."),
 			Bytes:   mustCreateMetric("/netstack/nic/tx/bytes", "Number of bytes transmitted."),
 		},
+		TxPacketsDroppedNoBufferSpace: mustCreateMetric("/netstack/nic/tx_packets_dropped_no_buffer_space", "Number of TX packets dropped as a result of no buffer space errors."),
 		Rx: tcpip.NICPacketStats{
 			Packets: mustCreateMetric("/netstack/nic/rx/packets", "Number of packets received."),
 			Bytes:   mustCreateMetric("/netstack/nic/rx/bytes", "Number of bytes received."),
@@ -1064,6 +1065,14 @@ func getSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, fam
 		vP := primitive.Int32(boolToInt32(v))
 		return &vP, nil
 
+	case linux.SO_RCVLOWAT:
+		if outLen < sizeOfInt32 {
+			return nil, syserr.ErrInvalidArgument
+		}
+
+		v := primitive.Int32(ep.SocketOptions().GetRcvlowat())
+		return &v, nil
+
 	default:
 		socket.GetSockOptEmitUnimplementedEvent(t, name)
 	}
@@ -1439,7 +1448,7 @@ func getSockOptIPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name 
 			return nil, syserr.ErrInvalidArgument
 		}
 
-		v := primitive.Int32(boolToInt32(ep.SocketOptions().GetRecvError()))
+		v := primitive.Int32(boolToInt32(ep.SocketOptions().GetIPv6RecvError()))
 		return &v, nil
 
 	case linux.IPV6_RECVORIGDSTADDR:
@@ -1639,7 +1648,7 @@ func getSockOptIP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name in
 			return nil, syserr.ErrInvalidArgument
 		}
 
-		v := primitive.Int32(boolToInt32(ep.SocketOptions().GetRecvError()))
+		v := primitive.Int32(boolToInt32(ep.SocketOptions().GetIPv4RecvError()))
 		return &v, nil
 
 	case linux.IP_PKTINFO:
@@ -2002,6 +2011,17 @@ func setSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, nam
 		var v tcpip.SocketDetachFilterOption
 		return syserr.TranslateNetstackError(ep.SetSockOpt(&v))
 
+	// TODO(b/226603727): Add support for SO_RCVLOWAT option. For now, only
+	// the unsupported syscall message is removed.
+	case linux.SO_RCVLOWAT:
+		if len(optVal) < sizeOfInt32 {
+			return syserr.ErrInvalidArgument
+		}
+
+		v := hostarch.ByteOrder.Uint32(optVal)
+		ep.SocketOptions().SetRcvlowat(int32(v))
+		return nil
+
 	default:
 		socket.SetSockOptEmitUnimplementedEvent(t, name)
 	}
@@ -2319,7 +2339,7 @@ func setSockOptIPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name 
 		if err != nil {
 			return err
 		}
-		ep.SocketOptions().SetRecvError(v != 0)
+		ep.SocketOptions().SetIPv6RecvError(v != 0)
 		return nil
 
 	case linux.IP6T_SO_SET_REPLACE:
@@ -2536,7 +2556,7 @@ func setSockOptIP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name in
 		if err != nil {
 			return err
 		}
-		ep.SocketOptions().SetRecvError(v != 0)
+		ep.SocketOptions().SetIPv4RecvError(v != 0)
 		return nil
 
 	case linux.IP_PKTINFO:

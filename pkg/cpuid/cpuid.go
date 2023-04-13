@@ -30,8 +30,6 @@ package cpuid
 import (
 	"fmt"
 	"strings"
-
-	"gvisor.dev/gvisor/pkg/context"
 )
 
 // contextID is the package for context.Context.Value keys.
@@ -42,8 +40,13 @@ const (
 	CtxFeatureSet contextID = iota
 )
 
+// context represents context.Context.
+type context interface {
+	Value(key interface{}) interface{}
+}
+
 // FromContext returns the FeatureSet from the context, if available.
-func FromContext(ctx context.Context) FeatureSet {
+func FromContext(ctx context) FeatureSet {
 	v := ctx.Value(CtxFeatureSet)
 	if v == nil {
 		return FeatureSet{} // Panics if used.
@@ -57,8 +60,8 @@ func FromContext(ctx context.Context) FeatureSet {
 // On x86, features are numbered according to "blocks". Each block is 32 bits, and
 // feature bits from the same source (cpuid leaf/level) are in the same block.
 //
-// On arm64, features are numbered according to the ELF HWCAP definition, from:
-//   arch/arm64/include/uapi/asm/hwcap.h
+// On arm64, features are numbered according to the ELF HWCAP definition, from
+// arch/arm64/include/uapi/asm/hwcap.h.
 type Feature int
 
 // allFeatureInfo is the value for allFeatures.

@@ -15,8 +15,6 @@
 package pipe
 
 import (
-	"sync/atomic"
-
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
@@ -31,7 +29,7 @@ import (
 // This file contains types enabling the pipe package to be used with the vfs
 // package.
 
-// VFSPipe represents the actual pipe, analagous to an inode. VFSPipes should
+// VFSPipe represents the actual pipe, analogous to an inode. VFSPipes should
 // not be copied.
 //
 // +stateify savable
@@ -102,12 +100,12 @@ func (vp *VFSPipe) Open(ctx context.Context, mnt *vfs.Mount, vfsd *vfs.Dentry, s
 		// Pipes opened for read-write always succeed without blocking.
 
 	case readable:
-		tWriters := atomic.LoadInt32(&vp.pipe.totalWriters)
+		tWriters := vp.pipe.totalWriters.Load()
 		vp.pipe.rOpen()
 		// If this pipe is being opened as blocking and there's no
 		// writer, we have to wait for a writer to open the other end.
 		for vp.pipe.isNamed && statusFlags&linux.O_NONBLOCK == 0 && !vp.pipe.HasWriters() &&
-			tWriters == atomic.LoadInt32(&vp.pipe.totalWriters) {
+			tWriters == vp.pipe.totalWriters.Load() {
 			if !ctx.BlockOn((*waitWriters)(&vp.pipe), waiter.EventInternal) {
 				fd.DecRef(ctx)
 				return nil, linuxerr.EINTR
@@ -115,10 +113,10 @@ func (vp *VFSPipe) Open(ctx context.Context, mnt *vfs.Mount, vfsd *vfs.Dentry, s
 		}
 
 	case writable:
-		tReaders := atomic.LoadInt32(&vp.pipe.totalReaders)
+		tReaders := vp.pipe.totalReaders.Load()
 		vp.pipe.wOpen()
 		for vp.pipe.isNamed && !vp.pipe.HasReaders() &&
-			tReaders == atomic.LoadInt32(&vp.pipe.totalReaders) {
+			tReaders == vp.pipe.totalReaders.Load() {
 			// Non-blocking, write-only opens fail with ENXIO when the read
 			// side isn't open yet.
 			if statusFlags&linux.O_NONBLOCK != 0 {
@@ -417,7 +415,7 @@ func spliceOrTee(ctx context.Context, dst, src *VFSPipeFD, count int64, removeFr
 		return uint64(n), err
 	})
 	dst.pipe.mu.Unlock()
-	src.pipe.mu.Unlock()
+	src.pipe.mu.NestedUnlock()
 
 	if n > 0 {
 		dst.pipe.queue.Notify(waiter.ReadableEvents)

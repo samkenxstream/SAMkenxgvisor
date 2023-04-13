@@ -23,7 +23,6 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
-	"gvisor.dev/gvisor/pkg/sync"
 )
 
 // KeyKind indicates the type of a Key.
@@ -201,18 +200,18 @@ func atomicOp(t Target, addr hostarch.Addr, opIn uint32) (bool, error) {
 type Waiter struct {
 	// Synchronization:
 	//
-	// - A Waiter that is not enqueued in a bucket is exclusively owned (no
-	// synchronization applies).
+	//	- A Waiter that is not enqueued in a bucket is exclusively owned (no
+	//		synchronization applies).
 	//
-	// - A Waiter is enqueued in a bucket by calling WaitPrepare(). After this,
-	// waiterEntry, bucket, and key are protected by the bucket.mu ("bucket
-	// lock") of the containing bucket, and bitmask is immutable. Note that
-	// since bucket is mutated using atomic memory operations, bucket.Load()
-	// may be called without holding the bucket lock, although it may change
-	// racily. See WaitComplete().
+	//	- A Waiter is enqueued in a bucket by calling WaitPrepare(). After this,
+	//		waiterEntry, bucket, and key are protected by the bucket.mu ("bucket
+	//		lock") of the containing bucket, and bitmask is immutable. Note that
+	//		since bucket is mutated using atomic memory operations, bucket.Load()
+	//		may be called without holding the bucket lock, although it may change
+	//		racily. See WaitComplete().
 	//
-	// - A Waiter is only guaranteed to be no longer queued after calling
-	// WaitComplete().
+	//	- A Waiter is only guaranteed to be no longer queued after calling
+	//		WaitComplete().
 
 	// waiterEntry links Waiter into bucket.waiters.
 	waiterEntry
@@ -252,7 +251,7 @@ func (w *Waiter) woken() bool {
 // +stateify savable
 type bucket struct {
 	// mu protects waiters and contained Waiter state. See comment in Waiter.
-	mu sync.Mutex `state:"nosave"`
+	mu futexBucketMutex `state:"nosave"`
 
 	waiters waiterList `state:"zerovalue"`
 }
@@ -342,11 +341,11 @@ func getKey(t Target, addr hostarch.Addr, private bool) (Key, error) {
 
 // bucketIndexForAddr returns the index into Manager.buckets for addr.
 func bucketIndexForAddr(addr hostarch.Addr) uintptr {
-	// - The bottom 2 bits of addr must be 0, per getKey.
+	//	- The bottom 2 bits of addr must be 0, per getKey.
 	//
-	// - On amd64, the top 16 bits of addr (bits 48-63) must be equal to bit 47
-	// for a canonical address, and (on all existing platforms) bit 47 must be
-	// 0 for an application address.
+	//	- On amd64, the top 16 bits of addr (bits 48-63) must be equal to bit 47
+	//		for a canonical address, and (on all existing platforms) bit 47 must be
+	//		0 for an application address.
 	//
 	// Thus 19 bits of addr are "useless" for hashing, leaving only 45 "useful"
 	// bits. We choose one of the simplest possible hash functions that at
@@ -426,10 +425,10 @@ func (m *Manager) lockBuckets(k1, k2 *Key) (b1 *bucket, b2 *bucket) {
 		switch {
 		case i1 < i2:
 			b1.mu.Lock()
-			b2.mu.Lock()
+			b2.mu.NestedLock()
 		case i2 < i1:
 			b2.mu.Lock()
-			b1.mu.Lock()
+			b1.mu.NestedLock()
 		default:
 			b1.mu.Lock()
 		}
@@ -452,7 +451,7 @@ func (m *Manager) lockBuckets(k1, k2 *Key) (b1 *bucket, b2 *bucket) {
 // +checklocksrelease:b1.mu
 // +checklocksrelease:b2.mu
 func (m *Manager) unlockBuckets(b1, b2 *bucket) {
-	b1.mu.Unlock()
+	b1.mu.NestedUnlock()
 	if b1 != b2 {
 		b2.mu.Unlock()
 	}

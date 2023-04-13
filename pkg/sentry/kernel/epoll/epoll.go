@@ -16,10 +16,11 @@
 // facility. See epoll(7) for more details.
 //
 // Lock order:
-// EventPoll.mu
-//   fdnotifier.notifier.mu
-//     EventPoll.listsMu
-//       unix.baseEndpoint.Mutex
+//
+//	 EventPoll.mu
+//		fdnotifier.notifier.mu
+//		  EventPoll.listsMu
+//		    unix.baseEndpoint.Mutex
 package epoll
 
 import (
@@ -108,7 +109,7 @@ type EventPoll struct {
 
 	// files is the map of all the files currently being observed, it is
 	// protected by mu.
-	mu    sync.Mutex `state:"nosave"`
+	mu    epollMutex `state:"nosave"`
 	files map[FileIdentifier]*pollEntry
 
 	// listsMu protects manipulation of the lists below. It needs to be a
@@ -128,7 +129,7 @@ type EventPoll struct {
 	//		called on it before it gets moved to the readyList.
 	//	disabledList -- when the entry is disabled. This happens when
 	//		a one-shot entry gets delivered via readEvents().
-	listsMu      sync.Mutex `state:"nosave"`
+	listsMu      epollListMutex `state:"nosave"`
 	readyList    pollEntryList
 	waitingList  pollEntryList
 	disabledList pollEntryList
@@ -212,6 +213,7 @@ func (e *EventPoll) eventsAvailable() bool {
 		return false
 	}
 	defer func() {
+		notify := true
 		e.listsMu.Lock()
 		e.readyList.PushFrontList(&readyList)
 		var next *pollEntry
@@ -221,12 +223,16 @@ func (e *EventPoll) eventsAvailable() bool {
 				// entry.NotifyEvent() was called while we were running.
 				waitingList.Remove(entry)
 				e.readyList.PushBack(entry)
+				notify = true
 			} else {
 				entry.curList = &e.waitingList
 			}
 		}
 		e.waitingList.PushBackList(&waitingList)
 		e.listsMu.Unlock()
+		if notify {
+			e.Notify(waiter.ReadableEvents)
+		}
 	}()
 
 	for it := readyList.Front(); it != nil; {
@@ -287,6 +293,7 @@ func (e *EventPoll) ReadEvents(max int) []linux.EpollEvent {
 		return nil
 	}
 	defer func() {
+		notify := false
 		e.listsMu.Lock()
 		e.readyList.PushFrontList(&readyList)
 		var next *pollEntry
@@ -296,6 +303,7 @@ func (e *EventPoll) ReadEvents(max int) []linux.EpollEvent {
 				// entry.NotifyEvent() was called while we were running.
 				waitingList.Remove(entry)
 				e.readyList.PushBack(entry)
+				notify = true
 			} else {
 				entry.curList = &e.waitingList
 			}
@@ -307,6 +315,9 @@ func (e *EventPoll) ReadEvents(max int) []linux.EpollEvent {
 		}
 		e.disabledList.PushBackList(&disabledList)
 		e.listsMu.Unlock()
+		if notify {
+			e.Notify(waiter.ReadableEvents)
+		}
 	}()
 
 	// Go through all entries we believe may be ready.

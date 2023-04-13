@@ -15,6 +15,7 @@
 package buffer
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 )
@@ -31,6 +32,19 @@ type View struct {
 	data bufferList
 	size int64
 	pool pool
+}
+
+// NewWithData creates a new view initialized with given data.
+func NewWithData(b []byte) View {
+	v := View{
+		size: int64(len(b)),
+	}
+	if len(b) > 0 {
+		buf := v.pool.getNoInit()
+		buf.initWithData(b)
+		v.data.PushBack(buf)
+	}
+	return v
 }
 
 // TrimFront removes the first count bytes from the buffer.
@@ -276,6 +290,16 @@ func (v *View) AppendOwned(data []byte) {
 		buf := v.pool.getNoInit()
 		buf.initWithData(data)
 		v.data.PushBack(buf)
+		v.size += int64(len(data))
+	}
+}
+
+// PrependOwned takes ownership of data and prepends it to v.
+func (v *View) PrependOwned(data []byte) {
+	if len(data) > 0 {
+		buf := v.pool.getNoInit()
+		buf.initWithData(data)
+		v.data.PushFront(buf)
 		v.size += int64(len(data))
 	}
 }
@@ -587,4 +611,13 @@ func (x Range) Len() int {
 		l = 0
 	}
 	return l
+}
+
+// Readers returns a bytes.Reader for each of bufs's underlying buffers.
+func (v *View) Readers() []bytes.Reader {
+	readers := make([]bytes.Reader, 0, v.data.Len())
+	for buf := v.data.Front(); buf != nil; buf = buf.Next() {
+		readers = append(readers, buf.Reader())
+	}
+	return readers
 }

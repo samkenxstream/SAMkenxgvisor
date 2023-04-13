@@ -17,12 +17,14 @@ package fsgofer
 import (
 	"io"
 	"math"
+	"os"
 	"path"
+	"path/filepath"
 	"strconv"
-	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	rwfd "gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/lisafs"
@@ -66,7 +68,7 @@ func (s *LisafsServer) Mount(c *lisafs.Connection, mountNode *lisafs.Node) (*lis
 
 	rootFD := &controlFDLisa{
 		hostFD:         rootHostFD,
-		writableHostFD: -1,
+		writableHostFD: atomicbitops.FromInt32(-1),
 	}
 	mountNode.IncRef() // Ref is transferred to ControlFD.
 	rootFD.ControlFD.Init(c, mountNode, linux.FileMode(stat.Mode), rootFD)
@@ -107,6 +109,9 @@ func (s *LisafsServer) SupportedMessages() []lisafs.MID {
 		lisafs.Getdents64,
 		lisafs.FGetXattr,
 		lisafs.FSetXattr,
+		lisafs.BindAt,
+		lisafs.Listen,
+		lisafs.Accept,
 	}
 }
 
@@ -117,10 +122,10 @@ type controlFDLisa struct {
 	// hostFD is the file descriptor which can be used to make host syscalls.
 	hostFD int
 
-	// writableHostFD is the file descriptor number for a writable FD opened on the
-	// same FD as `hostFD`. writableHostFD must only be accessed using atomic
-	// operations. It is initialized to -1, and can change in value exactly once.
-	writableHostFD int32
+	// writableHostFD is the file descriptor number for a writable FD opened on
+	// the same FD as `hostFD`. It is initialized to -1, and can change in value
+	// exactly once.
+	writableHostFD atomicbitops.Int32
 }
 
 var _ lisafs.ControlFDImpl = (*controlFDLisa)(nil)
@@ -152,13 +157,13 @@ func newControlFDLisa(hostFD int, parent *controlFDLisa, name string, mode linux
 		}
 	})
 	childFD.hostFD = hostFD
-	childFD.writableHostFD = -1
+	childFD.writableHostFD = atomicbitops.FromInt32(-1)
 	childFD.ControlFD.Init(parent.Conn(), childNode, mode, childFD)
 	return childFD
 }
 
 func (fd *controlFDLisa) getWritableFD() (int, error) {
-	if writableFD := atomic.LoadInt32(&fd.writableHostFD); writableFD != -1 {
+	if writableFD := fd.writableHostFD.Load(); writableFD != -1 {
 		return int(writableFD), nil
 	}
 
@@ -166,10 +171,10 @@ func (fd *controlFDLisa) getWritableFD() (int, error) {
 	if err != nil {
 		return -1, err
 	}
-	if !atomic.CompareAndSwapInt32(&fd.writableHostFD, -1, int32(writableFD)) {
+	if !fd.writableHostFD.CompareAndSwap(-1, int32(writableFD)) {
 		// Race detected, use the new value and clean this up.
 		unix.Close(writableFD)
-		return int(atomic.LoadInt32(&fd.writableHostFD)), nil
+		return int(fd.writableHostFD.Load()), nil
 	}
 	return writableFD, nil
 }
@@ -189,9 +194,9 @@ func (fd *controlFDLisa) Close() {
 		fd.hostFD = -1
 	}
 	// No concurrent access is possible so no need to use atomics.
-	if fd.writableHostFD >= 0 {
-		_ = unix.Close(int(fd.writableHostFD))
-		fd.writableHostFD = -1
+	if fd.writableHostFD.RacyLoad() >= 0 {
+		_ = unix.Close(int(fd.writableHostFD.RacyLoad()))
+		fd.writableHostFD = atomicbitops.FromInt32(-1)
 	}
 }
 
@@ -620,7 +625,7 @@ func (fd *controlFDLisa) Readlink(getLinkBuf func(uint32) []byte) (uint16, error
 // Connect implements lisafs.ControlFDImpl.Connect.
 func (fd *controlFDLisa) Connect(sockType uint32) (int, error) {
 	if !fd.Conn().ServerImpl().(*LisafsServer).config.HostUDS {
-		return -1, unix.ECONNREFUSED
+		return -1, unix.EPERM
 	}
 
 	// TODO(gvisor.dev/issue/1003): Due to different app vs replacement
@@ -629,7 +634,7 @@ func (fd *controlFDLisa) Connect(sockType uint32) (int, error) {
 	// in order to actually connect to this socket.
 	hostPath := fd.Node().FilePath()
 	if len(hostPath) >= unixPathMax {
-		return -1, unix.ECONNREFUSED
+		return -1, unix.EINVAL
 	}
 
 	// Only the following types are supported.
@@ -652,6 +657,68 @@ func (fd *controlFDLisa) Connect(sockType uint32) (int, error) {
 	return sock, nil
 }
 
+// BindAt implements lisafs.ControlFDImpl.BindAt.
+func (fd *controlFDLisa) BindAt(name string, sockType uint32) (*lisafs.ControlFD, linux.Statx, *lisafs.BoundSocketFD, int, error) {
+	if !fd.Conn().ServerImpl().(*LisafsServer).config.HostUDS {
+		return nil, linux.Statx{}, nil, -1, unix.EPERM
+	}
+
+	// Because there is no "bindat" syscall in Linux, we must create an
+	// absolute path to the socket we are creating,
+	socketPath := filepath.Join(fd.Node().FilePath(), name)
+
+	// TODO(gvisor.dev/issue/1003): Due to different app vs replacement
+	// mappings, the app path may have fit in the sockaddr, but we can't fit
+	// hostPath in our sockaddr. We'd need to redirect through a shorter path
+	// in order to actually connect to this socket.
+	if len(socketPath) >= unixPathMax {
+		log.Warningf("BindAt called with name too long: %q (len=%d)", socketPath, len(socketPath))
+		return nil, linux.Statx{}, nil, -1, unix.EINVAL
+	}
+
+	// Only the following types are supported.
+	switch sockType {
+	case unix.SOCK_STREAM, unix.SOCK_SEQPACKET:
+	default:
+		return nil, linux.Statx{}, nil, -1, unix.ENXIO
+	}
+
+	// Create and bind the socket using the sockPath which may be a
+	// symlink.
+	sockFD, err := unix.Socket(unix.AF_UNIX, int(sockType), 0)
+	if err != nil {
+		return nil, linux.Statx{}, nil, -1, err
+	}
+	if err := unix.Bind(sockFD, &unix.SockaddrUnix{Name: socketPath}); err != nil {
+		return nil, linux.Statx{}, nil, -1, err
+	}
+
+	// Stat the socket.
+	sockStat, err := fstatTo(sockFD)
+	if err != nil {
+		_ = unix.Unlink(socketPath)
+		return nil, linux.Statx{}, nil, -1, err
+	}
+
+	// Get an os.File that will back future socket calls.
+	sockFile := os.NewFile(uintptr(sockFD), socketPath)
+
+	// Create an FD that will be donated to the sandbox.
+	sockFDToDonate, err := unix.Dup(int(sockFile.Fd()))
+	if err != nil {
+		_ = unix.Unlink(socketPath)
+		return nil, linux.Statx{}, nil, -1, err
+	}
+
+	socketControlFD := newControlFDLisa(sockFD, fd, socketPath, linux.ModeSocket)
+	boundSocketFD := &boundSocketFDLisa{
+		sock: sockFile,
+	}
+	boundSocketFD.Init(socketControlFD.FD(), boundSocketFD)
+
+	return socketControlFD.FD(), sockStat, boundSocketFD.FD(), sockFDToDonate, nil
+}
+
 // Unlink implements lisafs.ControlFDImpl.Unlink.
 func (fd *controlFDLisa) Unlink(name string, flags uint32) error {
 	return unix.Unlinkat(fd.hostFD, name, int(flags))
@@ -669,32 +736,12 @@ func (fd *controlFDLisa) Renamed() {
 
 // GetXattr implements lisafs.ControlFDImpl.GetXattr.
 func (fd *controlFDLisa) GetXattr(name string, size uint32, getValueBuf func(uint32) []byte) (uint16, error) {
-	if !fd.Conn().ServerImpl().(*LisafsServer).config.EnableVerityXattr {
-		return 0, unix.EOPNOTSUPP
-	}
-	if _, ok := verityXattrs[name]; !ok {
-		return 0, unix.EOPNOTSUPP
-	}
-	if size == 0 {
-		n, err := unix.Fgetxattr(fd.hostFD, name, nil)
-		if err != nil {
-			return 0, err
-		}
-		size = uint32(n)
-	}
-	n, err := unix.Fgetxattr(fd.hostFD, name, getValueBuf(size))
-	return uint16(n), err
+	return 0, unix.EOPNOTSUPP
 }
 
 // SetXattr implements lisafs.ControlFDImpl.SetXattr.
 func (fd *controlFDLisa) SetXattr(name string, value string, flags uint32) error {
-	if !fd.Conn().ServerImpl().(*LisafsServer).config.EnableVerityXattr {
-		return unix.EOPNOTSUPP
-	}
-	if _, ok := verityXattrs[name]; !ok {
-		return unix.EOPNOTSUPP
-	}
-	return unix.Fsetxattr(fd.hostFD, name, []byte(value) /* sigh */, int(flags))
+	return unix.EOPNOTSUPP
 }
 
 // ListXattr implements lisafs.ControlFDImpl.ListXattr.
@@ -836,6 +883,44 @@ func (fd *openFDLisa) Getdent64(count uint32, seek0 bool, recordDirent func(lisa
 // Renamed implements lisafs.OpenFDImpl.Renamed.
 func (fd *openFDLisa) Renamed() {
 	// openFDLisa does not have any state to update on rename.
+}
+
+type boundSocketFDLisa struct {
+	lisafs.BoundSocketFD
+
+	sock *os.File
+}
+
+var _ lisafs.BoundSocketFDImpl = (*boundSocketFDLisa)(nil)
+
+// Close implements lisafs.BoundSocketFD.Close.
+func (fd *boundSocketFDLisa) Close() {
+	fd.sock.Close()
+}
+
+// FD implements lisafs.BoundSocketFD.FD.
+func (fd *boundSocketFDLisa) FD() *lisafs.BoundSocketFD {
+	if fd == nil {
+		return nil
+	}
+	return &fd.BoundSocketFD
+}
+
+// Listen implements lisafs.BoundSocketFD.Listen.
+func (fd *boundSocketFDLisa) Listen(backlog int32) error {
+	return unix.Listen(int(fd.sock.Fd()), int(backlog))
+}
+
+// Listen implements lisafs.BoundSocketFD.Accept.
+func (fd *boundSocketFDLisa) Accept() (int, string, error) {
+	flags := unix.O_NONBLOCK | unix.O_CLOEXEC
+	nfd, _, err := unix.Accept4(int(fd.sock.Fd()), flags)
+	if err != nil {
+		return -1, "", err
+	}
+	// Return an empty peer address so that we don't leak the actual host
+	// address.
+	return nfd, "", err
 }
 
 // tryOpen tries to open() with different modes as documented.

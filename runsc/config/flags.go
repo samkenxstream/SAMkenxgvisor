@@ -34,6 +34,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.String("log", "", "file path where internal debug information is written, default is stdout.")
 	flagSet.String("log-format", "text", "log format: text (default), json, or json-k8s.")
 	flagSet.Bool("debug", false, "enable debug logging.")
+	flagSet.Bool("systemd-cgroup", false, "EXPERIMENTAL. Use systemd for cgroups.")
 
 	// These flags are unique to runsc, and are used to configure parts of the
 	// system that are not covered by the runtime spec.
@@ -71,28 +72,31 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Bool("oci-seccomp", false, "Enables loading OCI seccomp filters inside the sandbox.")
 	flagSet.Var(defaultControlConfig(), "controls", "Sentry control endpoints.")
 	flagSet.Bool("enable-core-tags", false, "enables core tagging. Requires host linux kernel >= 5.14.")
+	flagSet.String("pod-init-config", "", "path to configuration file with additional steps to take during pod creation.")
 
 	// Flags that control sandbox runtime behavior: FS related.
 	flagSet.Var(fileAccessTypePtr(FileAccessExclusive), "file-access", "specifies which filesystem validation to use for the root mount: exclusive (default), shared.")
 	flagSet.Var(fileAccessTypePtr(FileAccessShared), "file-access-mounts", "specifies which filesystem validation to use for volumes other than the root mount: shared (default), exclusive.")
 	flagSet.Bool("overlay", false, "wrap filesystem mounts with writable overlay. All modifications are stored in memory inside the sandbox.")
-	flagSet.Bool("verity", false, "specifies whether a verity file system will be mounted.")
 	flagSet.Bool("fsgofer-host-uds", false, "allow the gofer to mount Unix Domain Sockets.")
-	flagSet.Bool("vfs2", true, "enables VFSv2. This uses the new VFS layer that is faster than the previous one.")
+	flagSet.Bool("vfs2", true, "DEPRECATED: this flag has no effect.")
 	flagSet.Bool("fuse", false, "TEST ONLY; use while FUSE in VFSv2 is landing. This allows the use of the new experimental FUSE filesystem.")
-	flagSet.Bool("lisafs", false, "Enables lisafs protocol instead of 9P. This is only effective with VFS2.")
+	flagSet.Bool("lisafs", false, "Enables lisafs protocol instead of 9P.")
 	flagSet.Bool("cgroupfs", false, "Automatically mount cgroupfs.")
 	flagSet.Bool("ignore-cgroups", false, "don't configure cgroups.")
+	flagSet.Int("fdlimit", -1, "Specifies a limit on the number of host file descriptors that can be open. Applies separately to the sentry and gofer. Note: each file in the sandbox holds more than one host FD open.")
+	flagSet.Int("dcache", 0, "Set the global gofer direct cache size. This acts as a coarse-grained control on the number of host FDs simultaneously open by the sentry. If zero, per-mount caches are used.")
 
 	// Flags that control sandbox runtime behavior: network related.
 	flagSet.Var(networkTypePtr(NetworkSandbox), "network", "specifies which network to use: sandbox (default), host, none. Using network inside the sandbox is more secure because it's isolated from the host network.")
 	flagSet.Bool("net-raw", false, "enable raw sockets. When false, raw sockets are disabled by removing CAP_NET_RAW from containers (`runsc exec` will still be able to utilize raw sockets). Raw sockets allow malicious containers to craft packets and potentially attack the network.")
-	flagSet.Bool("gso", true, "enable hardware segmentation offload if it is supported by a network device.")
-	flagSet.Bool("software-gso", true, "enable software segmentation offload when hardware offload can't be enabled.")
+	flagSet.Bool("gso", true, "enable host segmentation offload if it is supported by a network device.")
+	flagSet.Bool("software-gso", true, "enable gVisor segmentation offload when host offload can't be enabled.")
 	flagSet.Bool("tx-checksum-offload", false, "enable TX checksum offload.")
 	flagSet.Bool("rx-checksum-offload", true, "enable RX checksum offload.")
 	flagSet.Var(queueingDisciplinePtr(QDiscFIFO), "qdisc", "specifies which queueing discipline to apply by default to the non loopback nics used by the sandbox.")
 	flagSet.Int("num-network-channels", 1, "number of underlying channels(FDs) to use for network link endpoints.")
+	flagSet.Bool("buffer-pooling", true, "enable allocation of buffers from a shared pool instead of the heap.")
 
 	// Test flags, not to be used outside tests, ever.
 	flagSet.Bool("TESTONLY-unsafe-nonroot", false, "TEST ONLY; do not ever use! This skips many security measures that isolate the host from the sandbox.")

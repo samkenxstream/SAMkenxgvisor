@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"runtime"
 	"runtime/trace"
-	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
@@ -57,7 +56,7 @@ type taskRunState interface {
 // make it visible in stack dumps. A goroutine for a given task can be identified
 // searching for Task.run()'s argument value.
 func (t *Task) run(threadID uintptr) {
-	atomic.StoreInt64(&t.goid, goid.Get())
+	t.goid.Store(goid.Get())
 
 	// Construct t.blockingTimer here. We do this here because we can't
 	// reconstruct t.blockingTimer during restore in Task.afterLoad(), because
@@ -83,14 +82,14 @@ func (t *Task) run(threadID uintptr) {
 	for {
 		// Explanation for this ordering:
 		//
-		// - A freshly-started task that is stopped should not do anything
-		// before it enters the stop.
+		//	- A freshly-started task that is stopped should not do anything
+		//		before it enters the stop.
 		//
-		// - If taskRunState.execute returns nil, the task goroutine should
-		// exit without checking for a stop.
+		//	- If taskRunState.execute returns nil, the task goroutine should
+		//		exit without checking for a stop.
 		//
-		// - Task.Start won't start Task.run if t.runState is nil, so this
-		// ordering is safe.
+		//	- Task.Start won't start Task.run if t.runState is nil, so this
+		//		ordering is safe.
 		t.doStop()
 		t.runState = t.runState.execute(t)
 		if t.runState == nil {
@@ -103,7 +102,7 @@ func (t *Task) run(threadID uintptr) {
 
 			// Deferring this store triggers a false positive in the race
 			// detector (https://github.com/golang/go/issues/42599).
-			atomic.StoreInt64(&t.goid, 0)
+			t.goid.Store(0)
 			// Keep argument alive because stack trace for dead variables may not be correct.
 			runtime.KeepAlive(threadID)
 			return
@@ -113,7 +112,7 @@ func (t *Task) run(threadID uintptr) {
 
 // doStop is called by Task.run to block until the task is not stopped.
 func (t *Task) doStop() {
-	if atomic.LoadInt32(&t.stopCount) == 0 {
+	if t.stopCount.Load() == 0 {
 		return
 	}
 	t.Deactivate()
@@ -128,7 +127,7 @@ func (t *Task) doStop() {
 	defer t.tg.pidns.owner.runningGoroutines.Add(1)
 	t.goroutineStopped.Add(-1)
 	defer t.goroutineStopped.Add(1)
-	for t.stopCount > 0 {
+	for t.stopCount.RacyLoad() > 0 {
 		t.endStopCond.Wait()
 	}
 }
@@ -148,11 +147,11 @@ func (app *runApp) execute(t *Task) taskRunState {
 	}
 
 	// Execute any task work callbacks before returning to user space.
-	if atomic.LoadInt32(&t.taskWorkCount) > 0 {
+	if t.taskWorkCount.Load() > 0 {
 		t.taskWorkMu.Lock()
 		queue := t.taskWork
 		t.taskWork = nil
-		atomic.StoreInt32(&t.taskWorkCount, 0)
+		t.taskWorkCount.Store(0)
 		t.taskWorkMu.Unlock()
 
 		// Do not hold taskWorkMu while executing task work, which may register
@@ -268,6 +267,8 @@ func (app *runApp) execute(t *Task) taskRunState {
 		// an application-generated signal and we should continue execution
 		// normally.
 		if at.Any() {
+			faultCounter.Increment()
+
 			region := trace.StartRegion(t.traceContext, faultRegion)
 			addr := hostarch.Addr(info.Addr())
 			err := t.MemoryManager().HandleUserFault(t, addr, at, hostarch.Addr(t.Arch().Stack()))
@@ -347,14 +348,14 @@ func (app *runApp) execute(t *Task) taskRunState {
 // assertTaskGoroutine panics if the caller is not running on t's task
 // goroutine.
 func (t *Task) assertTaskGoroutine() {
-	if got, want := goid.Get(), atomic.LoadInt64(&t.goid); got != want {
+	if got, want := goid.Get(), t.goid.Load(); got != want {
 		panic(fmt.Sprintf("running on goroutine %d (task goroutine for kernel.Task %p is %d)", got, t, want))
 	}
 }
 
 // GoroutineID returns the ID of t's task goroutine.
 func (t *Task) GoroutineID() int64 {
-	return atomic.LoadInt64(&t.goid)
+	return t.goid.Load()
 }
 
 // waitGoroutineStoppedOrExited blocks until t's task goroutine stops or exits.
@@ -373,6 +374,6 @@ func (tg *ThreadGroup) WaitExited() {
 
 // Yield yields the processor for the calling task.
 func (t *Task) Yield() {
-	atomic.AddUint64(&t.yieldCount, 1)
+	t.yieldCount.Add(1)
 	runtime.Gosched()
 }

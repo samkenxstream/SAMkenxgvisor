@@ -22,7 +22,6 @@
 package kvm
 
 import (
-	"sync/atomic"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -65,14 +64,14 @@ func bluepillArchContext(context unsafe.Pointer) *arch.SignalContext64 {
 //go:nosplit
 func bluepillGuestExit(c *vCPU, context unsafe.Pointer) {
 	// Increment our counter.
-	atomic.AddUint64(&c.guestExits, 1)
+	c.guestExits.Add(1)
 
 	// Copy out registers.
 	bluepillArchExit(c, bluepillArchContext(context))
 
 	// Return to the vCPUReady state; notify any waiters.
-	user := atomic.LoadUint32(&c.state) & vCPUUser
-	switch atomic.SwapUint32(&c.state, user) {
+	user := c.state.Load() & vCPUUser
+	switch c.state.Swap(user) {
 	case user | vCPUGuest: // Expected case.
 	case user | vCPUGuest | vCPUWaiter:
 		c.notify()
@@ -102,7 +101,7 @@ func bluepillHandler(context unsafe.Pointer) {
 	c := bluepillArchEnter(bluepillArchContext(context))
 
 	// Mark this as guest mode.
-	switch atomic.SwapUint32(&c.state, vCPUGuest|vCPUUser) {
+	switch c.state.Swap(vCPUGuest | vCPUUser) {
 	case vCPUUser: // Expected case.
 	case vCPUUser | vCPUWaiter:
 		c.notify()
@@ -111,10 +110,12 @@ func bluepillHandler(context unsafe.Pointer) {
 	}
 
 	for {
+		hostExitCounter.Increment()
 		_, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(c.fd), _KVM_RUN, 0) // escapes: no.
 		switch errno {
 		case 0: // Expected case.
 		case unix.EINTR:
+			interruptCounter.Increment()
 			// First, we process whatever pending signal
 			// interrupted KVM. Since we're in a signal handler
 			// currently, all signals are masked and the signal

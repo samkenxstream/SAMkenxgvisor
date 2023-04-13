@@ -65,6 +65,10 @@ type Stack struct {
 	netSNMPFile    *os.File
 }
 
+// Destroy implements inet.Stack.Destroy.
+func (*Stack) Destroy() {
+}
+
 // NewStack returns an empty Stack containing no configuration.
 func NewStack() *Stack {
 	return &Stack{
@@ -480,6 +484,9 @@ func (s *Stack) Statistics(stat interface{}, arg string) error {
 func (s *Stack) RouteTable() []inet.Route {
 	return append([]inet.Route(nil), s.routes...)
 }
+
+// Pause implements inet.Stack.Pause.
+func (*Stack) Pause() {}
 
 // Resume implements inet.Stack.Resume.
 func (*Stack) Resume() {}

@@ -173,6 +173,11 @@ var allowedSyscalls = seccomp.SyscallRules{
 			seccomp.EqualTo(linux.TIOCGWINSZ),
 			seccomp.MatchAny{}, /* winsize struct */
 		},
+		{
+			seccomp.MatchAny{}, /* fd */
+			seccomp.EqualTo(linux.SIOCGIFTXQLEN),
+			seccomp.MatchAny{}, /* ifreq struct */
+		},
 	},
 	unix.SYS_LSEEK:   {},
 	unix.SYS_MADVISE: {},
@@ -473,6 +478,16 @@ func hostInetFilters() seccomp.SyscallRules {
 				seccomp.MatchAny{},
 				seccomp.EqualTo(unix.SOL_SOCKET),
 				seccomp.EqualTo(unix.SO_TIMESTAMP),
+			},
+			{
+				seccomp.MatchAny{},
+				seccomp.EqualTo(unix.SOL_SOCKET),
+				seccomp.EqualTo(unix.SO_RCVTIMEO),
+			},
+			{
+				seccomp.MatchAny{},
+				seccomp.EqualTo(unix.SOL_SOCKET),
+				seccomp.EqualTo(unix.SO_SNDTIMEO),
 			},
 			{
 				seccomp.MatchAny{},

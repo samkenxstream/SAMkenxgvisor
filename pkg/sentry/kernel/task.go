@@ -20,9 +20,11 @@ import (
 	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/bpf"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/metric"
 	"gvisor.dev/gvisor/pkg/sentry/fs"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -30,7 +32,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/sched"
 	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
-	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
@@ -62,7 +63,7 @@ type Task struct {
 	// but since it's used to detect cases where non-task goroutines
 	// incorrectly access state owned by, or exclusive to, the task goroutine,
 	// goid is always accessed using atomic memory operations.
-	goid int64 `state:"nosave"`
+	goid atomicbitops.Int64 `state:"nosave"`
 
 	// runState is what the task goroutine is executing if it is not stopped.
 	// If runState is nil, the task goroutine should exit or has exited.
@@ -71,9 +72,7 @@ type Task struct {
 
 	// taskWorkCount represents the current size of the task work queue. It is
 	// used to avoid acquiring taskWorkMu when the queue is empty.
-	//
-	// Must accessed with atomic memory operations.
-	taskWorkCount int32
+	taskWorkCount atomicbitops.Int32
 
 	// taskWorkMu protects taskWork.
 	taskWorkMu sync.Mutex `state:"nosave"`
@@ -111,7 +110,7 @@ type Task struct {
 	//
 	// yieldCount is accessed using atomic memory operations. yieldCount is
 	// owned by the task goroutine.
-	yieldCount uint64
+	yieldCount atomicbitops.Uint64
 
 	// pendingSignals is the set of pending signals that may be handled only by
 	// this task.
@@ -128,7 +127,7 @@ type Task struct {
 	// signal mutex is locked or if atomic memory operations are used, while
 	// writing signalMask requires both). signalMask is owned by the task
 	// goroutine.
-	signalMask linux.SignalSet
+	signalMask atomicbitops.Uint64
 
 	// If the task goroutine is currently executing Task.sigtimedwait,
 	// realSignalMask is the previous value of signalMask, which has temporarily
@@ -218,7 +217,7 @@ type Task struct {
 	// stop; after a save/restore cycle, the restored sentry has no knowledge
 	// of the pre-save sentryctl command, and the stopped task would remain
 	// stopped forever.)
-	stopCount int32 `state:"nosave"`
+	stopCount atomicbitops.Int32 `state:"nosave"`
 
 	// endStopCond is signaled when stopCount transitions to 0. The combination
 	// of stopCount and endStopCond effectively form a sync.WaitGroup, but
@@ -256,7 +255,7 @@ type Task struct {
 	containerID string
 
 	// mu protects some of the following fields.
-	mu sync.Mutex `state:"nosave"`
+	mu taskMutex `state:"nosave"`
 
 	// image holds task data provided by the ELF loader.
 	//
@@ -483,9 +482,7 @@ type Task struct {
 
 	// cpu is the fake cpu number returned by getcpu(2). cpu is ignored
 	// entirely if Kernel.useHostCores is true.
-	//
-	// cpu is accessed using atomic memory operations.
-	cpu int32
+	cpu atomicbitops.Int32
 
 	// This is used to keep track of changes made to a process' priority/niceness.
 	// It is mostly used to provide some reasonable return value from
@@ -599,6 +596,19 @@ type Task struct {
 	userCounters *userCounters
 }
 
+// Task related metrics
+var (
+	// syscallCounter is a metric that tracks how many syscalls the sentry has
+	// executed.
+	syscallCounter = metric.MustCreateNewUint64Metric(
+		"/task/syscalls", false, "The number of syscalls the sentry has executed for the user.")
+
+	// faultCounter is a metric that tracks how many faults the sentry has had to
+	// handle.
+	faultCounter = metric.MustCreateNewUint64Metric(
+		"/task/faults", false, "The number of faults the sentry has handled.")
+)
+
 func (t *Task) savePtraceTracer() *Task {
 	return t.ptraceTracer.Load().(*Task)
 }
@@ -624,7 +634,7 @@ func (t *Task) afterLoad() {
 	t.interruptChan = make(chan struct{}, 1)
 	t.gosched.State = TaskGoroutineNonexistent
 	if t.stop != nil {
-		t.stopCount = 1
+		t.stopCount = atomicbitops.FromInt32(1)
 	}
 	t.endStopCond.L = &t.tg.signalHandlers.mu
 	t.rseqPreempted = true
@@ -844,7 +854,7 @@ func (t *Task) ContainerID() string {
 
 // OOMScoreAdj gets the task's thread group's OOM score adjustment.
 func (t *Task) OOMScoreAdj() int32 {
-	return atomic.LoadInt32(&t.tg.oomScoreAdj)
+	return t.tg.oomScoreAdj.Load()
 }
 
 // SetOOMScoreAdj sets the task's thread group's OOM score adjustment. The
@@ -853,7 +863,7 @@ func (t *Task) SetOOMScoreAdj(adj int32) error {
 	if adj > 1000 || adj < -1000 {
 		return linuxerr.EINVAL
 	}
-	atomic.StoreInt32(&t.tg.oomScoreAdj, adj)
+	t.tg.oomScoreAdj.Store(adj)
 	return nil
 }
 
@@ -877,25 +887,5 @@ func (t *Task) ResetKcov() {
 	if t.kcov != nil {
 		t.kcov.OnTaskExit()
 		t.kcov = nil
-	}
-}
-
-// Preconditions: The TaskSet mutex must be locked.
-func (t *Task) loadSeccheckInfoLocked(req seccheck.TaskFieldSet, mask *seccheck.TaskFieldSet, info *seccheck.TaskInfo) {
-	if req.Contains(seccheck.TaskFieldThreadID) {
-		info.ThreadID = int32(t.k.tasks.Root.tids[t])
-		mask.Add(seccheck.TaskFieldThreadID)
-	}
-	if req.Contains(seccheck.TaskFieldThreadStartTime) {
-		info.ThreadStartTime = t.startTime
-		mask.Add(seccheck.TaskFieldThreadStartTime)
-	}
-	if req.Contains(seccheck.TaskFieldThreadGroupID) {
-		info.ThreadGroupID = int32(t.k.tasks.Root.tgids[t.tg])
-		mask.Add(seccheck.TaskFieldThreadGroupID)
-	}
-	if req.Contains(seccheck.TaskFieldThreadGroupStartTime) {
-		info.ThreadGroupStartTime = t.tg.leader.startTime
-		mask.Add(seccheck.TaskFieldThreadGroupStartTime)
 	}
 }

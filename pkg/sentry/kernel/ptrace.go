@@ -16,7 +16,6 @@ package kernel
 
 import (
 	"fmt"
-	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
@@ -129,7 +128,7 @@ func (t *Task) CanTrace(target *Task, attach bool) bool {
 		return true
 	}
 
-	if atomic.LoadInt32(&t.k.YAMAPtraceScope) == linux.YAMA_SCOPE_RELATIONAL {
+	if t.k.YAMAPtraceScope.Load() == linux.YAMA_SCOPE_RELATIONAL {
 		t.tg.pidns.owner.mu.RLock()
 		defer t.tg.pidns.owner.mu.RUnlock()
 		if !t.canTraceYAMALocked(target) {
@@ -155,7 +154,7 @@ func (t *Task) canTraceLocked(target *Task, attach bool) bool {
 		return true
 	}
 
-	if atomic.LoadInt32(&t.k.YAMAPtraceScope) == linux.YAMA_SCOPE_RELATIONAL {
+	if t.k.YAMAPtraceScope.Load() == linux.YAMA_SCOPE_RELATIONAL {
 		if !t.canTraceYAMALocked(target) {
 			return false
 		}
@@ -180,12 +179,12 @@ func (t *Task) canTraceStandard(target *Task, attach bool) bool {
 	//
 	// 2. Deny access if neither of the following is true:
 	//
-	// - The real, effective, and saved-set user IDs of the target match the
-	// caller's user ID, *and* the real, effective, and saved-set group IDs of
-	// the target match the caller's group ID.
+	//	- The real, effective, and saved-set user IDs of the target match the
+	//		caller's user ID, *and* the real, effective, and saved-set group IDs of
+	//		the target match the caller's group ID.
 	//
-	// - The caller has the CAP_SYS_PTRACE capability in the user namespace of
-	// the target.
+	//	- The caller has the CAP_SYS_PTRACE capability in the user namespace of
+	//		the target.
 	//
 	// 3. Deny access if the target process "dumpable" attribute has a value
 	// other than 1 (SUID_DUMP_USER; see the discussion of PR_SET_DUMPABLE in
@@ -200,12 +199,12 @@ func (t *Task) canTraceStandard(target *Task, attach bool) bool {
 	//
 	// b) Deny access if neither of the following is true:
 	//
-	// - The caller and the target process are in the same user namespace, and
-	// the caller's capabilities are a proper superset of the target process's
-	// permitted capabilities.
+	//	- The caller and the target process are in the same user namespace, and
+	//		the caller's capabilities are a proper superset of the target process's
+	//		permitted capabilities.
 	//
-	// - The caller has the CAP_SYS_PTRACE capability in the target process's
-	// user namespace.
+	//	- The caller has the CAP_SYS_PTRACE capability in the target process's
+	//		user namespace.
 	//
 	// Note that the commoncap LSM does not distinguish between
 	// PTRACE_MODE_READ and PTRACE_MODE_ATTACH. (ED: From earlier in this
@@ -364,8 +363,8 @@ func (s *ptraceStop) Killable() bool {
 // waiting.
 //
 // Preconditions:
-// * The TaskSet mutex must be locked.
-// * The caller must be running on the task goroutine.
+//   - The TaskSet mutex must be locked.
+//   - The caller must be running on the task goroutine.
 func (t *Task) beginPtraceStopLocked() bool {
 	t.tg.signalHandlers.mu.Lock()
 	defer t.tg.signalHandlers.mu.Unlock()
@@ -411,8 +410,8 @@ func (t *Task) ptraceTrapLocked(code int32) {
 // Task.Kill, and returns true. Otherwise it returns false.
 //
 // Preconditions:
-// * The TaskSet mutex must be locked.
-// * The caller must be running on the task goroutine of t's tracer.
+//   - The TaskSet mutex must be locked.
+//   - The caller must be running on the task goroutine of t's tracer.
 func (t *Task) ptraceFreeze() bool {
 	t.tg.signalHandlers.mu.Lock()
 	defer t.tg.signalHandlers.mu.Unlock()
@@ -443,8 +442,8 @@ func (t *Task) ptraceUnfreeze() {
 }
 
 // Preconditions:
-// * t must be in a frozen ptraceStop.
-// * t's signal mutex must be locked.
+//   - t must be in a frozen ptraceStop.
+//   - t's signal mutex must be locked.
 func (t *Task) ptraceUnfreezeLocked() {
 	// Do this even if the task has been killed to ensure a panic if t.stop is
 	// nil or not a ptraceStop.
@@ -649,8 +648,9 @@ func (t *Task) forgetTracerLocked() {
 // enter ptrace signal-delivery-stop.
 //
 // Preconditions:
-// * The signal mutex must be locked.
-// * The caller must be running on the task goroutine.
+//   - The signal mutex must be locked.
+//   - The caller must be running on the task goroutine.
+//
 // +checklocks:t.tg.signalHandlers.mu
 func (t *Task) ptraceSignalLocked(info *linux.SignalInfo) bool {
 	if linux.Signal(info.Signo) == linux.SIGKILL {
@@ -982,8 +982,8 @@ func (t *Task) ptraceInterrupt(target *Task) error {
 }
 
 // Preconditions:
-// * The TaskSet mutex must be locked for writing.
-// * t must have a tracer.
+//   - The TaskSet mutex must be locked for writing.
+//   - t must have a tracer.
 func (t *Task) ptraceSetOptionsLocked(opts uintptr) error {
 	const valid = uintptr(linux.PTRACE_O_EXITKILL |
 		linux.PTRACE_O_TRACESYSGOOD |

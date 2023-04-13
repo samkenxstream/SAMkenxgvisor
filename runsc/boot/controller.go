@@ -27,8 +27,8 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	controlpb "gvisor.dev/gvisor/pkg/sentry/control/control_go_proto"
-	"gvisor.dev/gvisor/pkg/sentry/fs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netstack"
 	"gvisor.dev/gvisor/pkg/sentry/state"
 	"gvisor.dev/gvisor/pkg/sentry/time"
@@ -37,6 +37,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/boot/pprof"
+	"gvisor.dev/gvisor/runsc/boot/procfs"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
@@ -80,6 +81,18 @@ const (
 
 	// ContMgrRootContainerStart starts a new sandbox with a root container.
 	ContMgrRootContainerStart = "containerManager.StartRoot"
+
+	// ContMgrCreateTraceSession starts a trace session.
+	ContMgrCreateTraceSession = "containerManager.CreateTraceSession"
+
+	// ContMgrDeleteTraceSession deletes a trace session.
+	ContMgrDeleteTraceSession = "containerManager.DeleteTraceSession"
+
+	// ContMgrListTraceSessions lists a trace session.
+	ContMgrListTraceSessions = "containerManager.ListTraceSessions"
+
+	// ContMgrProcfsDump dumps sandbox procfs state.
+	ContMgrProcfsDump = "containerManager.ProcfsDump"
 )
 
 const (
@@ -432,18 +445,10 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) error {
 
 	// Set up the restore environment.
 	ctx := k.SupervisorContext()
-	mntr := newContainerMounter(&cm.l.root, cm.l.k, cm.l.mountHints, kernel.VFS2Enabled)
-	if kernel.VFS2Enabled {
-		ctx, err = mntr.configureRestore(ctx)
-		if err != nil {
-			return fmt.Errorf("configuring filesystem restore: %v", err)
-		}
-	} else {
-		renv, err := mntr.createRestoreEnvironment(cm.l.root.conf)
-		if err != nil {
-			return fmt.Errorf("creating RestoreEnvironment: %v", err)
-		}
-		fs.SetRestoreEnvironment(*renv)
+	mntr := newContainerMounter(&cm.l.root, cm.l.k, cm.l.mountHints, cm.l.productName)
+	ctx, err = mntr.configureRestore(ctx)
+	if err != nil {
+		return fmt.Errorf("configuring filesystem restore: %v", err)
 	}
 
 	// Prepare to load from the state file.
@@ -589,4 +594,57 @@ type SignalArgs struct {
 func (cm *containerManager) Signal(args *SignalArgs, _ *struct{}) error {
 	log.Debugf("containerManager.Signal: cid: %s, PID: %d, signal: %d, mode: %v", args.CID, args.PID, args.Signo, args.Mode)
 	return cm.l.signal(args.CID, args.PID, args.Signo, args.Mode)
+}
+
+// CreateTraceSessionArgs are arguments to the CreateTraceSession method.
+type CreateTraceSessionArgs struct {
+	Config seccheck.SessionConfig
+	Force  bool
+	urpc.FilePayload
+}
+
+// CreateTraceSession creates a new trace session.
+func (cm *containerManager) CreateTraceSession(args *CreateTraceSessionArgs, _ *struct{}) error {
+	log.Debugf("containerManager.CreateTraceSession: config: %+v", args.Config)
+	for i, sinkFile := range args.Files {
+		if sinkFile != nil {
+			fd, err := fd.NewFromFile(sinkFile)
+			if err != nil {
+				return err
+			}
+			args.Config.Sinks[i].FD = fd
+		}
+	}
+	return seccheck.Create(&args.Config, args.Force)
+}
+
+// DeleteTraceSession deletes an existing trace session.
+func (cm *containerManager) DeleteTraceSession(name *string, _ *struct{}) error {
+	log.Debugf("containerManager.DeleteTraceSession: name: %q", *name)
+	return seccheck.Delete(*name)
+}
+
+// ListTraceSessions lists trace sessions.
+func (cm *containerManager) ListTraceSessions(_ *struct{}, out *[]seccheck.SessionConfig) error {
+	log.Debugf("containerManager.ListTraceSessions")
+	seccheck.List(out)
+	return nil
+}
+
+// ProcfsDump dumps procfs state of the sandbox.
+func (cm *containerManager) ProcfsDump(_ *struct{}, out *[]procfs.ProcessProcfsDump) error {
+	log.Debugf("containerManager.ProcfsDump")
+	ts := cm.l.k.TaskSet()
+	pidns := ts.Root
+	*out = make([]procfs.ProcessProcfsDump, 0, len(cm.l.processes))
+	for _, tg := range pidns.ThreadGroups() {
+		pid := pidns.IDOfThreadGroup(tg)
+		procDump, err := procfs.Dump(tg.Leader(), pid, pidns)
+		if err != nil {
+			log.Warningf("skipping procfs dump for PID %s: %v", pid, err)
+			continue
+		}
+		*out = append(*out, procDump)
+	}
+	return nil
 }

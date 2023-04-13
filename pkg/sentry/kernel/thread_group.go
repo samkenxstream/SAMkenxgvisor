@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/fs"
@@ -111,13 +112,13 @@ type ThreadGroup struct {
 	//
 	// Analogues in Linux:
 	//
-	// - groupContNotify && groupContInterrupted is represented by
-	// SIGNAL_CLD_STOPPED.
+	//	- groupContNotify && groupContInterrupted is represented by
+	//		SIGNAL_CLD_STOPPED.
 	//
-	// - groupContNotify && !groupContInterrupted is represented by
-	// SIGNAL_CLD_CONTINUED.
+	//	- groupContNotify && !groupContInterrupted is represented by
+	//		SIGNAL_CLD_CONTINUED.
 	//
-	// - !groupContNotify is represented by neither flag being set.
+	//	- !groupContNotify is represented by neither flag being set.
 	//
 	// groupContNotify and groupContInterrupted are protected by the signal
 	// mutex.
@@ -158,7 +159,7 @@ type ThreadGroup struct {
 	// restarted by Task.Start.
 	liveGoroutines sync.WaitGroup `state:"nosave"`
 
-	timerMu sync.Mutex `state:"nosave"`
+	timerMu threadGroupTimerMutex `state:"nosave"`
 
 	// itimerRealTimer implements ITIMER_REAL for the thread group.
 	itimerRealTimer *ktime.Timer
@@ -183,9 +184,8 @@ type ThreadGroup struct {
 	// itimerProfSetting.Enabled is true, rlimitCPUSoftSetting.Enabled is true,
 	// or limits.Get(CPU) is finite.
 	//
-	// cpuTimersEnabled is protected by the signal mutex. cpuTimersEnabled is
-	// accessed using atomic memory operations.
-	cpuTimersEnabled uint32
+	// cpuTimersEnabled is protected by the signal mutex.
+	cpuTimersEnabled atomicbitops.Uint32
 
 	// timers is the thread group's POSIX interval timers. nextTimerID is the
 	// TimerID at which allocation should begin searching for an unused ID.
@@ -208,11 +208,11 @@ type ThreadGroup struct {
 
 	// maxRSS is the historical maximum resident set size of the thread group, updated when:
 	//
-	// - A task in the thread group exits, since after all tasks have
-	// exited the MemoryManager is no longer reachable.
+	//	- A task in the thread group exits, since after all tasks have
+	//		exited the MemoryManager is no longer reachable.
 	//
-	// - The thread group completes an execve, since this changes
-	// MemoryManagers.
+	//	- The thread group completes an execve, since this changes
+	//		MemoryManagers.
 	//
 	// maxRSS is protected by the TaskSet mutex.
 	maxRSS uint64
@@ -258,9 +258,7 @@ type ThreadGroup struct {
 	// oomScoreAdj is the thread group's OOM score adjustment. This is
 	// currently not used but is maintained for consistency.
 	// TODO(gvisor.dev/issue/1967)
-	//
-	// oomScoreAdj is accessed using atomic memory operations.
-	oomScoreAdj int32
+	oomScoreAdj atomicbitops.Int32
 }
 
 // NewThreadGroup returns a new, empty thread group in PID namespace pidns. The
@@ -377,15 +375,15 @@ func (tg *ThreadGroup) SetControllingTTY(tty *TTY, steal bool, isReadable bool) 
 		for othertg := range tg.pidns.owner.Root.tgids {
 			// This won't deadlock by locking tg.signalHandlers
 			// because at this point:
-			// - We only lock signalHandlers if it's in the same
-			//   session as the tty's controlling thread group.
-			// - We know that the calling thread group is not in
-			//   the same session as the tty's controlling thread
-			//   group.
+			//	- We only lock signalHandlers if it's in the same
+			//		session as the tty's controlling thread group.
+			//	- We know that the calling thread group is not in
+			//		the same session as the tty's controlling thread
+			//		group.
 			if othertg.processGroup.session == tty.tg.processGroup.session {
-				othertg.signalHandlers.mu.Lock()
+				othertg.signalHandlers.mu.NestedLock()
 				othertg.tty = nil
-				othertg.signalHandlers.mu.Unlock()
+				othertg.signalHandlers.mu.NestedUnlock()
 			}
 		}
 	}
@@ -516,7 +514,7 @@ func (tg *ThreadGroup) SetForegroundProcessGroup(tty *TTY, pgid ProcessGroupID) 
 	// signal is sent to all members of this background process group.
 	// We need also need to check whether it is ignoring or blocking SIGTTOU.
 	ignored := signalAction.Handler == linux.SIG_IGN
-	blocked := tg.leader.signalMask == linux.SignalSetOf(linux.SIGTTOU)
+	blocked := linux.SignalSet(tg.leader.signalMask.RacyLoad()) == linux.SignalSetOf(linux.SIGTTOU)
 	if tg.processGroup.id != tg.processGroup.session.foreground.id && !ignored && !blocked {
 		tg.leader.sendSignalLocked(SignalInfoPriv(linux.SIGTTOU), true)
 	}

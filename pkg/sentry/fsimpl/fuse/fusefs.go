@@ -19,9 +19,9 @@ import (
 	"math"
 	"strconv"
 	"sync"
-	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/log"
@@ -31,7 +31,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
-	"gvisor.dev/gvisor/pkg/waiter"
 )
 
 // Name is the default filesystem name.
@@ -97,9 +96,6 @@ type filesystem struct {
 
 	// opts is the options the fusefs is initialized with.
 	opts *filesystemOptions
-
-	// umounted is true if filesystem.Release() has been called.
-	umounted bool
 }
 
 // Name implements vfs.FilesystemType.Name.
@@ -233,19 +229,24 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		return nil, nil, linuxerr.EINVAL
 	}
 
+	fuseFD.mu.Lock()
+	connected := fuseFD.connected()
 	// Create a new FUSE filesystem.
 	fs, err := newFUSEFilesystem(ctx, vfsObj, &fsType, fuseFD, devMinor, &fsopts)
 	if err != nil {
 		log.Warningf("%s.NewFUSEFilesystem: failed with error: %v", fsType.Name(), err)
+		fuseFD.mu.Unlock()
 		return nil, nil, err
 	}
+	fuseFD.mu.Unlock()
 
 	// Send a FUSE_INIT request to the FUSE daemon server before returning.
 	// This call is not blocking.
-	if err := fs.conn.InitSend(creds, uint32(kernelTask.ThreadID())); err != nil {
-		log.Warningf("%s.InitSend: failed with error: %v", fsType.Name(), err)
-		fs.VFSFilesystem().DecRef(ctx) // returned by newFUSEFilesystem
-		return nil, nil, err
+	if !connected {
+		if err := fs.conn.InitSend(creds, uint32(kernelTask.ThreadID())); err != nil {
+			log.Warningf("%s.InitSend: failed with error: %v", fsType.Name(), err)
+			return nil, nil, err
+		}
 	}
 
 	// root is the fusefs root directory.
@@ -255,45 +256,28 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 }
 
 // newFUSEFilesystem creates a new FUSE filesystem.
+// +checklocks:fuseFD.mu
 func newFUSEFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, fsType *FilesystemType, fuseFD *DeviceFD, devMinor uint32, opts *filesystemOptions) (*filesystem, error) {
-	conn, err := newFUSEConnection(ctx, fuseFD, opts)
-	if err != nil {
-		log.Warningf("fuse.NewFUSEFilesystem: NewFUSEConnection failed with error: %v", err)
-		return nil, linuxerr.EINVAL
+	if !fuseFD.connected() {
+		conn, err := newFUSEConnection(ctx, fuseFD, opts)
+		if err != nil {
+			log.Warningf("fuse.NewFUSEFilesystem: NewFUSEConnection failed with error: %v", err)
+			return nil, linuxerr.EINVAL
+		}
+		fuseFD.conn = conn
 	}
 
 	fs := &filesystem{
 		devMinor: devMinor,
 		opts:     opts,
-		conn:     conn,
+		conn:     fuseFD.conn,
 	}
 	fs.VFSFilesystem().Init(vfsObj, fsType, fs)
-
-	// FIXME(gvisor.dev/issue/4813): Doesn't conn or fs need to hold a
-	// reference on fuseFD, since conn uses fuseFD for communication with the
-	// server? Wouldn't doing so create a circular reference?
-	fs.VFSFilesystem().IncRef() // for fuseFD.fs
-
-	fuseFD.mu.Lock()
-	fs.conn.mu.Lock()
-	fuseFD.fs = fs
-	fs.conn.mu.Unlock()
-	fuseFD.mu.Unlock()
-
 	return fs, nil
 }
 
 // Release implements vfs.FilesystemImpl.Release.
 func (fs *filesystem) Release(ctx context.Context) {
-	fs.conn.fd.mu.Lock()
-
-	fs.umounted = true
-	fs.conn.Abort(ctx)
-	// Notify all the waiters on this fd.
-	fs.conn.fd.waitQueue.Notify(waiter.ReadableEvents)
-
-	fs.conn.fd.mu.Unlock()
-
 	fs.Filesystem.VFSFilesystem().VirtualFilesystem().PutAnonBlockDevMinor(fs.devMinor)
 	fs.Filesystem.Release(ctx)
 }
@@ -334,10 +318,10 @@ type inode struct {
 	locks vfs.FileLocks
 
 	// size of the file.
-	size uint64
+	size atomicbitops.Uint64
 
 	// attributeVersion is the version of inode's attributes.
-	attributeVersion uint64
+	attributeVersion atomicbitops.Uint64
 
 	// attributeTime is the remaining vaild time of attributes.
 	attributeTime uint64
@@ -368,7 +352,7 @@ func (fs *filesystem) newInode(ctx context.Context, nodeID uint64, attr linux.FU
 	i := &inode{fs: fs, nodeID: nodeID}
 	creds := auth.Credentials{EffectiveKGID: auth.KGID(attr.UID), EffectiveKUID: auth.KUID(attr.UID)}
 	i.InodeAttrs.Init(ctx, &creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), linux.FileMode(attr.Mode))
-	atomic.StoreUint64(&i.size, attr.Size)
+	i.size.Store(attr.Size)
 	i.OrderedChildren.Init(kernfs.OrderedChildrenOptions{})
 	i.InitRefs()
 	return i
@@ -412,7 +396,7 @@ func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentr
 	if !isDir && opts.Mode.IsDir() {
 		return nil, linuxerr.ENOTDIR
 	}
-	if opts.Flags&linux.O_LARGEFILE == 0 && atomic.LoadUint64(&i.size) > linux.MAX_NON_LFS {
+	if opts.Flags&linux.O_LARGEFILE == 0 && i.size.Load() > linux.MAX_NON_LFS {
 		return nil, linuxerr.EOVERFLOW
 	}
 
@@ -496,9 +480,8 @@ func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentr
 	// by setting the file size to 0.
 	if i.fs.conn.atomicOTrunc && opts.Flags&linux.O_TRUNC != 0 {
 		i.fs.conn.mu.Lock()
-		i.fs.conn.attributeVersion++
-		i.attributeVersion = i.fs.conn.attributeVersion
-		atomic.StoreUint64(&i.size, 0)
+		i.attributeVersion.Store(i.fs.conn.attributeVersion.Add(1))
+		i.size.Store(0)
 		i.fs.conn.mu.Unlock()
 		i.attributeTime = 0
 	}
@@ -713,7 +696,7 @@ func (i *inode) Readlink(ctx context.Context, mnt *vfs.Mount) (string, error) {
 func (i *inode) getFUSEAttr() linux.FUSEAttr {
 	return linux.FUSEAttr{
 		Ino:  i.Ino(),
-		Size: atomic.LoadUint64(&i.size),
+		Size: i.size.Load(),
 		Mode: uint32(i.Mode()),
 	}
 }
@@ -775,12 +758,12 @@ func statFromFUSEAttr(attr linux.FUSEAttr, mask, devMinor uint32) linux.Statx {
 // or read from local cache. It updates the corresponding attributes if
 // necessary.
 func (i *inode) getAttr(ctx context.Context, fs *vfs.Filesystem, opts vfs.StatOptions, flags uint32, fh uint64) (linux.FUSEAttr, error) {
-	attributeVersion := atomic.LoadUint64(&i.fs.conn.attributeVersion)
+	attributeVersion := i.fs.conn.attributeVersion.Load()
 
 	// TODO(gvisor.dev/issue/3679): send the request only if
-	// - invalid local cache for fields specified in the opts.Mask
-	// - forced update
-	// - i.attributeTime expired
+	//	- invalid local cache for fields specified in the opts.Mask
+	//	- forced update
+	//	- i.attributeTime expired
 	// If local cache is still valid, return local cache.
 	// Currently we always send a request,
 	// and we always set the metadata with the new result,
@@ -814,7 +797,7 @@ func (i *inode) getAttr(ctx context.Context, fs *vfs.Filesystem, opts vfs.StatOp
 
 	// Local version is newer, return the local one.
 	// Skip the update.
-	if attributeVersion != 0 && atomic.LoadUint64(&i.attributeVersion) > attributeVersion {
+	if attributeVersion != 0 && i.attributeVersion.Load() > attributeVersion {
 		return i.getFUSEAttr(), nil
 	}
 
@@ -826,7 +809,7 @@ func (i *inode) getAttr(ctx context.Context, fs *vfs.Filesystem, opts vfs.StatOp
 	}
 
 	// Set the size if no error (after SetStat() check).
-	atomic.StoreUint64(&i.size, out.Attr.Size)
+	i.size.Store(out.Attr.Size)
 
 	return out.Attr, nil
 }

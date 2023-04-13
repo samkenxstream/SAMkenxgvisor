@@ -15,8 +15,6 @@
 package overlay
 
 import (
-	"sync/atomic"
-
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
@@ -26,17 +24,16 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
-	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
 func (d *dentry) isRegularFile() bool {
-	return atomic.LoadUint32(&d.mode)&linux.S_IFMT == linux.S_IFREG
+	return d.mode.Load()&linux.S_IFMT == linux.S_IFREG
 }
 
 func (d *dentry) isSymlink() bool {
-	return atomic.LoadUint32(&d.mode)&linux.S_IFMT == linux.S_IFLNK
+	return d.mode.Load()&linux.S_IFMT == linux.S_IFLNK
 }
 
 func (d *dentry) readlink(ctx context.Context) (string, error) {
@@ -56,7 +53,7 @@ type regularFileFD struct {
 	// fileDescription.dentry().upperVD. cachedFlags is the last known value of
 	// cachedFD.StatusFlags(). copiedUp, cachedFD, and cachedFlags are
 	// protected by mu.
-	mu          sync.Mutex `state:"nosave"`
+	mu          regularFileFDMutex `state:"nosave"`
 	copiedUp    bool
 	cachedFD    *vfs.FileDescription
 	cachedFlags uint32
@@ -169,8 +166,8 @@ func (fd *regularFileFD) Allocate(ctx context.Context, mode, offset, length uint
 // SetStat implements vfs.FileDescriptionImpl.SetStat.
 func (fd *regularFileFD) SetStat(ctx context.Context, opts vfs.SetStatOptions) error {
 	d := fd.dentry()
-	mode := linux.FileMode(atomic.LoadUint32(&d.mode))
-	if err := vfs.CheckSetStat(ctx, auth.CredentialsFromContext(ctx), &opts, mode, auth.KUID(atomic.LoadUint32(&d.uid)), auth.KGID(atomic.LoadUint32(&d.gid))); err != nil {
+	mode := linux.FileMode(d.mode.Load())
+	if err := vfs.CheckSetStat(ctx, auth.CredentialsFromContext(ctx), &opts, mode, auth.KUID(d.uid.Load()), auth.KGID(d.gid.Load())); err != nil {
 		return err
 	}
 	mnt := fd.vfsfd.Mount()
@@ -332,7 +329,7 @@ func (fd *regularFileFD) updateSetUserGroupIDs(ctx context.Context, wrappedFD *v
 	// Writing can clear the setuid and/or setgid bits. We only have to
 	// check this if something was written and one of those bits was set.
 	dentry := fd.dentry()
-	if written == 0 || atomic.LoadUint32(&dentry.mode)&(linux.S_ISUID|linux.S_ISGID) == 0 {
+	if written == 0 || dentry.mode.Load()&(linux.S_ISUID|linux.S_ISGID) == 0 {
 		return written, nil
 	}
 	stat, err := wrappedFD.Stat(ctx, vfs.StatOptions{Mask: linux.STATX_MODE})
@@ -341,7 +338,7 @@ func (fd *regularFileFD) updateSetUserGroupIDs(ctx context.Context, wrappedFD *v
 	}
 	dentry.copyMu.Lock()
 	defer dentry.copyMu.Unlock()
-	atomic.StoreUint32(&dentry.mode, uint32(stat.Mode))
+	dentry.mode.Store(uint32(stat.Mode))
 	return written, nil
 }
 
@@ -398,13 +395,13 @@ func (fd *regularFileFD) ensureMappable(ctx context.Context, opts *memmap.MMapOp
 	d := fd.dentry()
 
 	// Fast path if we already have a Mappable for the current top layer.
-	if atomic.LoadUint32(&d.isMappable) != 0 {
+	if d.isMappable.Load() != 0 {
 		return nil
 	}
 
 	// Only permit mmap of regular files, since other file types may have
 	// unpredictable behavior when mmapped (e.g. /dev/zero).
-	if atomic.LoadUint32(&d.mode)&linux.S_IFMT != linux.S_IFREG {
+	if d.mode.Load()&linux.S_IFMT != linux.S_IFREG {
 		return linuxerr.ENODEV
 	}
 
@@ -413,7 +410,7 @@ func (fd *regularFileFD) ensureMappable(ctx context.Context, opts *memmap.MMapOp
 	defer fd.mu.Unlock()
 	d.copyMu.RLock()
 	defer d.copyMu.RUnlock()
-	if atomic.LoadUint32(&d.isMappable) != 0 {
+	if d.isMappable.Load() != 0 {
 		return nil
 	}
 	wrappedFD, err := fd.currentFDLocked(ctx)
@@ -435,7 +432,7 @@ func (fd *regularFileFD) ensureMappable(ctx context.Context, opts *memmap.MMapOp
 	defer d.dataMu.Unlock()
 	if d.wrappedMappable == nil {
 		d.wrappedMappable = opts.Mappable
-		atomic.StoreUint32(&d.isMappable, 1)
+		d.isMappable.Store(1)
 	}
 	return nil
 }

@@ -79,8 +79,14 @@ type Stack interface {
 	// RouteTable returns the network stack's route table.
 	RouteTable() []Route
 
+	// Pause pauses the network stack before save.
+	Pause()
+
 	// Resume restarts the network stack after restore.
 	Resume()
+
+	// Destroy the network stack.
+	Destroy()
 
 	// RegisteredEndpoints returns all endpoints which are currently registered.
 	RegisteredEndpoints() []stack.TransportEndpoint

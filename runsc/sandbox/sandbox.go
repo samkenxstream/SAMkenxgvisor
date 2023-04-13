@@ -25,7 +25,6 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -33,6 +32,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/syndtr/gocapability/capability"
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/control/client"
 	"gvisor.dev/gvisor/pkg/control/server"
@@ -41,10 +41,12 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
+	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/unet"
 	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/boot"
+	"gvisor.dev/gvisor/runsc/boot/procfs"
 	"gvisor.dev/gvisor/runsc/cgroup"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/console"
@@ -54,16 +56,15 @@ import (
 
 // pid is an atomic type that implements JSON marshal/unmarshal interfaces.
 type pid struct {
-	// +checkatomics
-	val int64
+	val atomicbitops.Int64
 }
 
 func (p *pid) store(pid int) {
-	atomic.StoreInt64(&p.val, int64(pid))
+	p.val.Store(int64(pid))
 }
 
 func (p *pid) load() int {
-	return int(atomic.LoadInt64(&p.val))
+	return int(p.val.Load())
 }
 
 // UnmarshalJSON implements json.Unmarshaler.UnmarshalJSON.
@@ -167,16 +168,23 @@ type Args struct {
 	// Attached indicates that the sandbox lifecycle is attached with the caller.
 	// If the caller exits, the sandbox should exit too.
 	Attached bool
+
+	// SinkFiles is the an ordered array of files to be used by seccheck sinks
+	// configured from the --pod-init-config file.
+	SinkFiles []*os.File
 }
 
 // New creates the sandbox process. The caller must call Destroy() on the
 // sandbox.
 func New(conf *config.Config, args *Args) (*Sandbox, error) {
 	s := &Sandbox{
-		ID:         args.ID,
-		CgroupJSON: cgroup.CgroupJSON{Cgroup: args.Cgroup},
-		UID:        -1, // prevent usage before it's set.
-		GID:        -1, // prevent usage before it's set.
+		ID: args.ID,
+		CgroupJSON: cgroup.CgroupJSON{
+			Cgroup:     args.Cgroup,
+			UseSystemd: conf.SystemdCgroup,
+		},
+		UID: -1, // prevent usage before it's set.
+		GID: -1, // prevent usage before it's set.
 	}
 	// The Cleanup object cleans up partially created sandboxes when an error
 	// occurs. Any errors occurring during cleanup itself are ignored.
@@ -186,6 +194,17 @@ func New(conf *config.Config, args *Args) (*Sandbox, error) {
 		}
 	})
 	defer c.Clean()
+
+	if len(conf.PodInitConfig) > 0 {
+		initConf, err := boot.LoadInitConfig(conf.PodInitConfig)
+		if err != nil {
+			return nil, fmt.Errorf("loading init config file: %w", err)
+		}
+		args.SinkFiles, err = initConf.Setup()
+		if err != nil {
+			return nil, fmt.Errorf("cannot init config: %w", err)
+		}
+	}
 
 	// Create pipe to synchronize when sandbox process has been booted.
 	clientSyncFile, sandboxSyncFile, err := os.Pipe()
@@ -200,7 +219,7 @@ func New(conf *config.Config, args *Args) (*Sandbox, error) {
 	// process exits unexpectedly.
 	sandboxSyncFile.Close()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("cannot create sandbox process: %w", err)
 	}
 
 	// Wait until the sandbox has booted.
@@ -218,7 +237,7 @@ func New(conf *config.Config, args *Args) (*Sandbox, error) {
 				return nil, fmt.Errorf("%v: %v", err, permsErr)
 			}
 		}
-		return nil, err
+		return nil, fmt.Errorf("cannot read client sync file: %w", err)
 	}
 
 	c.Release()
@@ -371,9 +390,89 @@ func (s *Sandbox) Processes(cid string) ([]*control.Process, error) {
 	return pl, nil
 }
 
+// CreateTraceSession creates a new trace session.
+func (s *Sandbox) CreateTraceSession(config *seccheck.SessionConfig, force bool) error {
+	log.Debugf("Creating trace session in sandbox %q", s.ID)
+
+	sinkFiles, err := seccheck.SetupSinks(config.Sinks)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		for _, f := range sinkFiles {
+			_ = f.Close()
+		}
+	}()
+
+	conn, err := s.sandboxConnect()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	arg := boot.CreateTraceSessionArgs{
+		Config: *config,
+		Force:  force,
+		FilePayload: urpc.FilePayload{
+			Files: sinkFiles,
+		},
+	}
+	if err := conn.Call(boot.ContMgrCreateTraceSession, &arg, nil); err != nil {
+		return fmt.Errorf("creating trace session: %w", err)
+	}
+	return nil
+}
+
+// DeleteTraceSession deletes an existing trace session.
+func (s *Sandbox) DeleteTraceSession(name string) error {
+	log.Debugf("Deleting trace session %q in sandbox %q", name, s.ID)
+	conn, err := s.sandboxConnect()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	if err := conn.Call(boot.ContMgrDeleteTraceSession, name, nil); err != nil {
+		return fmt.Errorf("deleting trace session: %w", err)
+	}
+	return nil
+}
+
+// ListTraceSessions lists all trace sessions.
+func (s *Sandbox) ListTraceSessions() ([]seccheck.SessionConfig, error) {
+	log.Debugf("Listing trace sessions in sandbox %q", s.ID)
+	conn, err := s.sandboxConnect()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	var sessions []seccheck.SessionConfig
+	if err := conn.Call(boot.ContMgrListTraceSessions, nil, &sessions); err != nil {
+		return nil, fmt.Errorf("listing trace session: %w", err)
+	}
+	return sessions, nil
+}
+
+// ProcfsDump collects and returns a procfs dump for the sandbox.
+func (s *Sandbox) ProcfsDump() ([]procfs.ProcessProcfsDump, error) {
+	log.Debugf("Procfs dump %q", s.ID)
+	conn, err := s.sandboxConnect()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	var procfsDump []procfs.ProcessProcfsDump
+	if err := conn.Call(boot.ContMgrProcfsDump, nil, &procfsDump); err != nil {
+		return nil, fmt.Errorf("getting sandbox %q stacks: %v", s.ID, err)
+	}
+	return procfsDump, nil
+}
+
 // NewCGroup returns the sandbox's Cgroup, or an error if it does not have one.
 func (s *Sandbox) NewCGroup() (cgroup.Cgroup, error) {
-	return cgroup.NewFromPid(s.Pid.load())
+	return cgroup.NewFromPid(s.Pid.load(), false /* useSystemd */)
 }
 
 // Execute runs the specified command in the container. It returns the PID of
@@ -469,6 +568,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		}
 	}
 
+	// Relay all the config flags to the sandbox process.
 	cmd := exec.Command(specutils.ExePath, conf.ToFlags()...)
 	cmd.SysProcAttr = &unix.SysProcAttr{
 		// Detach from this session, otherwise cmd will get SIGHUP and SIGCONT
@@ -524,13 +624,18 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 
 	specFile, err := specutils.OpenSpec(args.BundleDir)
 	if err != nil {
-		return err
+		return fmt.Errorf("cannot open spec file in bundle dir %v: %w", args.BundleDir, err)
 	}
 	donations.DonateAndClose("spec-fd", specFile)
 
+	if err := donations.OpenAndDonate("pod-init-config-fd", conf.PodInitConfig, os.O_RDONLY); err != nil {
+		return err
+	}
+	donations.DonateAndClose("sink-fds", args.SinkFiles...)
+
 	gPlatform, err := platform.Lookup(conf.Platform)
 	if err != nil {
-		return err
+		return fmt.Errorf("cannot look up platform: %w", err)
 	}
 	if deviceFile, err := gPlatform.OpenDevice(conf.PlatformDevicePath); err != nil {
 		return fmt.Errorf("opening device file for platform %q: %v", conf.Platform, err)

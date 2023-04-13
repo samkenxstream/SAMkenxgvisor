@@ -29,14 +29,13 @@ import (
 // Config holds configuration that is not part of the runtime spec.
 //
 // Follow these steps to add a new flag:
-//   1. Create a new field in Config.
-//   2. Add a field tag with the flag name
-//   3. Register a new flag in flags.go, with same name and add a description
-//   4. Add any necessary validation into validate()
-//   5. If adding an enum, follow the same pattern as FileAccessType
-//   6. Evaluate if the flag can be changed with OCI annotations. See
-//      overrideAllowlist for more details
-//
+//  1. Create a new field in Config.
+//  2. Add a field tag with the flag name
+//  3. Register a new flag in flags.go, with same name and add a description
+//  4. Add any necessary validation into validate()
+//  5. If adding an enum, follow the same pattern as FileAccessType
+//  6. Evaluate if the flag can be changed with OCI annotations. See
+//     overrideAllowlist for more details
 type Config struct {
 	// RootDir is the runtime root directory.
 	RootDir string `flag:"root"`
@@ -74,11 +73,8 @@ type Config struct {
 	// Overlay is whether to wrap the root filesystem in an overlay.
 	Overlay bool `flag:"overlay"`
 
-	// Verity is whether there's one or more verity file system to mount.
-	Verity bool `flag:"verity"`
-
-	// FSGoferHostUDS enables the gofer to mount a host UDS and connect to it or
-	// bind (create) a host UDS and serve it.
+	// FSGoferHostUDS enables the gofer to create and connect to host unix
+	// domain sockets.
 	FSGoferHostUDS bool `flag:"fsgofer-host-uds"`
 
 	// Network indicates what type of network to use.
@@ -92,11 +88,12 @@ type Config struct {
 	// AllowPacketEndpointWrite enables write operations on packet endpoints.
 	AllowPacketEndpointWrite bool `flag:"TESTONLY-allow-packet-endpoint-write"`
 
-	// HardwareGSO indicates that hardware segmentation offload is enabled.
-	HardwareGSO bool `flag:"gso"`
+	// HostGSO indicates that host segmentation offload is enabled.
+	HostGSO bool `flag:"gso"`
 
-	// SoftwareGSO indicates that software segmentation offload is enabled.
-	SoftwareGSO bool `flag:"software-gso"`
+	// GvisorGSO indicates that gVisor segmentation offload is enabled. The flag
+	// retains its old name of "software" GSO for API consistency.
+	GvisorGSO bool `flag:"software-gso"`
 
 	// TXChecksumOffload indicates that TX Checksum Offload is enabled.
 	TXChecksumOffload bool `flag:"tx-checksum-offload"`
@@ -178,7 +175,7 @@ type Config struct {
 	// Controls defines the controls that may be enabled.
 	Controls controlConfig `flag:"controls"`
 
-	// RestoreFile is the path to the saved container image
+	// RestoreFile is the path to the saved container image.
 	RestoreFile string
 
 	// NumNetworkChannels controls the number of AF_PACKET sockets that map
@@ -205,9 +202,6 @@ type Config struct {
 	// E.g. 0.2 CPU quota will result in 1, and 1.9 in 2.
 	CPUNumFromQuota bool `flag:"cpu-num-from-quota"`
 
-	// Enables VFS2.
-	VFS2 bool `flag:"vfs2"`
-
 	// Enable lisafs.
 	Lisafs bool `flag:"lisafs"`
 
@@ -225,6 +219,25 @@ type Config struct {
 
 	// Don't configure cgroups.
 	IgnoreCgroups bool `flag:"ignore-cgroups"`
+
+	// Use systemd to configure cgroups.
+	SystemdCgroup bool `flag:"systemd-cgroup"`
+
+	// PodInitConfig is the path to configuration file with additional steps to
+	// take during pod creation.
+	PodInitConfig string `flag:"pod-init-config"`
+
+	// Use pools to manage buffer memory instead of heap.
+	BufferPooling bool `flag:"buffer-pooling"`
+
+	// FDLimit specifies a limit on the number of host file descriptors that can
+	// be open simultaneously by the sentry and gofer. It applies separately to
+	// each.
+	FDLimit int `flag:"fdlimit"`
+
+	// DCache sets the global dirent cache size. If zero, per-mount caches are
+	// used.
+	DCache int `flag:"dcache"`
 
 	// TestOnlyAllowRunAsCurrentUserWithoutChroot should only be used in
 	// tests. It allows runsc to start the sandbox process as the current

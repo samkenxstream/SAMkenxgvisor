@@ -33,8 +33,8 @@ import (
 // stepExistingLocked is loosely analogous to fs/namei.c:walk_component().
 //
 // Preconditions:
-// * Filesystem.mu must be locked for at least reading.
-// * !rp.Done().
+//   - Filesystem.mu must be locked for at least reading.
+//   - !rp.Done().
 //
 // Postcondition: Caller must call fs.processDeferredDecRefs*.
 func (fs *Filesystem) stepExistingLocked(ctx context.Context, rp *vfs.ResolvingPath, d *Dentry, mayFollowSymlinks bool) (*Dentry, error) {
@@ -109,10 +109,10 @@ afterSymlink:
 // nil) to verify that the returned child (or lack thereof) is correct.
 //
 // Preconditions:
-// * Filesystem.mu must be locked for at least reading.
-// * parent.dirMu must be locked.
-// * parent.isDir().
-// * name is not "." or "..".
+//   - Filesystem.mu must be locked for at least reading.
+//   - parent.dirMu must be locked.
+//   - parent.isDir().
+//   - name is not "." or "..".
 //
 // Postconditions: Caller must call fs.processDeferredDecRefs*.
 func (fs *Filesystem) revalidateChildLocked(ctx context.Context, vfsObj *vfs.VirtualFilesystem, parent *Dentry, name string, child *Dentry) (*Dentry, error) {
@@ -182,8 +182,8 @@ func (fs *Filesystem) walkExistingLocked(ctx context.Context, rp *vfs.ResolvingP
 // fs/namei.c:path_parentat().
 //
 // Preconditions:
-// * Filesystem.mu must be locked for at least reading.
-// * !rp.Done().
+//   - Filesystem.mu must be locked for at least reading.
+//   - !rp.Done().
 //
 // Postconditions: Caller must call fs.processDeferredDecRefs*.
 func (fs *Filesystem) walkParentDirLocked(ctx context.Context, rp *vfs.ResolvingPath) (*Dentry, error) {
@@ -205,8 +205,8 @@ func (fs *Filesystem) walkParentDirLocked(ctx context.Context, rp *vfs.Resolving
 // directory parent, then returns rp.Component().
 //
 // Preconditions:
-// * Filesystem.mu must be locked for at least reading.
-// * isDir(parentInode) == true.
+//   - Filesystem.mu must be locked for at least reading.
+//   - isDir(parentInode) == true.
 func checkCreateLocked(ctx context.Context, creds *auth.Credentials, name string, parent *Dentry) error {
 	// Order of checks is important. First check if parent directory can be
 	// executed, then check for existence, and lastly check if mount is writable.
@@ -241,6 +241,15 @@ func checkDeleteLocked(ctx context.Context, rp *vfs.ResolvingPath, d *Dentry) er
 	}
 	if parent.vfsd.IsDead() {
 		return linuxerr.ENOENT
+	}
+	if d.vfsd.IsDead() {
+		// This implies a duplicate unlink on an orphaned dentry, where the path
+		// resolution was successful. This is possible when the orphan is
+		// replaced by a new node of the same name (so the path resolution
+		// succeeds), and the orphan is unlinked again through a dirfd using
+		// unlinkat(2) (so the unlink refers to the orphan and not the new
+		// node). See Linux, fs/namei.c:do_rmdir().
+		return linuxerr.EINVAL
 	}
 	if err := parent.inode.CheckPermissions(ctx, rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
 		return err
@@ -302,7 +311,13 @@ func (fs *Filesystem) AccessAt(ctx context.Context, rp *vfs.ResolvingPath, creds
 	if err != nil {
 		return err
 	}
-	return d.inode.CheckPermissions(ctx, creds, ats)
+	if err := d.inode.CheckPermissions(ctx, creds, ats); err != nil {
+		return err
+	}
+	if ats.MayWrite() && rp.Mount().ReadOnly() {
+		return linuxerr.EROFS
+	}
+	return nil
 }
 
 // GetDentryAt implements vfs.FilesystemImpl.GetDentryAt.

@@ -18,13 +18,13 @@
 //
 // Lock order (outermost locks must be taken first):
 //
-// Kernel.extMu
-//   ThreadGroup.timerMu
-//     ktime.Timer.mu (for kernelCPUClockTicker and IntervalTimer)
-//       TaskSet.mu
-//         SignalHandlers.mu
-//           Task.mu
-//       runningTasksMu
+//	Kernel.extMu
+//		ThreadGroup.timerMu
+//		  ktime.Timer.mu (for kernelCPUClockTicker and IntervalTimer)
+//		    TaskSet.mu
+//		      SignalHandlers.mu
+//		        Task.mu
+//		    runningTasksMu
 //
 // Locking SignalHandlers.mu in multiple SignalHandlers requires locking
 // TaskSet.mu exclusively first. Locking Task.mu in multiple Tasks at the same
@@ -35,10 +35,10 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
-	"sync/atomic"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/cpuid"
@@ -101,19 +101,18 @@ var FUSEEnabled = false
 type userCounters struct {
 	uid auth.KUID
 
-	// +checkatomic
-	rlimitNProc uint64
+	rlimitNProc atomicbitops.Uint64
 }
 
 // incRLimitNProc increments the rlimitNProc counter.
 func (uc *userCounters) incRLimitNProc(ctx context.Context) error {
 	lim := limits.FromContext(ctx).Get(limits.ProcessCount)
 	creds := auth.CredentialsFromContext(ctx)
-	nproc := atomic.AddUint64(&uc.rlimitNProc, 1)
+	nproc := uc.rlimitNProc.Add(1)
 	if nproc > lim.Cur &&
 		!creds.HasCapability(linux.CAP_SYS_ADMIN) &&
 		!creds.HasCapability(linux.CAP_SYS_RESOURCE) {
-		atomic.AddUint64(&uc.rlimitNProc, ^uint64(0))
+		uc.rlimitNProc.Add(^uint64(0))
 		return linuxerr.EAGAIN
 	}
 	return nil
@@ -121,7 +120,7 @@ func (uc *userCounters) incRLimitNProc(ctx context.Context) error {
 
 // decRLimitNProc decrements the rlimitNProc counter.
 func (uc *userCounters) decRLimitNProc() {
-	atomic.AddUint64(&uc.rlimitNProc, ^uint64(0))
+	uc.rlimitNProc.Add(^uint64(0))
 }
 
 // Kernel represents an emulated Linux kernel. It must be initialized by calling
@@ -190,7 +189,7 @@ type Kernel struct {
 	// runningTasksMu is used to exclude critical sections when the timer
 	// disables itself and when the first active task enables the timer,
 	// ensuring that tasks always see a valid cpuClock value.
-	runningTasksMu sync.Mutex `state:"nosave"`
+	runningTasksMu runningTasksMutex `state:"nosave"`
 
 	// runningTasks is the total count of tasks currently in
 	// TaskGoroutineRunningSys or TaskGoroutineRunningApp. i.e., they are
@@ -198,7 +197,7 @@ type Kernel struct {
 	//
 	// runningTasks must be accessed atomically. Increments from 0 to 1 are
 	// further protected by runningTasksMu (see incRunningTasks).
-	runningTasks int64
+	runningTasks atomicbitops.Int64
 
 	// cpuClock is incremented every linux.ClockTick. cpuClock is used to
 	// measure task CPU usage, since sampling monotonicClock twice on every
@@ -210,7 +209,7 @@ type Kernel struct {
 	// doesn't provide this information.
 	//
 	// cpuClock is mutable, and is accessed using atomic memory operations.
-	cpuClock uint64
+	cpuClock atomicbitops.Uint64
 
 	// cpuClockTicker increments cpuClock.
 	cpuClockTicker *ktime.Timer `state:"nosave"`
@@ -234,14 +233,13 @@ type Kernel struct {
 	// uniqueID is used to generate unique identifiers.
 	//
 	// uniqueID is mutable, and is accessed using atomic memory operations.
-	uniqueID uint64
+	uniqueID atomicbitops.Uint64
 
 	// nextInotifyCookie is a monotonically increasing counter used for
 	// generating unique inotify event cookies.
 	//
-	// nextInotifyCookie is mutable, and is accessed using atomic memory
-	// operations.
-	nextInotifyCookie uint32
+	// nextInotifyCookie is mutable.
+	nextInotifyCookie atomicbitops.Uint32
 
 	// netlinkPorts manages allocation of netlink socket port IDs.
 	netlinkPorts *port.Manager
@@ -300,7 +298,7 @@ type Kernel struct {
 	pipeMount *vfs.Mount
 
 	// shmMount is the Mount used for anonymous files created by the
-	// memfd_create() syscalls. It is analagous to Linux's shm_mnt.
+	// memfd_create() syscalls. It is analogous to Linux's shm_mnt.
 	shmMount *vfs.Mount
 
 	// socketMount is the Mount used for sockets created by the socket() and
@@ -325,16 +323,16 @@ type Kernel struct {
 	ptraceExceptions map[*Task]*Task
 
 	// YAMAPtraceScope is the current level of YAMA ptrace restrictions.
-	YAMAPtraceScope int32
+	YAMAPtraceScope atomicbitops.Int32
 
 	// cgroupRegistry contains the set of active cgroup controllers on the
 	// system. It is controller by cgroupfs. Nil if cgroupfs is unavailable on
 	// the system.
 	cgroupRegistry *CgroupRegistry
 
-	// userCountersMa maps auth.KUID into a set of user counters.
+	// userCountersMap maps auth.KUID into a set of user counters.
 	userCountersMap   map[auth.KUID]*userCounters
-	userCountersMapMu sync.Mutex `state:"nosave"`
+	userCountersMapMu userCountersMutex `state:"nosave"`
 }
 
 // InitKernelArgs holds arguments to Init.
@@ -431,7 +429,7 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 	k.futexes = futex.NewManager()
 	k.netlinkPorts = port.New()
 	k.ptraceExceptions = make(map[*Task]*Task)
-	k.YAMAPtraceScope = linux.YAMA_SCOPE_RELATIONAL
+	k.YAMAPtraceScope = atomicbitops.FromInt32(linux.YAMA_SCOPE_RELATIONAL)
 	k.userCountersMap = make(map[auth.KUID]*userCounters)
 
 	if VFS2Enabled {
@@ -551,6 +549,15 @@ func (k *Kernel) SaveTo(ctx context.Context, w wire.Writer) error {
 	log.Infof("CPUID save took [%s].", time.Since(cpuidStart))
 
 	// Save the timekeeper's state.
+
+	if rootNS := k.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
+		// Pause the network stack.
+		netstackPauseStart := time.Now()
+		log.Infof("Pausing root network namespace")
+		k.rootNetworkNamespace.Stack().Pause()
+		defer k.rootNetworkNamespace.Stack().Resume()
+		log.Infof("Pausing root network namespace took [%s].", time.Since(netstackPauseStart))
+	}
 
 	// Save the kernel state.
 	kernelStart := time.Now()
@@ -757,7 +764,7 @@ func (k *Kernel) LoadFrom(ctx context.Context, r wire.Reader, timeReady chan str
 
 // UniqueID returns a unique identifier.
 func (k *Kernel) UniqueID() uint64 {
-	id := atomic.AddUint64(&k.uniqueID, 1)
+	id := k.uniqueID.Add(1)
 	if id == 0 {
 		panic("unique identifier generator wrapped around")
 	}
@@ -943,6 +950,9 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 	if VFS2Enabled {
 		mntnsVFS2 = args.MountNamespaceVFS2
 		if mntnsVFS2 == nil {
+			if k.globalInit == nil {
+				return nil, 0, fmt.Errorf("mount namespace is nil")
+			}
 			// Add a reference to the namespace, which is transferred to the new process.
 			mntnsVFS2 = k.globalInit.Leader().MountNamespaceVFS2()
 			mntnsVFS2.IncRef()
@@ -961,10 +971,15 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 				Path:               fspath.Parse(args.WorkingDirectory),
 				FollowFinalSymlink: true,
 			}
+			// NOTE(b/236028361): Do not set CheckSearchable flag to true.
+			// Application is allowed to start with a working directory that it can
+			// not access/search. This is consistent with Docker and VFS1. Runc
+			// explicitly allows for this in 6ce2d63a5db6 ("libct/init_linux: retry
+			// chdir to fix EPERM"). As described in the commit, runc unintentionally
+			// allowed this behavior in a couple of releases and applications started
+			// relying on it. So they decided to allow it for backward compatibility.
 			var err error
-			wd, err = k.VFS().GetDentryAt(ctx, args.Credentials, &pop, &vfs.GetDentryOptions{
-				CheckSearchable: true,
-			})
+			wd, err = k.VFS().GetDentryAt(ctx, args.Credentials, &pop, &vfs.GetDentryOptions{})
 			if err != nil {
 				return nil, 0, fmt.Errorf("failed to find initial working directory %q: %v", args.WorkingDirectory, err)
 			}
@@ -976,6 +991,9 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 	} else {
 		mntns = args.MountNamespace
 		if mntns == nil {
+			if k.globalInit == nil {
+				return nil, 0, fmt.Errorf("mount namespace is nil")
+			}
 			mntns = k.GlobalInit().Leader().MountNamespace()
 			mntns.IncRef()
 		}
@@ -1066,6 +1084,7 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 		ContainerID:             args.ContainerID,
 		UserCounters:            k.GetUserCounters(args.Credentials.RealKUID),
 	}
+	config.NetworkNamespace.IncRef()
 	t, err := k.tasks.NewTask(ctx, config)
 	if err != nil {
 		return nil, 0, err
@@ -1095,9 +1114,6 @@ func (k *Kernel) Start() error {
 	k.extMu.Lock()
 	defer k.extMu.Unlock()
 
-	if k.globalInit == nil {
-		return fmt.Errorf("kernel contains no tasks")
-	}
 	if k.started {
 		return fmt.Errorf("kernel already started")
 	}
@@ -1112,11 +1128,18 @@ func (k *Kernel) Start() error {
 	// Kernel.SaveTo and need to be resumed. If k was created by NewKernel,
 	// this is a no-op.
 	k.resumeTimeLocked(k.SupervisorContext())
-	// Start task goroutines.
 	k.tasks.mu.RLock()
-	defer k.tasks.mu.RUnlock()
-	for t, tid := range k.tasks.Root.tids {
-		t.Start(tid)
+	ts := make([]*Task, 0, len(k.tasks.Root.tids))
+	for t := range k.tasks.Root.tids {
+		ts = append(ts, t)
+	}
+	k.tasks.mu.RUnlock()
+	// Start task goroutines.
+	// NOTE(b/235349091): We don't actually need the TaskSet mutex, we just
+	// need to make sure we only call t.Start() once for each task. Holding the
+	// mutex for each task start may cause a nested locking error.
+	for _, t := range ts {
+		t.Start(t.ThreadID())
 	}
 	return nil
 }
@@ -1124,8 +1147,8 @@ func (k *Kernel) Start() error {
 // pauseTimeLocked pauses all Timers and Timekeeper updates.
 //
 // Preconditions:
-// * Any task goroutines running in k must be stopped.
-// * k.extMu must be locked.
+//   - Any task goroutines running in k must be stopped.
+//   - k.extMu must be locked.
 func (k *Kernel) pauseTimeLocked(ctx context.Context) {
 	// k.cpuClockTicker may be nil since Kernel.SaveTo() may be called before
 	// Kernel.Start().
@@ -1169,8 +1192,8 @@ func (k *Kernel) pauseTimeLocked(ctx context.Context) {
 // effect.
 //
 // Preconditions:
-// * Any task goroutines running in k must be stopped.
-// * k.extMu must be locked.
+//   - Any task goroutines running in k must be stopped.
+//   - k.extMu must be locked.
 func (k *Kernel) resumeTimeLocked(ctx context.Context) {
 	if k.cpuClockTicker != nil {
 		k.cpuClockTicker.Resume()
@@ -1202,10 +1225,10 @@ func (k *Kernel) resumeTimeLocked(ctx context.Context) {
 
 func (k *Kernel) incRunningTasks() {
 	for {
-		tasks := atomic.LoadInt64(&k.runningTasks)
+		tasks := k.runningTasks.Load()
 		if tasks != 0 {
 			// Standard case. Simply increment.
-			if !atomic.CompareAndSwapInt64(&k.runningTasks, tasks, tasks+1) {
+			if !k.runningTasks.CompareAndSwap(tasks, tasks+1) {
 				continue
 			}
 			return
@@ -1213,18 +1236,18 @@ func (k *Kernel) incRunningTasks() {
 
 		// Transition from 0 -> 1. Synchronize with other transitions and timer.
 		k.runningTasksMu.Lock()
-		tasks = atomic.LoadInt64(&k.runningTasks)
+		tasks = k.runningTasks.Load()
 		if tasks != 0 {
 			// We're no longer the first task, no need to
 			// re-enable.
-			atomic.AddInt64(&k.runningTasks, 1)
+			k.runningTasks.Add(1)
 			k.runningTasksMu.Unlock()
 			return
 		}
 
 		if !k.cpuClockTickerDisabled {
 			// Timer was never disabled.
-			atomic.StoreInt64(&k.runningTasks, 1)
+			k.runningTasks.Store(1)
 			k.runningTasksMu.Unlock()
 			return
 		}
@@ -1260,12 +1283,12 @@ func (k *Kernel) incRunningTasks() {
 		// don't matter.
 		setting, exp := k.cpuClockTickerSetting.At(k.timekeeper.monotonicClock.Now())
 		if exp > 0 {
-			atomic.AddUint64(&k.cpuClock, exp)
+			k.cpuClock.Add(exp)
 		}
 
 		// Now that cpuClock is updated it is safe to allow other tasks to
 		// transition to running.
-		atomic.StoreInt64(&k.runningTasks, 1)
+		k.runningTasks.Store(1)
 
 		// N.B. we must unlock before calling Swap to maintain lock ordering.
 		//
@@ -1285,7 +1308,7 @@ func (k *Kernel) incRunningTasks() {
 }
 
 func (k *Kernel) decRunningTasks() {
-	tasks := atomic.AddInt64(&k.runningTasks, -1)
+	tasks := k.runningTasks.Add(-1)
 	if tasks < 0 {
 		panic(fmt.Sprintf("Invalid running count %d", tasks))
 	}
@@ -1478,7 +1501,7 @@ func (k *Kernel) MonotonicClock() ktime.Clock {
 
 // CPUClockNow returns the current value of k.cpuClock.
 func (k *Kernel) CPUClockNow() uint64 {
-	return atomic.LoadUint64(&k.cpuClock)
+	return k.cpuClock.Load()
 }
 
 // Syslog returns the syslog.
@@ -1492,10 +1515,10 @@ func (k *Kernel) Syslog() *syslog {
 // space is exhausted. 0 is not a valid cookie value, all other values
 // representable in a uint32 are allowed.
 func (k *Kernel) GenerateInotifyCookie() uint32 {
-	id := atomic.AddUint32(&k.nextInotifyCookie, 1)
+	id := k.nextInotifyCookie.Add(1)
 	// Wrap-around is explicitly allowed for inotify event cookies.
 	if id == 0 {
-		id = atomic.AddUint32(&k.nextInotifyCookie, 1)
+		id = k.nextInotifyCookie.Add(1)
 	}
 	return id
 }
@@ -1836,6 +1859,7 @@ func (k *Kernel) Release() {
 	}
 	k.timekeeper.Destroy()
 	k.vdso.Release(ctx)
+	k.RootNetworkNamespace().DecRef()
 }
 
 // PopulateNewCgroupHierarchy moves all tasks into a newly created cgroup
@@ -1864,7 +1888,11 @@ func (k *Kernel) PopulateNewCgroupHierarchy(root Cgroup) {
 // hierarchy with the provided id.  This is intended for use during hierarchy
 // teardown, as otherwise the tasks would be orphaned w.r.t to some controllers.
 func (k *Kernel) ReleaseCgroupHierarchy(hid uint32) {
+	var releasedCGs []Cgroup
+
 	k.tasks.mu.RLock()
+	// We'll have one cgroup per hierarchy per task.
+	releasedCGs = make([]Cgroup, 0, len(k.tasks.Root.tids))
 	k.tasks.forEachTaskLocked(func(t *Task) {
 		if t.exitState != TaskExitNone {
 			return
@@ -1872,12 +1900,22 @@ func (k *Kernel) ReleaseCgroupHierarchy(hid uint32) {
 		t.mu.Lock()
 		for cg := range t.cgroups {
 			if cg.HierarchyID() == hid {
-				t.leaveCgroupLocked(cg)
+				cg.Leave(t)
+				delete(t.cgroups, cg)
+				releasedCGs = append(releasedCGs, cg)
+				// A task can't be part of multiple cgroups from the same
+				// hierarchy, so we can skip checking the rest once we find a
+				// match.
+				break
 			}
 		}
 		t.mu.Unlock()
 	})
 	k.tasks.mu.RUnlock()
+
+	for _, c := range releasedCGs {
+		c.decRef()
+	}
 }
 
 func (k *Kernel) ReplaceFSContextRoots(ctx context.Context, oldRoot vfs.VirtualDentry, newRoot vfs.VirtualDentry) {

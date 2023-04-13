@@ -17,18 +17,19 @@
 //
 // Lock order:
 //
-// fs locks, except for memmap.Mappable locks
-//   mm.MemoryManager.metadataMu
-//     mm.MemoryManager.mappingMu
-//       Locks taken by memmap.Mappable methods other than Translate
-//         mm.MemoryManager.activeMu
-//           Locks taken by memmap.Mappable.Translate
-//             mm.privateRefs.mu
-//               platform.AddressSpace locks
-//                 memmap.File locks
-//         mm.aioManager.mu
-//           mm.AIOContext.mu
-//         kernel.TaskSet.mu
+//	 fs locks, except for memmap.Mappable locks
+//		mm.MemoryManager.metadataMu
+//			mm.MemoryManager.mappingMu
+//				Locks taken by memmap.MappingIdentity and memmap.Mappable methods other
+//				than Translate
+//					kernel.TaskSet.mu
+//						mm.MemoryManager.activeMu
+//							Locks taken by memmap.Mappable.Translate
+//								mm.privateRefs.mu
+//									platform.AddressSpace locks
+//										memmap.File locks
+//					mm.aioManager.mu
+//						mm.AIOContext.mu
 //
 // Only mm.MemoryManager.Fork is permitted to lock mm.MemoryManager.activeMu in
 // multiple mm.MemoryManagers, as it does so in a well-defined order (forked
@@ -39,6 +40,7 @@ import (
 	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
@@ -46,7 +48,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
-	"gvisor.dev/gvisor/pkg/sync"
 )
 
 // MemoryManager implements a virtual address space.
@@ -79,12 +80,10 @@ type MemoryManager struct {
 	// users is the number of dependencies on the mappings in the MemoryManager.
 	// When the number of references in users reaches zero, all mappings are
 	// unmapped.
-	//
-	// users is accessed using atomic memory operations.
-	users int32
+	users atomicbitops.Int32
 
 	// mappingMu is analogous to Linux's struct mm_struct::mmap_sem.
-	mappingMu sync.RWMutex `state:"nosave"`
+	mappingMu mappingRWMutex `state:"nosave"`
 
 	// vmas stores virtual memory areas. Since vmas are stored by value,
 	// clients should usually use vmaIterator.ValuePtr() instead of
@@ -127,7 +126,7 @@ type MemoryManager struct {
 
 	// activeMu is loosely analogous to Linux's struct
 	// mm_struct::page_table_lock.
-	activeMu sync.RWMutex `state:"nosave"`
+	activeMu activeRWMutex `state:"nosave"`
 
 	// pmas stores platform mapping areas used to implement vmas. Since pmas
 	// are stored by value, clients should usually use pmaIterator.ValuePtr()
@@ -169,7 +168,7 @@ type MemoryManager struct {
 	// activeMu. (This is because such transitions may need to be atomic with
 	// changes to as.)
 	as     platform.AddressSpace `state:"nosave"`
-	active int32                 `state:"zerovalue"`
+	active atomicbitops.Int32    `state:"zerovalue"`
 
 	// unmapAllOnActivate indicates that the next Activate call should activate
 	// an empty AddressSpace.
@@ -194,7 +193,12 @@ type MemoryManager struct {
 	captureInvalidations  bool             `state:"zerovalue"`
 	capturedInvalidations []invalidateArgs `state:"nosave"`
 
-	metadataMu sync.Mutex `state:"nosave"`
+	// dumpability describes if and how this MemoryManager may be dumped to
+	// userspace. This is read under kernel.TaskSet.mu, so it can't be protected
+	// by metadataMu.
+	dumpability atomicbitops.Int32
+
+	metadataMu metadataMutex `state:"nosave"`
 
 	// argv is the application argv. This is set up by the loader and may be
 	// modified by prctl(PR_SET_MM_ARG_START/PR_SET_MM_ARG_END). No
@@ -221,12 +225,6 @@ type MemoryManager struct {
 	// executable is protected by metadataMu.
 	executable fsbridge.File
 
-	// dumpability describes if and how this MemoryManager may be dumped to
-	// userspace.
-	//
-	// dumpability is protected by metadataMu.
-	dumpability Dumpability
-
 	// aioManager keeps track of AIOContexts used for async IOs. AIOManager
 	// must be cloned when CLONE_VM is used.
 	aioManager aioManager
@@ -243,15 +241,11 @@ type MemoryManager struct {
 	// previously been called. Since, as of this writing,
 	// MEMBARRIER_CMD_PRIVATE_EXPEDITED is implemented as a global memory
 	// barrier, membarrierPrivateEnabled has no other effect.
-	//
-	// membarrierPrivateEnabled is accessed using atomic memory operations.
-	membarrierPrivateEnabled uint32
+	membarrierPrivateEnabled atomicbitops.Uint32
 
 	// membarrierRSeqEnabled is non-zero if EnableMembarrierRSeq has previously
 	// been called.
-	//
-	// membarrierRSeqEnabled is accessed using atomic memory operations.
-	membarrierRSeqEnabled uint32
+	membarrierRSeqEnabled atomicbitops.Uint32
 }
 
 // vma represents a virtual memory area.
@@ -488,7 +482,7 @@ type pma struct {
 
 // +stateify savable
 type privateRefs struct {
-	mu sync.Mutex `state:"nosave"`
+	mu privateRefsMutex `state:"nosave"`
 
 	// refs maps offsets into MemoryManager.mfp.MemoryFile() to the number of
 	// pmas (or, equivalently, MemoryManagers) that share ownership of the

@@ -22,8 +22,8 @@ import (
 	"fmt"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/rawfile"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -43,11 +43,12 @@ const (
 // Memory allocated for the ring buffer: tpBlockSize * tpBlockNR = 2 MiB
 //
 // NOTE:
-//   Frames need to be aligned at 16 byte boundaries.
-//   BlockSize needs to be page aligned.
 //
-//   For details see PACKET_MMAP setting constraints in
-//   https://www.kernel.org/doc/Documentation/networking/packet_mmap.txt
+//	Frames need to be aligned at 16 byte boundaries.
+//	BlockSize needs to be page aligned.
+//
+//	For details see PACKET_MMAP setting constraints in
+//	https://www.kernel.org/doc/Documentation/networking/packet_mmap.txt
 const (
 	tpFrameSize = 65536 + 128
 	tpBlockSize = tpFrameSize * 32
@@ -186,7 +187,7 @@ func (d *packetMMapDispatcher) dispatch() (bool, tcpip.Error) {
 	}
 
 	pbuf := stack.NewPacketBuffer(stack.PacketBufferOptions{
-		Data: buffer.View(pkt).ToVectorisedView(),
+		Payload: buffer.NewWithData(pkt),
 	})
 	defer pbuf.DecRef()
 	if d.e.hdrSize > 0 {

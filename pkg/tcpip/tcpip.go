@@ -71,6 +71,11 @@ type MonotonicTime struct {
 	nanoseconds int64
 }
 
+// String implements Stringer.
+func (mt MonotonicTime) String() string {
+	return strconv.FormatInt(mt.nanoseconds, 10)
+}
+
 // Before reports whether the monotonic clock reading mt is before u.
 func (mt MonotonicTime) Before(u MonotonicTime) bool {
 	return mt.nanoseconds < u.nanoseconds
@@ -431,6 +436,12 @@ type SendableControlMessages struct {
 
 	// HopLimit is the IPv6 Hop Limit of the associated packet.
 	HopLimit uint8
+
+	// HasIPv6PacketInfo indicates whether IPv6PacketInfo is set.
+	HasIPv6PacketInfo bool
+
+	// IPv6PacketInfo holds interface and address data on an incoming packet.
+	IPv6PacketInfo IPv6PacketInfo
 }
 
 // ReceivableControlMessages contains socket control messages that can be
@@ -674,6 +685,16 @@ type Endpoint interface {
 	// SocketOptions returns the structure which contains all the socket
 	// level options.
 	SocketOptions() *SocketOptions
+}
+
+// EndpointWithPreflight is the interface implemented by endpoints that need
+// to expose the `Preflight` method for preparing the endpoint prior to
+// calling `Write`.
+type EndpointWithPreflight interface {
+	// Prepares the endpoint for writes using the provided WriteOptions,
+	// returning an error if the options were incompatible with the endpoint's
+	// current state.
+	Preflight(WriteOptions) Error
 }
 
 // LinkPacketInfo holds Link layer information for a received packet.
@@ -1351,7 +1372,7 @@ type NetworkProtocolNumber uint32
 //
 // +stateify savable
 type StatCounter struct {
-	count atomicbitops.AlignedAtomicUint64
+	count atomicbitops.Uint64
 }
 
 // Increment adds one to the counter.
@@ -1693,11 +1714,24 @@ type IPForwardingStats struct {
 	// header.
 	ExtensionHeaderProblem *StatCounter
 
+	// UnexpectedMulticastInputInterface is the number of multicast packets that
+	// were received on an interface that did not match the corresponding route's
+	// expected input interface.
+	UnexpectedMulticastInputInterface *StatCounter
+
+	// UnknownOutputEndpoint is the number of packets that could not be forwarded
+	// because the output endpoint could not be found.
+	UnknownOutputEndpoint *StatCounter
+
+	// NoMulticastPendingQueueBufferSpace is the number of multicast packets that
+	// were dropped due to insufficent buffer space in the pending packet queue.
+	NoMulticastPendingQueueBufferSpace *StatCounter
+
 	// Errors is the number of IP packets received which could not be
 	// successfully forwarded.
 	Errors *StatCounter
 
-	// LINT.ThenChange(network/internal/ip/stats.go:multiCounterIPForwardingStats)
+	// LINT.ThenChange(network/internal/ip/stats.go:MultiCounterIPForwardingStats)
 }
 
 // IPStats collects IP-specific stats (both v4 and v6).
@@ -2098,6 +2132,13 @@ type NICStats struct {
 	// Tx contains statistics about transmitted packets.
 	Tx NICPacketStats
 
+	// TxPacketsDroppedNoBufferSpace is the number of packets dropepd due to the
+	// NIC not having enough buffer space to send the packet.
+	//
+	// Packets may be dropped with a no buffer space error when the device TX
+	// queue is full.
+	TxPacketsDroppedNoBufferSpace *StatCounter
+
 	// Rx contains statistics about received packets.
 	Rx NICPacketStats
 
@@ -2275,12 +2316,10 @@ func (s Stats) FillIn() Stats {
 	return s
 }
 
-// Clone returns a copy of the TransportEndpointStats by atomically reading
-// each field.
-func (src *TransportEndpointStats) Clone() TransportEndpointStats {
-	var dst TransportEndpointStats
-	clone(reflect.ValueOf(&dst).Elem(), reflect.ValueOf(src).Elem())
-	return dst
+// Clone clones a copy of the TransportEndpointStats into dst by atomically
+// reading each field.
+func (src *TransportEndpointStats) Clone(dst *TransportEndpointStats) {
+	clone(reflect.ValueOf(dst).Elem(), reflect.ValueOf(src).Elem())
 }
 
 func clone(dst reflect.Value, src reflect.Value) {
@@ -2488,6 +2527,18 @@ func GetDanglingEndpoints() []Endpoint {
 	}
 	danglingEndpointsMu.Unlock()
 	return es
+}
+
+// ReleaseDanglingEndpoints clears out all all reference counted objects held by
+// dangling endpoints.
+func ReleaseDanglingEndpoints() {
+	// Get the dangling endpoints first to avoid locking around Release(), which
+	// can cause a lock inversion with endpoint.mu and danglingEndpointsMu.
+	// Calling Release on a dangling endpoint that has been deleted is a noop.
+	eps := GetDanglingEndpoints()
+	for _, ep := range eps {
+		ep.Abort()
+	}
 }
 
 // AddDanglingEndpoint adds a dangling endpoint.

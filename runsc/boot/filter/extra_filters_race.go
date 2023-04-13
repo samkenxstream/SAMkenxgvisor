@@ -25,7 +25,7 @@ import (
 // instrumentationFilters returns additional filters for syscalls used by TSAN.
 func instrumentationFilters() seccomp.SyscallRules {
 	Report("TSAN is enabled: syscall filters less restrictive!")
-	return seccomp.SyscallRules{
+	return archInstrumentationFilters(seccomp.SyscallRules{
 		unix.SYS_BRK:             {},
 		unix.SYS_CLOCK_NANOSLEEP: {},
 		unix.SYS_CLONE:           {},
@@ -33,10 +33,7 @@ func instrumentationFilters() seccomp.SyscallRules {
 		unix.SYS_MMAP:            {},
 		unix.SYS_MUNLOCK:         {},
 		unix.SYS_NANOSLEEP:       {},
-		unix.SYS_OPEN:            {},
 		unix.SYS_OPENAT:          {},
 		unix.SYS_SET_ROBUST_LIST: {},
-		// Used within glibc's malloc.
-		unix.SYS_TIME: {},
-	}
+	})
 }

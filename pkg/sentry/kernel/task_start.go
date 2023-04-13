@@ -15,7 +15,11 @@
 package kernel
 
 import (
+	"fmt"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -111,6 +115,7 @@ func (ts *TaskSet) NewTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 		cfg.FSContext.DecRef(ctx)
 		cfg.FDTable.DecRef(ctx)
 		cfg.IPCNamespace.DecRef(ctx)
+		cfg.NetworkNamespace.DecRef()
 		if cfg.MountNamespaceVFS2 != nil {
 			cfg.MountNamespaceVFS2.DecRef(ctx)
 		}
@@ -119,7 +124,7 @@ func (ts *TaskSet) NewTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 		cleanup()
 		return nil, err
 	}
-	t, err := ts.newTask(cfg)
+	t, err := ts.newTask(ctx, cfg)
 	if err != nil {
 		cfg.UserCounters.decRLimitNProc()
 		cleanup()
@@ -130,7 +135,8 @@ func (ts *TaskSet) NewTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 
 // newTask is a helper for TaskSet.NewTask that only takes ownership of parts
 // of cfg if it succeeds.
-func (ts *TaskSet) newTask(cfg *TaskConfig) (*Task, error) {
+func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) {
+	srcT := TaskFromContext(ctx)
 	tg := cfg.ThreadGroup
 	image := cfg.TaskImage
 	t := &Task{
@@ -141,7 +147,7 @@ func (ts *TaskSet) newTask(cfg *TaskConfig) (*Task, error) {
 		},
 		runState:           (*runApp)(nil),
 		interruptChan:      make(chan struct{}, 1),
-		signalMask:         cfg.SignalMask,
+		signalMask:         atomicbitops.FromUint64(uint64(cfg.SignalMask)),
 		signalStack:        linux.SignalStack{Flags: linux.SS_DISABLE},
 		image:              *image,
 		fsContext:          cfg.FSContext,
@@ -169,6 +175,27 @@ func (ts *TaskSet) newTask(cfg *TaskConfig) (*Task, error) {
 	t.ptraceTracer.Store((*Task)(nil))
 	// We don't construct t.blockingTimer until Task.run(); see that function
 	// for justification.
+
+	var cu cleanup.Cleanup
+	defer cu.Clean()
+
+	// Reserve cgroup PIDs controller charge. This is either commited when the
+	// new task enters the cgroup below, or rolled back on failure.
+	//
+	// We may also get here from a non-task context (for example, when
+	// creating the init task, or from the exec control command). In these cases
+	// we skip charging the pids controller, as non-userspace task creation
+	// bypasses pid limits.
+	if srcT != nil {
+		if err := srcT.ChargeFor(t, CgroupControllerPIDs, CgroupResourcePID, 1); err != nil {
+			return nil, err
+		}
+		cu.Add(func() {
+			if err := srcT.ChargeFor(t, CgroupControllerPIDs, CgroupResourcePID, -1); err != nil {
+				panic(fmt.Sprintf("Failed to clean up PIDs charge on task creation failure: %v", err))
+			}
+		})
+	}
 
 	// Make the new task (and possibly thread group) visible to the rest of
 	// the system atomically.
@@ -202,7 +229,8 @@ func (ts *TaskSet) newTask(cfg *TaskConfig) (*Task, error) {
 	}
 
 	if VFS2Enabled {
-		t.EnterInitialCgroups(t.parent)
+		// srcT may be nil, in which case we default to root cgroups.
+		t.EnterInitialCgroups(srcT)
 	}
 
 	if tg.leader == nil {
@@ -223,18 +251,20 @@ func (ts *TaskSet) newTask(cfg *TaskConfig) (*Task, error) {
 	tg.activeTasks++
 
 	// Propagate external TaskSet stops to the new task.
-	t.stopCount = ts.stopCount
+	t.stopCount = atomicbitops.FromInt32(ts.stopCount)
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	t.cpu = assignCPU(t.allowedCPUMask, ts.Root.tids[t])
+	t.cpu = atomicbitops.FromInt32(assignCPU(t.allowedCPUMask, ts.Root.tids[t]))
+
 	t.startTime = t.k.RealtimeClock().Now()
 
 	// As a final step, initialize the platform context. This may require
 	// other pieces to be initialized as the task is used the context.
 	t.p = cfg.Kernel.Platform.NewContext(t.AsyncContext())
 
+	cu.Release()
 	return t, nil
 }
 
@@ -267,6 +297,7 @@ func (ts *TaskSet) assignTIDsLocked(t *Task) error {
 		}
 		return err
 	}
+	t.tg.pidWithinNS.Store(int32(t.tg.pidns.tgids[t.tg]))
 	return nil
 }
 

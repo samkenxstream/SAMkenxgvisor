@@ -34,7 +34,8 @@ import (
 // +stateify savable
 type cpusetController struct {
 	controllerCommon
-	controllerNoopMigrate
+	controllerStateless
+	controllerNoResource
 
 	maxCpus uint32
 	maxMems uint32
@@ -59,12 +60,14 @@ func newCPUSetController(k *kernel.Kernel, fs *filesystem) *cpusetController {
 		maxCpus: uint32(k.ApplicationCores()),
 		maxMems: 1, // We always report a single NUMA node.
 	}
-	c.controllerCommon.init(controllerCPUSet, fs)
+	c.controllerCommon.init(kernel.CgroupControllerCPUSet, fs)
 	return c
 }
 
 // Clone implements controller.Clone.
 func (c *cpusetController) Clone() controller {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	cpus := c.cpus.Clone()
 	mems := c.mems.Clone()
 	new := &cpusetController{
@@ -73,7 +76,7 @@ func (c *cpusetController) Clone() controller {
 		cpus:    &cpus,
 		mems:    &mems,
 	}
-	new.controllerCommon.cloneFrom(&c.controllerCommon)
+	new.controllerCommon.cloneFromParent(c)
 	return new
 }
 

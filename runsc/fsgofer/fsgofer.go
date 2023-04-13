@@ -16,8 +16,8 @@
 // a simple mapping from a path prefix that is added to the path requested
 // by the sandbox. Ex:
 //
-//   prefix: "/docker/imgs/alpine"
-//   app path: /bin/ls => /docker/imgs/alpine/bin/ls
+//	prefix: "/docker/imgs/alpine"
+//	app path: /bin/ls => /docker/imgs/alpine/bin/ls
 package fsgofer
 
 import (
@@ -52,14 +52,6 @@ const (
 	unixPathMax = 108
 )
 
-// verityXattrs are the extended attributes used by verity file system.
-var verityXattrs = map[string]struct{}{
-	"user.merkle.offset":         {},
-	"user.merkle.size":           {},
-	"user.merkle.childrenOffset": {},
-	"user.merkle.childrenSize":   {},
-}
-
 // join is equivalent to path.Join() but skips path.Clean() which is expensive.
 func join(parent, child string) string {
 	return parent + "/" + child
@@ -73,13 +65,9 @@ type Config struct {
 	// PanicOnWrite panics on attempts to write to RO mounts.
 	PanicOnWrite bool
 
-	// HostUDS signals whether the gofer can mount a host's UDS and connect to it
-	// or bind (create) a host UDS and serve it.
+	// HostUDS signals whether the gofer can create and connect to host
+	// unix domain sockets.
 	HostUDS bool
-
-	// EnableVerityXattr allows access to extended attributes used by the
-	// verity file system.
-	EnableVerityXattr bool
 }
 
 type attachPoint struct {
@@ -202,10 +190,10 @@ func (a *attachPoint) makeQID(stat *unix.Stat_t) p9.QID {
 // multiple files are only being opened for read (esp. startup).
 //
 // File operations must use "at" functions whenever possible:
-//   * Local operations must use AT_EMPTY_PATH:
-//  	   fchownat(fd, "", AT_EMPTY_PATH, ...), instead of chown(fullpath, ...)
-//   * Creation operations must use (fd + name):
-//       mkdirat(fd, name, ...), instead of mkdir(fullpath, ...)
+//   - Local operations must use AT_EMPTY_PATH:
+//     fchownat(fd, "", AT_EMPTY_PATH, ...), instead of chown(fullpath, ...)
+//   - Creation operations must use (fd + name):
+//     mkdirat(fd, name, ...), instead of mkdir(fullpath, ...)
 //
 // Apart from being faster, it also adds another layer of defense against
 // symlink attacks (note that O_NOFOLLOW applies only to the last element in
@@ -822,27 +810,11 @@ func (l *localFile) SetAttr(valid p9.SetAttrMask, attr p9.SetAttr) error {
 }
 
 func (l *localFile) GetXattr(name string, size uint64) (string, error) {
-	if !l.attachPoint.conf.EnableVerityXattr {
-		return "", unix.EOPNOTSUPP
-	}
-	if _, ok := verityXattrs[name]; !ok {
-		return "", unix.EOPNOTSUPP
-	}
-	buffer := make([]byte, size)
-	if _, err := unix.Fgetxattr(l.file.FD(), name, buffer); err != nil {
-		return "", err
-	}
-	return string(buffer), nil
+	return "", unix.EOPNOTSUPP
 }
 
 func (l *localFile) SetXattr(name string, value string, flags uint32) error {
-	if !l.attachPoint.conf.EnableVerityXattr {
-		return unix.EOPNOTSUPP
-	}
-	if _, ok := verityXattrs[name]; !ok {
-		return unix.EOPNOTSUPP
-	}
-	return unix.Fsetxattr(l.file.FD(), name, []byte(value), int(flags))
+	return unix.EOPNOTSUPP
 }
 
 func (*localFile) ListXattr(uint64) (map[string]struct{}, error) {
