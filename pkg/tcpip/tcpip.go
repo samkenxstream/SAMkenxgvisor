@@ -33,6 +33,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/bits"
 	"reflect"
 	"strconv"
@@ -44,8 +45,13 @@ import (
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
-// Using header.IPv4AddressSize would cause an import cycle.
-const ipv4AddressSize = 4
+// Using the header package here would cause an import cycle.
+const (
+	ipv4AddressSize    = 4
+	ipv4ProtocolNumber = 0x0800
+	ipv6AddressSize    = 16
+	ipv6ProtocolNumber = 0x86dd
+)
 
 // Errors related to Subnet
 var (
@@ -74,6 +80,12 @@ type MonotonicTime struct {
 // String implements Stringer.
 func (mt MonotonicTime) String() string {
 	return strconv.FormatInt(mt.nanoseconds, 10)
+}
+
+// MonotonicTimeInfinite returns the monotonic timestamp as far away in the
+// future as possible.
+func MonotonicTimeInfinite() MonotonicTime {
+	return MonotonicTime{nanoseconds: math.MaxInt64}
 }
 
 // Before reports whether the monotonic clock reading mt is before u.
@@ -1551,6 +1563,10 @@ type ICMPv6PacketStats struct {
 	// counted.
 	MulticastListenerReport *StatCounter
 
+	// MulticastListenerReportV2 is the number of Multicast Listener Report
+	// messages counted.
+	MulticastListenerReportV2 *StatCounter
+
 	// MulticastListenerDone is the number of Multicast Listener Done messages
 	// counted.
 	MulticastListenerDone *StatCounter
@@ -1631,6 +1647,10 @@ type IGMPPacketStats struct {
 	// counted.
 	V2MembershipReport *StatCounter
 
+	// V3MembershipReport is the number of Version 3 Membership Report messages
+	// counted.
+	V3MembershipReport *StatCounter
+
 	// LeaveGroup is the number of Leave Group messages counted.
 	LeaveGroup *StatCounter
 
@@ -1693,6 +1713,11 @@ type IPForwardingStats struct {
 	// because their TTL was exhausted.
 	ExhaustedTTL *StatCounter
 
+	// InitializingSource is the number of IP packets which were dropped
+	// because they contained a source address that may only be used on the local
+	// network as part of initialization work.
+	InitializingSource *StatCounter
+
 	// LinkLocalSource is the number of IP packets which were dropped
 	// because they contained a link-local source address.
 	LinkLocalSource *StatCounter
@@ -1726,6 +1751,10 @@ type IPForwardingStats struct {
 	// NoMulticastPendingQueueBufferSpace is the number of multicast packets that
 	// were dropped due to insufficent buffer space in the pending packet queue.
 	NoMulticastPendingQueueBufferSpace *StatCounter
+
+	// OutgoingDeviceNoBufferSpace is the number of packets that were dropped due
+	// to insufficient space in the outgoing device.
+	OutgoingDeviceNoBufferSpace *StatCounter
 
 	// Errors is the number of IP packets received which could not be
 	// successfully forwarded.
@@ -2023,6 +2052,16 @@ type NICNeighborStats struct {
 	// UnreachableEntryLookups counts the number of lookups performed on an
 	// entry in Unreachable state.
 	UnreachableEntryLookups *StatCounter
+
+	// DroppedConfirmationForNoninitiatedNeighbor counts the number of neighbor
+	// responses that were dropped because they didn't match an entry in the
+	// cache.
+	DroppedConfirmationForNoninitiatedNeighbor *StatCounter
+
+	// DroppedInvalidLinkAddressConfirmations counts the number of neighbor
+	// responses that were ignored because they had an invalid source link-layer
+	// address.
+	DroppedInvalidLinkAddressConfirmations *StatCounter
 
 	// LINT.ThenChange(stack/nic_stats.go:multiCounterNICNeighborStats)
 }

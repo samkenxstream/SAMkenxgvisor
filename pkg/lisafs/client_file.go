@@ -304,7 +304,13 @@ func (f *ClientFD) SetStat(ctx context.Context, stat *linux.Statx) (uint32, erro
 	ctx.UninterruptibleSleepStart(false)
 	err := f.client.SndRcvMessage(SetStat, uint32(req.SizeBytes()), req.MarshalUnsafe, resp.CheckedUnmarshal, nil, req.String, resp.String)
 	ctx.UninterruptibleSleepFinish(false)
-	return resp.FailureMask, unix.Errno(resp.FailureErrNo), err
+	if err != nil {
+		return 0, nil, err
+	}
+	if resp.FailureMask == 0 {
+		return 0, nil, nil
+	}
+	return resp.FailureMask, unix.Errno(resp.FailureErrNo), nil
 }
 
 // WalkMultiple makes the Walk RPC with multiple path components.
@@ -421,16 +427,18 @@ func (f *ClientFD) Flush(ctx context.Context) error {
 }
 
 // BindAt makes the BindAt RPC.
-func (f *ClientFD) BindAt(ctx context.Context, sockType linux.SockType, name string) (Inode, *ClientBoundSocketFD, error) {
-	req := BindAtReq{
-		DirFD:    f.fd,
-		SockType: primitive.Uint32(sockType),
-		Name:     SizedString(name),
-	}
+func (f *ClientFD) BindAt(ctx context.Context, sockType linux.SockType, name string, mode linux.FileMode, uid UID, gid GID) (Inode, *ClientBoundSocketFD, error) {
 	var (
+		req          BindAtReq
 		resp         BindAtResp
 		hostSocketFD [1]int
 	)
+	req.DirFD = f.fd
+	req.SockType = primitive.Uint32(sockType)
+	req.Name = SizedString(name)
+	req.Mode = mode
+	req.UID = uid
+	req.GID = gid
 	ctx.UninterruptibleSleepStart(false)
 	err := f.client.SndRcvMessage(BindAt, uint32(req.SizeBytes()), req.MarshalBytes, resp.CheckedUnmarshal, hostSocketFD[:], req.String, resp.String)
 	ctx.UninterruptibleSleepFinish(false)
@@ -573,7 +581,8 @@ func (f *ClientFD) RemoveXattr(ctx context.Context, name string) error {
 	return err
 }
 
-// ClientBoundSocketFD corresponds to a bound socket on the server.
+// ClientBoundSocketFD corresponds to a bound socket on the server. It
+// implements transport.BoundSocketFD.
 //
 // All fields are immutable.
 type ClientBoundSocketFD struct {
@@ -587,19 +596,20 @@ type ClientBoundSocketFD struct {
 	client *Client
 }
 
-// Close closes the host and gofer-backed FDs associated to this bound socket.
+// Close implements transport.BoundSocketFD.Close.
 func (f *ClientBoundSocketFD) Close(ctx context.Context) {
 	_ = unix.Close(int(f.notificationFD))
+	// flush is true because the socket FD must be closed immediately on the
+	// server. close(2) on socket FD impacts application behavior.
 	f.client.CloseFD(ctx, f.fd, true /* flush */)
 }
 
-// NotificationFD is a host FD that can be used to notify when new clients
-// connect to the socket.
+// NotificationFD implements transport.BoundSocketFD.NotificationFD.
 func (f *ClientBoundSocketFD) NotificationFD() int32 {
 	return f.notificationFD
 }
 
-// Listen makes a Listen RPC.
+// Listen implements transport.BoundSocketFD.Listen.
 func (f *ClientBoundSocketFD) Listen(ctx context.Context, backlog int32) error {
 	req := ListenReq{
 		FD:      f.fd,
@@ -612,7 +622,7 @@ func (f *ClientBoundSocketFD) Listen(ctx context.Context, backlog int32) error {
 	return err
 }
 
-// Accept makes an Accept RPC.
+// Accept implements transport.BoundSocketFD.Accept.
 func (f *ClientBoundSocketFD) Accept(ctx context.Context) (int, error) {
 	req := AcceptReq{
 		FD: f.fd,

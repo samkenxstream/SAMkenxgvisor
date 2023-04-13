@@ -117,8 +117,17 @@ func (t *Task) killedLocked() bool {
 //
 // Preconditions: The caller must be running on the task goroutine.
 func (t *Task) PrepareExit(ws linux.WaitStatus) {
+	t.tg.pidns.owner.mu.RLock()
+	defer t.tg.pidns.owner.mu.RUnlock()
 	t.tg.signalHandlers.mu.Lock()
 	defer t.tg.signalHandlers.mu.Unlock()
+
+	last := t.tg.activeTasks == 1
+	if last {
+		t.prepareGroupExitLocked(ws)
+		return
+	}
+
 	t.exitStatus = ws
 }
 
@@ -133,6 +142,13 @@ func (t *Task) PrepareExit(ws linux.WaitStatus) {
 func (t *Task) PrepareGroupExit(ws linux.WaitStatus) {
 	t.tg.signalHandlers.mu.Lock()
 	defer t.tg.signalHandlers.mu.Unlock()
+	t.prepareGroupExitLocked(ws)
+}
+
+// Preconditions:
+//   - The caller must be running on the task goroutine.
+//   - The signal mutex must be locked.
+func (t *Task) prepareGroupExitLocked(ws linux.WaitStatus) {
 	if t.tg.exiting || t.tg.execing != nil {
 		// Note that if t.tg.exiting is false but t.tg.execing is not nil, i.e.
 		// this "group exit" is being executed by the killed sibling of an
@@ -214,7 +230,7 @@ func (*runExitMain) execute(t *Task) taskRunState {
 			info.ContextData = &pb.ContextData{}
 			LoadSeccheckData(t, fields.Context, info.ContextData)
 		}
-		seccheck.Global.SendToCheckers(func(c seccheck.Checker) error {
+		seccheck.Global.SentToSinks(func(c seccheck.Sink) error {
 			return c.TaskExit(t, fields, info)
 		})
 	}
@@ -269,8 +285,8 @@ func (*runExitMain) execute(t *Task) taskRunState {
 	t.LeaveCgroups()
 
 	t.mu.Lock()
-	mntns := t.mountNamespaceVFS2
-	t.mountNamespaceVFS2 = nil
+	mntns := t.mountNamespace
+	t.mountNamespace = nil
 	ipcns := t.ipcns
 	netns := t.NetworkNamespace()
 	t.mu.Unlock()
@@ -668,7 +684,7 @@ func (t *Task) exitNotifyLocked(fromPtraceDetach bool) {
 			// Clone or Exec events for the initial process.
 			if t.tg != t.k.globalInit && seccheck.Global.Enabled(seccheck.PointExitNotifyParent) {
 				mask, info := getExitNotifyParentSeccheckInfo(t)
-				if err := seccheck.Global.SendToCheckers(func(c seccheck.Checker) error {
+				if err := seccheck.Global.SentToSinks(func(c seccheck.Sink) error {
 					return c.ExitNotifyParent(t, mask, info)
 				}); err != nil {
 					log.Infof("Ignoring error from ExitNotifyParent point: %v", err)
@@ -732,7 +748,9 @@ func getExitNotifyParentSeccheckInfo(t *Task) (seccheck.FieldSet, *pb.ExitNotify
 	}
 	if !fields.Context.Empty() {
 		info.ContextData = &pb.ContextData{}
-		LoadSeccheckDataLocked(t, fields.Context, info.ContextData)
+		// cwd isn't used for notifyExit seccheck so it's ok to pass an empty
+		// string.
+		LoadSeccheckDataLocked(t, fields.Context, info.ContextData, "")
 	}
 
 	return fields, info

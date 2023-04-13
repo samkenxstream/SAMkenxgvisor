@@ -25,10 +25,9 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/metric"
-	"gvisor.dev/gvisor/pkg/p9"
 	"gvisor.dev/gvisor/pkg/safemem"
-	"gvisor.dev/gvisor/pkg/sentry/fs/fsutil"
 	"gvisor.dev/gvisor/pkg/sentry/fsmetric"
+	"gvisor.dev/gvisor/pkg/sentry/fsutil"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
@@ -95,30 +94,14 @@ func (fd *regularFileFD) OnClose(ctx context.Context) error {
 			return nil
 		}
 	}
-	d.handleMu.RLock()
-	defer d.handleMu.RUnlock()
-	if d.fs.opts.lisaEnabled {
-		if !d.writeFDLisa.Ok() {
-			return nil
-		}
-		return d.writeFDLisa.Flush(ctx)
-	}
-	if d.writeFile.isNil() {
-		return nil
-	}
-	return d.writeFile.flush(ctx)
+	return d.flush(ctx)
 }
 
 // Allocate implements vfs.FileDescriptionImpl.Allocate.
 func (fd *regularFileFD) Allocate(ctx context.Context, mode, offset, length uint64) error {
 	d := fd.dentry()
 	return d.doAllocate(ctx, offset, length, func() error {
-		d.handleMu.RLock()
-		defer d.handleMu.RUnlock()
-		if d.fs.opts.lisaEnabled {
-			return d.writeFDLisa.Allocate(ctx, mode, offset, length)
-		}
-		return d.writeFile.allocate(ctx, p9.ToAllocateMode(mode), offset, length)
+		return d.allocate(ctx, mode, offset, length)
 	})
 }
 
@@ -289,21 +272,10 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 		// If setuid or setgid were set, update d.mode and propagate
 		// changes to the host.
 		if newMode := vfs.ClearSUIDAndSGID(oldMode); newMode != oldMode {
-			d.mode.Store(newMode)
-			if d.fs.opts.lisaEnabled {
-				stat := linux.Statx{Mask: linux.STATX_MODE, Mode: uint16(newMode)}
-				failureMask, failureErr, err := d.controlFDLisa.SetStat(ctx, &stat)
-				if err != nil {
-					return 0, offset, err
-				}
-				if failureMask != 0 {
-					return 0, offset, failureErr
-				}
-			} else {
-				if err := d.file.setAttr(ctx, p9.SetAttrMask{Permissions: true}, p9.SetAttr{Permissions: p9.FileMode(newMode)}); err != nil {
-					return 0, offset, err
-				}
+			if err := d.chmod(ctx, uint16(newMode)); err != nil {
+				return 0, offset, err
 			}
+			d.mode.Store(newMode)
 		}
 	}
 
@@ -365,7 +337,7 @@ type dentryReadWriter struct {
 }
 
 var dentryReadWriterPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return &dentryReadWriter{}
 	},
 }
@@ -395,9 +367,9 @@ func (rw *dentryReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) 
 	// coherence with memory-mapped I/O), or if InteropModeShared is in effect
 	// (which prevents us from caching file contents and makes dentry.size
 	// unreliable), or if the file was opened O_DIRECT, read directly from
-	// dentry.readHandleLocked() without locking dentry.dataMu.
+	// readHandle() without locking dentry.dataMu.
 	rw.d.handleMu.RLock()
-	h := rw.d.readHandleLocked()
+	h := rw.d.readHandle()
 	if (rw.d.mmapFD.RacyLoad() >= 0 && !rw.d.fs.opts.forcePageCache) || rw.d.fs.opts.interop == InteropModeShared || rw.direct {
 		n, err := h.readToBlocksAt(rw.ctx, dsts, rw.off)
 		rw.d.handleMu.RUnlock()
@@ -467,7 +439,7 @@ func (rw *dentryReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) 
 					End:   gapEnd,
 				}
 				optMR := gap.Range()
-				err := rw.d.cache.Fill(rw.ctx, reqMR, maxFillRange(reqMR, optMR), rw.d.size.Load(), mf, usage.PageCache, h.readToBlocksAt)
+				_, err := rw.d.cache.Fill(rw.ctx, reqMR, maxFillRange(reqMR, optMR), rw.d.size.Load(), mf, usage.PageCache, true /* populate */, h.readToBlocksAt)
 				mf.MarkEvictable(rw.d, pgalloc.EvictableRange{optMR.Start, optMR.End})
 				seg, gap = rw.d.cache.Find(rw.off)
 				if !seg.Ok() {
@@ -514,10 +486,10 @@ func (rw *dentryReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64, erro
 	// If we have a mmappable host FD (which must be used here to ensure
 	// coherence with memory-mapped I/O), or if InteropModeShared is in effect
 	// (which prevents us from caching file contents), or if the file was
-	// opened with O_DIRECT, write directly to dentry.writeHandleLocked()
+	// opened with O_DIRECT, write directly to dentry.writeHandle()
 	// without locking dentry.dataMu.
 	rw.d.handleMu.RLock()
-	h := rw.d.writeHandleLocked()
+	h := rw.d.writeHandle()
 	if (rw.d.mmapFD.RacyLoad() >= 0 && !rw.d.fs.opts.forcePageCache) || rw.d.fs.opts.interop == InteropModeShared || rw.direct {
 		n, err := h.writeFromBlocksAt(rw.ctx, srcs, rw.off)
 		rw.off += n
@@ -625,7 +597,7 @@ func (d *dentry) writeback(ctx context.Context, offset, size int64) error {
 	}
 	d.handleMu.RLock()
 	defer d.handleMu.RUnlock()
-	h := d.writeHandleLocked()
+	h := d.writeHandle()
 	d.dataMu.Lock()
 	defer d.dataMu.Unlock()
 	// Compute the range of valid bytes (overflow-checked).
@@ -665,7 +637,7 @@ func regularFileSeekLocked(ctx context.Context, d *dentry, fdOffset, offset int6
 	case linux.SEEK_END, linux.SEEK_DATA, linux.SEEK_HOLE:
 		// Ensure file size is up to date.
 		if !d.cachedMetadataAuthoritative() {
-			if err := d.updateFromGetattr(ctx); err != nil {
+			if err := d.updateMetadata(ctx); err != nil {
 				return 0, err
 			}
 		}
@@ -676,12 +648,12 @@ func regularFileSeekLocked(ctx context.Context, d *dentry, fdOffset, offset int6
 		case linux.SEEK_END:
 			offset += size
 		case linux.SEEK_DATA:
-			if offset > size {
+			if offset >= size {
 				return 0, linuxerr.ENXIO
 			}
 			// Use offset as specified.
 		case linux.SEEK_HOLE:
-			if offset > size {
+			if offset >= size {
 				return 0, linuxerr.ENXIO
 			}
 			offset = size
@@ -825,8 +797,8 @@ func (d *dentry) Translate(ctx context.Context, required, optional memmap.Mappab
 	}
 
 	mf := d.fs.mfp.MemoryFile()
-	h := d.readHandleLocked()
-	cerr := d.cache.Fill(ctx, required, maxFillRange(required, optional), d.size.Load(), mf, usage.PageCache, h.readToBlocksAt)
+	h := d.readHandle()
+	_, cerr := d.cache.Fill(ctx, required, maxFillRange(required, optional), d.size.Load(), mf, usage.PageCache, true /* populate */, h.readToBlocksAt)
 
 	var ts []memmap.Translation
 	var translatedEnd uint64
@@ -897,7 +869,7 @@ func (d *dentry) InvalidateUnsavable(ctx context.Context) error {
 	mf := d.fs.mfp.MemoryFile()
 	d.handleMu.RLock()
 	defer d.handleMu.RUnlock()
-	h := d.writeHandleLocked()
+	h := d.writeHandle()
 	d.dataMu.Lock()
 	defer d.dataMu.Unlock()
 	if err := fsutil.SyncDirtyAll(ctx, &d.cache, &d.dirty, d.size.Load(), mf, h.writeFromBlocksAt); err != nil {
@@ -921,7 +893,7 @@ func (d *dentry) Evict(ctx context.Context, er pgalloc.EvictableRange) {
 	defer d.mapsMu.Unlock()
 	d.handleMu.RLock()
 	defer d.handleMu.RUnlock()
-	h := d.writeHandleLocked()
+	h := d.writeHandle()
 	d.dataMu.Lock()
 	defer d.dataMu.Unlock()
 

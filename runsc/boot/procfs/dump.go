@@ -23,6 +23,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/proc"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -65,6 +66,18 @@ type Stat struct {
 	SID  int32 `json:"sid"`
 }
 
+// Mapping contains information for /proc/[pid]/maps.
+type Mapping struct {
+	Address     hostarch.AddrRange  `json:"address,omitempty"`
+	Permissions hostarch.AccessType `json:"permissions"`
+	Private     string              `json:"private,omitempty"`
+	Offset      uint64              `json:"offset"`
+	DevMajor    uint32              `json:"deviceMajor,omitempty"`
+	DevMinor    uint32              `json:"deviceMinor,omitempty"`
+	Inode       uint64              `json:"inode,omitempty"`
+	Pathname    string              `json:"pathname,omitempty"`
+}
+
 // ProcessProcfsDump contains the procfs dump for one process. For more details
 // on fields that directly correspond to /proc fields, see proc(5).
 type ProcessProcfsDump struct {
@@ -92,6 +105,8 @@ type ProcessProcfsDump struct {
 	Status Status `json:"status,omitempty"`
 	// Stat is /proc/[pid]/stat.
 	Stat Stat `json:"stat,omitempty"`
+	// Maps is /proc/[pid]/maps.
+	Maps []Mapping `json:"maps,omitempty"`
 }
 
 // getMM returns t's MemoryManager. On success, the MemoryManager's users count
@@ -116,7 +131,7 @@ func getExecutablePath(ctx context.Context, pid kernel.ThreadID, mm *mm.MemoryMa
 	}
 	defer exec.DecRef(ctx)
 
-	return exec.PathnameWithDeleted(ctx)
+	return exec.MappedName(ctx)
 }
 
 func getMetadataArray(ctx context.Context, pid kernel.ThreadID, mm *mm.MemoryManager, metaType proc.MetadataType) []string {
@@ -132,7 +147,7 @@ func getMetadataArray(ctx context.Context, pid kernel.ThreadID, mm *mm.MemoryMan
 }
 
 func getCWD(ctx context.Context, t *kernel.Task, pid kernel.ThreadID) string {
-	cwdDentry := t.FSContext().WorkingDirectoryVFS2()
+	cwdDentry := t.FSContext().WorkingDirectory()
 	if !cwdDentry.Ok() {
 		log.Warningf("No CWD dentry found for PID %s", pid)
 		return ""
@@ -170,7 +185,7 @@ func getFDs(ctx context.Context, t *kernel.Task, pid kernel.ThreadID) []FDInfo {
 			fdNos := fdTable.GetFDs(ctx)
 			fds = make([]fdInfo, 0, len(fdNos))
 			for _, fd := range fdNos {
-				file, _ := fdTable.GetVFS2(fd)
+				file, _ := fdTable.Get(fd)
 				if file != nil {
 					fds = append(fds, fdInfo{fd: file, no: fd})
 				}
@@ -200,8 +215,8 @@ func getFDs(ctx context.Context, t *kernel.Task, pid kernel.ThreadID) []FDInfo {
 }
 
 func getRoot(t *kernel.Task, pid kernel.ThreadID) string {
-	realRoot := t.MountNamespaceVFS2().Root()
-	root := t.FSContext().RootDirectoryVFS2()
+	realRoot := t.MountNamespace().Root()
+	root := t.FSContext().RootDirectory()
 	defer root.DecRef(t)
 	path, err := t.Kernel().VFS().PathnameWithDeleted(t, realRoot, root)
 	if err != nil {
@@ -251,6 +266,27 @@ func getStat(t *kernel.Task, pid kernel.ThreadID, pidns *kernel.PIDNamespace) St
 	}
 }
 
+func getMappings(ctx context.Context, mm *mm.MemoryManager) []Mapping {
+	var maps []Mapping
+	mm.ReadMapsDataInto(ctx, func(start, end hostarch.Addr, permissions hostarch.AccessType, private string, offset uint64, devMajor, devMinor uint32, inode uint64, path string) {
+		maps = append(maps, Mapping{
+			Address: hostarch.AddrRange{
+				Start: start,
+				End:   end,
+			},
+			Permissions: permissions,
+			Private:     private,
+			Offset:      offset,
+			DevMajor:    devMajor,
+			DevMinor:    devMinor,
+			Inode:       inode,
+			Pathname:    path,
+		})
+	})
+
+	return maps
+}
+
 // Dump returns a procfs dump for process pid. t must be a task in process pid.
 func Dump(t *kernel.Task, pid kernel.ThreadID, pidns *kernel.PIDNamespace) (ProcessProcfsDump, error) {
 	ctx := t.AsyncContext()
@@ -282,5 +318,6 @@ func Dump(t *kernel.Task, pid kernel.ThreadID, pidns *kernel.PIDNamespace) (Proc
 		Cgroup: t.GetCgroupEntries(),
 		Status: getStatus(t, mm, pid, pidns),
 		Stat:   getStat(t, pid, pidns),
+		Maps:   getMappings(ctx, mm),
 	}, nil
 }

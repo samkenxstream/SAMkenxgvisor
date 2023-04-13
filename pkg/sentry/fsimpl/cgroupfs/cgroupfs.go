@@ -180,6 +180,14 @@ func (fs *filesystem) InitializeHierarchyID(hid uint32) {
 	fs.hierarchyID = hid
 }
 
+// RootCgroup implements kernel.cgroupFS.RootCgroup.
+func (fs *filesystem) RootCgroup() kernel.Cgroup {
+	return kernel.Cgroup{
+		Dentry:     fs.root,
+		CgroupImpl: fs.root.Inode().(kernel.CgroupImpl),
+	}
+}
+
 // Name implements vfs.FilesystemType.Name.
 func (FilesystemType) Name() string {
 	return Name
@@ -383,7 +391,7 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	}
 
 	// Move all existing tasks to the root of the new hierarchy.
-	k.PopulateNewCgroupHierarchy(fs.rootCgroup())
+	k.PopulateNewCgroupHierarchy(fs.effectiveRootCgroup())
 
 	return fs.VFSFilesystem(), rootD.VFSDentry(), nil
 }
@@ -441,7 +449,7 @@ func (fs *filesystem) prepareInitialCgroup(ctx context.Context, vfsObj *vfs.Virt
 	return nil
 }
 
-func (fs *filesystem) rootCgroup() kernel.Cgroup {
+func (fs *filesystem) effectiveRootCgroup() kernel.Cgroup {
 	return kernel.Cgroup{
 		Dentry:     fs.effectiveRoot,
 		CgroupImpl: fs.effectiveRoot.Inode().(kernel.CgroupImpl),
@@ -493,6 +501,7 @@ type dir struct {
 	kernfs.InodeAttrs
 	kernfs.InodeNotSymlink
 	kernfs.InodeDirectoryNoNewChildren
+	kernfs.InodeWatches
 	kernfs.OrderedChildren
 	implStatFS
 
@@ -514,6 +523,8 @@ func (d *dir) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *auth.Crede
 
 // Open implements kernfs.Inode.Open.
 func (d *dir) Open(ctx context.Context, rp *vfs.ResolvingPath, kd *kernfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+	opts.Flags &= linux.O_ACCMODE | linux.O_CREAT | linux.O_EXCL | linux.O_TRUNC |
+		linux.O_DIRECTORY | linux.O_NOFOLLOW | linux.O_NONBLOCK | linux.O_NOCTTY
 	fd, err := kernfs.NewGenericDirectoryFD(rp.Mount(), kd, &d.OrderedChildren, &d.locks, &opts, kernfs.GenericDirectoryFDOptions{
 		SeekEnd: kernfs.SeekEndStaticEntries,
 	})
@@ -632,12 +643,58 @@ func (d *dir) forEachChildDir(fn func(*dir)) {
 	})
 }
 
+// controllerFileImpl represents common cgroupfs-specific operations for control
+// files.
+type controllerFileImpl interface {
+	// Source extracts the underlying DynamicBytesFile for a control file.
+	Source() *kernfs.DynamicBytesFile
+	// AllowBackgroundAccess indicates whether a control file can be accessed
+	// from a background (i.e. non-task) context. Some control files cannot be
+	// meaningfully accessed from a non-task context because accessing them
+	// either have side effects on the calling context (ex: task migration
+	// across cgroups), or they refer to data which must be interpreted within
+	// the calling context (ex: when referring to a pid, in which pid
+	// namespace?).
+	//
+	// Currently, all writable control files that allow access from a background
+	// process can handle a nil FD, since a background write doesn't explicitly
+	// open the control file. This is enforced through the
+	// writableControllerFileImpl.
+	AllowBackgroundAccess() bool
+}
+
+// writableControllerFileImpl represents common cgroupfs-specific operations for
+// a writable control file.
+type writableControllerFileImpl interface {
+	controllerFileImpl
+	// WriteBackground writes data to a control file from a background
+	// context. This means the write isn't performed through and FD may be
+	// performed from a background context.
+	//
+	// Control files that support this should also return true for
+	// controllerFileImpl.AllowBackgroundAccess().
+	WriteBackground(ctx context.Context, src usermem.IOSequence) (int64, error)
+}
+
 // controllerFile represents a generic control file that appears within a cgroup
 // directory.
 //
 // +stateify savable
 type controllerFile struct {
 	kernfs.DynamicBytesFile
+	allowBackgroundAccess bool
+}
+
+var _ controllerFileImpl = (*controllerFile)(nil)
+
+// Source implements controllerFileImpl.Source.
+func (f *controllerFile) Source() *kernfs.DynamicBytesFile {
+	return &f.DynamicBytesFile
+}
+
+// AllowBackgroundAccess implements controllerFileImpl.AllowBackgroundAccess.
+func (f *controllerFile) AllowBackgroundAccess() bool {
+	return f.allowBackgroundAccess
 }
 
 // SetStat implements kernfs.Inode.SetStat.
@@ -645,14 +702,18 @@ func (f *controllerFile) SetStat(ctx context.Context, fs *vfs.Filesystem, creds 
 	return f.InodeAttrs.SetStat(ctx, fs, creds, opts)
 }
 
-func (fs *filesystem) newControllerFile(ctx context.Context, creds *auth.Credentials, data vfs.DynamicBytesSource) kernfs.Inode {
-	f := &controllerFile{}
+func (fs *filesystem) newControllerFile(ctx context.Context, creds *auth.Credentials, data vfs.DynamicBytesSource, allowBackgroundAccess bool) kernfs.Inode {
+	f := &controllerFile{
+		allowBackgroundAccess: allowBackgroundAccess,
+	}
 	f.Init(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), data, readonlyFileMode)
 	return f
 }
 
-func (fs *filesystem) newControllerWritableFile(ctx context.Context, creds *auth.Credentials, data vfs.WritableDynamicBytesSource) kernfs.Inode {
-	f := &controllerFile{}
+func (fs *filesystem) newControllerWritableFile(ctx context.Context, creds *auth.Credentials, data vfs.WritableDynamicBytesSource, allowBackgroundAccess bool) kernfs.Inode {
+	f := &controllerFile{
+		allowBackgroundAccess: allowBackgroundAccess,
+	}
 	f.Init(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), data, writableFileMode)
 	return f
 }
@@ -665,6 +726,18 @@ func (fs *filesystem) newControllerWritableFile(ctx context.Context, creds *auth
 type staticControllerFile struct {
 	kernfs.DynamicBytesFile
 	vfs.StaticData
+}
+
+var _ controllerFileImpl = (*staticControllerFile)(nil)
+
+// Source implements controllerFileImpl.Source.
+func (f *staticControllerFile) Source() *kernfs.DynamicBytesFile {
+	return &f.DynamicBytesFile
+}
+
+// AllowBackgroundAccess implements controllerFileImpl.AllowBackgroundAccess.
+func (f *staticControllerFile) AllowBackgroundAccess() bool {
+	return true
 }
 
 // SetStat implements kernfs.Inode.SetStat.
@@ -693,6 +766,8 @@ type stubControllerFile struct {
 	data *atomicbitops.Int64
 }
 
+var _ controllerFileImpl = (*stubControllerFile)(nil)
+
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (f *stubControllerFile) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	fmt.Fprintf(buf, "%d\n", f.data.Load())
@@ -701,6 +776,11 @@ func (f *stubControllerFile) Generate(ctx context.Context, buf *bytes.Buffer) er
 
 // Write implements vfs.WritableDynamicBytesSource.Write.
 func (f *stubControllerFile) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
+	return f.WriteBackground(ctx, src)
+}
+
+// WriteBackground implements writableControllerFileImpl.WriteBackground.
+func (f *stubControllerFile) WriteBackground(ctx context.Context, src usermem.IOSequence) (int64, error) {
 	val, n, err := parseInt64FromString(ctx, src)
 	if err != nil {
 		return 0, err
@@ -711,8 +791,11 @@ func (f *stubControllerFile) Write(ctx context.Context, _ *vfs.FileDescription, 
 
 // newStubControllerFile creates a new stub controller file that loads and
 // stores a control value from data.
-func (fs *filesystem) newStubControllerFile(ctx context.Context, creds *auth.Credentials, data *atomicbitops.Int64) kernfs.Inode {
+func (fs *filesystem) newStubControllerFile(ctx context.Context, creds *auth.Credentials, data *atomicbitops.Int64, allowBackgroundAccess bool) kernfs.Inode {
 	f := &stubControllerFile{
+		controllerFile: controllerFile{
+			allowBackgroundAccess: allowBackgroundAccess,
+		},
 		data: data,
 	}
 	f.Init(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), f, writableFileMode)

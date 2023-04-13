@@ -40,6 +40,7 @@ func (i *kcovInode) StateFields() []string {
 		"InodeNoopRefCount",
 		"InodeNotDirectory",
 		"InodeNotSymlink",
+		"InodeWatches",
 		"implStatFS",
 	}
 }
@@ -53,7 +54,8 @@ func (i *kcovInode) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(1, &i.InodeNoopRefCount)
 	stateSinkObject.Save(2, &i.InodeNotDirectory)
 	stateSinkObject.Save(3, &i.InodeNotSymlink)
-	stateSinkObject.Save(4, &i.implStatFS)
+	stateSinkObject.Save(4, &i.InodeWatches)
+	stateSinkObject.Save(5, &i.implStatFS)
 }
 
 func (i *kcovInode) afterLoad() {}
@@ -64,7 +66,8 @@ func (i *kcovInode) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(1, &i.InodeNoopRefCount)
 	stateSourceObject.Load(2, &i.InodeNotDirectory)
 	stateSourceObject.Load(3, &i.InodeNotSymlink)
-	stateSourceObject.Load(4, &i.implStatFS)
+	stateSourceObject.Load(4, &i.InodeWatches)
+	stateSourceObject.Load(5, &i.implStatFS)
 }
 
 func (fd *kcovFD) StateTypeName() string {
@@ -102,6 +105,40 @@ func (fd *kcovFD) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(2, &fd.vfsfd)
 	stateSourceObject.Load(3, &fd.inode)
 	stateSourceObject.Load(4, &fd.kcov)
+}
+
+func (gf *groTimeoutFile) StateTypeName() string {
+	return "pkg/sentry/fsimpl/sys.groTimeoutFile"
+}
+
+func (gf *groTimeoutFile) StateFields() []string {
+	return []string{
+		"implStatFS",
+		"DynamicBytesFile",
+		"idx",
+		"stk",
+	}
+}
+
+func (gf *groTimeoutFile) beforeSave() {}
+
+// +checklocksignore
+func (gf *groTimeoutFile) StateSave(stateSinkObject state.Sink) {
+	gf.beforeSave()
+	stateSinkObject.Save(0, &gf.implStatFS)
+	stateSinkObject.Save(1, &gf.DynamicBytesFile)
+	stateSinkObject.Save(2, &gf.idx)
+	stateSinkObject.Save(3, &gf.stk)
+}
+
+func (gf *groTimeoutFile) afterLoad() {}
+
+// +checklocksignore
+func (gf *groTimeoutFile) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &gf.implStatFS)
+	stateSourceObject.Load(1, &gf.DynamicBytesFile)
+	stateSourceObject.Load(2, &gf.idx)
+	stateSourceObject.Load(3, &gf.stk)
 }
 
 func (fsType *FilesystemType) StateTypeName() string {
@@ -190,6 +227,7 @@ func (d *dir) StateFields() []string {
 		"InodeNotSymlink",
 		"InodeDirectoryNoNewChildren",
 		"InodeTemporary",
+		"InodeWatches",
 		"OrderedChildren",
 		"locks",
 	}
@@ -206,8 +244,9 @@ func (d *dir) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(3, &d.InodeNotSymlink)
 	stateSinkObject.Save(4, &d.InodeDirectoryNoNewChildren)
 	stateSinkObject.Save(5, &d.InodeTemporary)
-	stateSinkObject.Save(6, &d.OrderedChildren)
-	stateSinkObject.Save(7, &d.locks)
+	stateSinkObject.Save(6, &d.InodeWatches)
+	stateSinkObject.Save(7, &d.OrderedChildren)
+	stateSinkObject.Save(8, &d.locks)
 }
 
 func (d *dir) afterLoad() {}
@@ -220,8 +259,9 @@ func (d *dir) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(3, &d.InodeNotSymlink)
 	stateSourceObject.Load(4, &d.InodeDirectoryNoNewChildren)
 	stateSourceObject.Load(5, &d.InodeTemporary)
-	stateSourceObject.Load(6, &d.OrderedChildren)
-	stateSourceObject.Load(7, &d.locks)
+	stateSourceObject.Load(6, &d.InodeWatches)
+	stateSourceObject.Load(7, &d.OrderedChildren)
+	stateSourceObject.Load(8, &d.locks)
 }
 
 func (c *cpuFile) StateTypeName() string {
@@ -308,6 +348,7 @@ func init() {
 	state.Register((*dirRefs)(nil))
 	state.Register((*kcovInode)(nil))
 	state.Register((*kcovFD)(nil))
+	state.Register((*groTimeoutFile)(nil))
 	state.Register((*FilesystemType)(nil))
 	state.Register((*InternalData)(nil))
 	state.Register((*filesystem)(nil))

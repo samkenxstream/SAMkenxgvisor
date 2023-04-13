@@ -96,7 +96,7 @@ func (conn *connection) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(20, &conn.bigWrites)
 	stateSourceObject.Load(21, &conn.dontMask)
 	stateSourceObject.Load(22, &conn.noOpen)
-	stateSourceObject.LoadValue(3, new(bool), func(y interface{}) { conn.loadInitializedChan(y.(bool)) })
+	stateSourceObject.LoadValue(3, new(bool), func(y any) { conn.loadInitializedChan(y.(bool)) })
 }
 
 func (f *fuseDevice) StateTypeName() string {
@@ -136,9 +136,7 @@ func (fd *DeviceFD) StateFields() []string {
 		"queue",
 		"numActiveRequests",
 		"completions",
-		"writeCursor",
 		"writeBuf",
-		"writeCursorFR",
 		"conn",
 	}
 }
@@ -160,10 +158,8 @@ func (fd *DeviceFD) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(7, &fd.queue)
 	stateSinkObject.Save(8, &fd.numActiveRequests)
 	stateSinkObject.Save(9, &fd.completions)
-	stateSinkObject.Save(10, &fd.writeCursor)
-	stateSinkObject.Save(11, &fd.writeBuf)
-	stateSinkObject.Save(12, &fd.writeCursorFR)
-	stateSinkObject.Save(13, &fd.conn)
+	stateSinkObject.Save(10, &fd.writeBuf)
+	stateSinkObject.Save(11, &fd.conn)
 }
 
 func (fd *DeviceFD) afterLoad() {}
@@ -179,11 +175,9 @@ func (fd *DeviceFD) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(7, &fd.queue)
 	stateSourceObject.Load(8, &fd.numActiveRequests)
 	stateSourceObject.Load(9, &fd.completions)
-	stateSourceObject.Load(10, &fd.writeCursor)
-	stateSourceObject.Load(11, &fd.writeBuf)
-	stateSourceObject.Load(12, &fd.writeCursorFR)
-	stateSourceObject.Load(13, &fd.conn)
-	stateSourceObject.LoadValue(5, new(int), func(y interface{}) { fd.loadFullQueueCh(y.(int)) })
+	stateSourceObject.Load(10, &fd.writeBuf)
+	stateSourceObject.Load(11, &fd.conn)
+	stateSourceObject.LoadValue(5, new(int), func(y any) { fd.loadFullQueueCh(y.(int)) })
 }
 
 func (fsType *FilesystemType) StateTypeName() string {
@@ -263,6 +257,7 @@ func (fs *filesystem) StateFields() []string {
 		"devMinor",
 		"conn",
 		"opts",
+		"clock",
 	}
 }
 
@@ -275,6 +270,7 @@ func (fs *filesystem) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(1, &fs.devMinor)
 	stateSinkObject.Save(2, &fs.conn)
 	stateSinkObject.Save(3, &fs.opts)
+	stateSinkObject.Save(4, &fs.clock)
 }
 
 func (fs *filesystem) afterLoad() {}
@@ -285,6 +281,38 @@ func (fs *filesystem) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(1, &fs.devMinor)
 	stateSourceObject.Load(2, &fs.conn)
 	stateSourceObject.Load(3, &fs.opts)
+	stateSourceObject.Load(4, &fs.clock)
+}
+
+func (f *fileHandle) StateTypeName() string {
+	return "pkg/sentry/fsimpl/fuse.fileHandle"
+}
+
+func (f *fileHandle) StateFields() []string {
+	return []string{
+		"new",
+		"handle",
+		"flags",
+	}
+}
+
+func (f *fileHandle) beforeSave() {}
+
+// +checklocksignore
+func (f *fileHandle) StateSave(stateSinkObject state.Sink) {
+	f.beforeSave()
+	stateSinkObject.Save(0, &f.new)
+	stateSinkObject.Save(1, &f.handle)
+	stateSinkObject.Save(2, &f.flags)
+}
+
+func (f *fileHandle) afterLoad() {}
+
+// +checklocksignore
+func (f *fileHandle) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &f.new)
+	stateSourceObject.Load(1, &f.handle)
+	stateSourceObject.Load(2, &f.flags)
 }
 
 func (i *inode) StateTypeName() string {
@@ -295,21 +323,29 @@ func (i *inode) StateFields() []string {
 	return []string{
 		"inodeRefs",
 		"InodeAlwaysValid",
-		"InodeAttrs",
-		"InodeDirectoryNoNewChildren",
 		"InodeNotSymlink",
+		"InodeWatches",
 		"OrderedChildren",
+		"CachedMappable",
 		"fs",
-		"metadataMu",
 		"nodeID",
-		"locks",
-		"size",
-		"attributeVersion",
-		"attributeTime",
-		"version",
+		"attrVersion",
+		"attrTime",
 		"link",
-		"isNewFh",
-		"newFhData",
+		"fh",
+		"locks",
+		"watches",
+		"attrMu",
+		"ino",
+		"uid",
+		"gid",
+		"mode",
+		"atime",
+		"mtime",
+		"ctime",
+		"size",
+		"nlink",
+		"blockSize",
 	}
 }
 
@@ -320,21 +356,29 @@ func (i *inode) StateSave(stateSinkObject state.Sink) {
 	i.beforeSave()
 	stateSinkObject.Save(0, &i.inodeRefs)
 	stateSinkObject.Save(1, &i.InodeAlwaysValid)
-	stateSinkObject.Save(2, &i.InodeAttrs)
-	stateSinkObject.Save(3, &i.InodeDirectoryNoNewChildren)
-	stateSinkObject.Save(4, &i.InodeNotSymlink)
-	stateSinkObject.Save(5, &i.OrderedChildren)
+	stateSinkObject.Save(2, &i.InodeNotSymlink)
+	stateSinkObject.Save(3, &i.InodeWatches)
+	stateSinkObject.Save(4, &i.OrderedChildren)
+	stateSinkObject.Save(5, &i.CachedMappable)
 	stateSinkObject.Save(6, &i.fs)
-	stateSinkObject.Save(7, &i.metadataMu)
-	stateSinkObject.Save(8, &i.nodeID)
-	stateSinkObject.Save(9, &i.locks)
-	stateSinkObject.Save(10, &i.size)
-	stateSinkObject.Save(11, &i.attributeVersion)
-	stateSinkObject.Save(12, &i.attributeTime)
-	stateSinkObject.Save(13, &i.version)
-	stateSinkObject.Save(14, &i.link)
-	stateSinkObject.Save(15, &i.isNewFh)
-	stateSinkObject.Save(16, &i.newFhData)
+	stateSinkObject.Save(7, &i.nodeID)
+	stateSinkObject.Save(8, &i.attrVersion)
+	stateSinkObject.Save(9, &i.attrTime)
+	stateSinkObject.Save(10, &i.link)
+	stateSinkObject.Save(11, &i.fh)
+	stateSinkObject.Save(12, &i.locks)
+	stateSinkObject.Save(13, &i.watches)
+	stateSinkObject.Save(14, &i.attrMu)
+	stateSinkObject.Save(15, &i.ino)
+	stateSinkObject.Save(16, &i.uid)
+	stateSinkObject.Save(17, &i.gid)
+	stateSinkObject.Save(18, &i.mode)
+	stateSinkObject.Save(19, &i.atime)
+	stateSinkObject.Save(20, &i.mtime)
+	stateSinkObject.Save(21, &i.ctime)
+	stateSinkObject.Save(22, &i.size)
+	stateSinkObject.Save(23, &i.nlink)
+	stateSinkObject.Save(24, &i.blockSize)
 }
 
 func (i *inode) afterLoad() {}
@@ -343,21 +387,29 @@ func (i *inode) afterLoad() {}
 func (i *inode) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &i.inodeRefs)
 	stateSourceObject.Load(1, &i.InodeAlwaysValid)
-	stateSourceObject.Load(2, &i.InodeAttrs)
-	stateSourceObject.Load(3, &i.InodeDirectoryNoNewChildren)
-	stateSourceObject.Load(4, &i.InodeNotSymlink)
-	stateSourceObject.Load(5, &i.OrderedChildren)
+	stateSourceObject.Load(2, &i.InodeNotSymlink)
+	stateSourceObject.Load(3, &i.InodeWatches)
+	stateSourceObject.Load(4, &i.OrderedChildren)
+	stateSourceObject.Load(5, &i.CachedMappable)
 	stateSourceObject.Load(6, &i.fs)
-	stateSourceObject.Load(7, &i.metadataMu)
-	stateSourceObject.Load(8, &i.nodeID)
-	stateSourceObject.Load(9, &i.locks)
-	stateSourceObject.Load(10, &i.size)
-	stateSourceObject.Load(11, &i.attributeVersion)
-	stateSourceObject.Load(12, &i.attributeTime)
-	stateSourceObject.Load(13, &i.version)
-	stateSourceObject.Load(14, &i.link)
-	stateSourceObject.Load(15, &i.isNewFh)
-	stateSourceObject.Load(16, &i.newFhData)
+	stateSourceObject.Load(7, &i.nodeID)
+	stateSourceObject.Load(8, &i.attrVersion)
+	stateSourceObject.Load(9, &i.attrTime)
+	stateSourceObject.Load(10, &i.link)
+	stateSourceObject.Load(11, &i.fh)
+	stateSourceObject.Load(12, &i.locks)
+	stateSourceObject.Load(13, &i.watches)
+	stateSourceObject.Load(14, &i.attrMu)
+	stateSourceObject.Load(15, &i.ino)
+	stateSourceObject.Load(16, &i.uid)
+	stateSourceObject.Load(17, &i.gid)
+	stateSourceObject.Load(18, &i.mode)
+	stateSourceObject.Load(19, &i.atime)
+	stateSourceObject.Load(20, &i.mtime)
+	stateSourceObject.Load(21, &i.ctime)
+	stateSourceObject.Load(22, &i.size)
+	stateSourceObject.Load(23, &i.nlink)
+	stateSourceObject.Load(24, &i.blockSize)
 }
 
 func (r *inodeRefs) StateTypeName() string {
@@ -555,6 +607,7 @@ func init() {
 	state.Register((*FilesystemType)(nil))
 	state.Register((*filesystemOptions)(nil))
 	state.Register((*filesystem)(nil))
+	state.Register((*fileHandle)(nil))
 	state.Register((*inode)(nil))
 	state.Register((*inodeRefs)(nil))
 	state.Register((*requestList)(nil))

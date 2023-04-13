@@ -15,13 +15,10 @@
 package transport
 
 import (
-	"fmt"
-
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fdnotifier"
-	"gvisor.dev/gvisor/pkg/lisafs"
 	"gvisor.dev/gvisor/pkg/sentry/uniqueid"
 	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -31,8 +28,8 @@ import (
 type locker interface {
 	Lock()
 	Unlock()
-	NestedLock()
-	NestedUnlock()
+	NestedLock(endpointlockNameIndex)
+	NestedUnlock(endpointlockNameIndex)
 }
 
 // A ConnectingEndpoint is a connectioned unix endpoint that is attempting to
@@ -120,7 +117,7 @@ type connectionedEndpoint struct {
 	// that may listen and accept incoming connections.
 	//
 	// boundSocketFD is protected by baseEndpoint.mu.
-	boundSocketFD *lisafs.ClientBoundSocketFD
+	boundSocketFD BoundSocketFD
 }
 
 var (
@@ -239,7 +236,6 @@ func (e *connectionedEndpoint) Close(ctx context.Context) {
 		c ConnectedEndpoint
 		r Receiver
 	)
-	bsFD := e.boundSocketFD
 	switch {
 	case e.Connected():
 		e.connected.CloseSend()
@@ -271,13 +267,7 @@ func (e *connectionedEndpoint) Close(ctx context.Context) {
 		c.CloseNotify()
 		c.Release(ctx)
 	}
-
-	// Clean up any associated host bound socket.
-	if bsFD != nil {
-		fdnotifier.RemoveFD(bsFD.NotificationFD())
-		bsFD.Close(ctx)
-	}
-
+	e.ResetBoundSocketFD(ctx)
 	if r != nil {
 		r.CloseNotify()
 		r.Release(ctx)
@@ -298,27 +288,27 @@ func (e *connectionedEndpoint) BidirectionalConnect(ctx context.Context, ce Conn
 	// Do a dance to safely acquire locks on both endpoints.
 	if e.id < ce.ID() {
 		e.Lock()
-		ce.NestedLock()
+		ce.NestedLock(endpointLockHigherid)
 	} else {
 		ce.Lock()
-		e.NestedLock()
+		e.NestedLock(endpointLockHigherid)
 	}
 
 	// Check connecting state.
 	if ce.Connected() {
-		e.NestedUnlock()
+		e.NestedUnlock(endpointLockHigherid)
 		ce.Unlock()
 		return syserr.ErrAlreadyConnected
 	}
 	if ce.ListeningLocked() {
-		e.NestedUnlock()
+		e.NestedUnlock(endpointLockHigherid)
 		ce.Unlock()
 		return syserr.ErrInvalidEndpointState
 	}
 
 	// Check bound state.
 	if !e.ListeningLocked() {
-		e.NestedUnlock()
+		e.NestedUnlock(endpointLockHigherid)
 		ce.Unlock()
 		return syserr.ErrConnectionRefused
 	}
@@ -336,6 +326,7 @@ func (e *connectionedEndpoint) BidirectionalConnect(ctx context.Context, ce Conn
 	ne.ops.InitHandler(ne, &stackHandler{}, getSendBufferLimits, getReceiveBufferLimits)
 	ne.ops.SetSendBufferSize(defaultBufferSize, false /* notify */)
 	ne.ops.SetReceiveBufferSize(defaultBufferSize, false /* notify */)
+	ne.SocketOptions().SetPassCred(e.SocketOptions().GetPassCred())
 
 	readQueue := &queue{ReaderQueue: ce.WaiterQueue(), WriterQueue: ne.Queue, limit: defaultBufferSize}
 	readQueue.InitRefs()
@@ -369,7 +360,7 @@ func (e *connectionedEndpoint) BidirectionalConnect(ctx context.Context, ce Conn
 		}
 
 		// Notify can deadlock if we are holding these locks.
-		e.NestedUnlock()
+		e.NestedUnlock(endpointLockHigherid)
 		ce.Unlock()
 
 		// Notify on both ends.
@@ -379,7 +370,7 @@ func (e *connectionedEndpoint) BidirectionalConnect(ctx context.Context, ce Conn
 		return nil
 	default:
 		// Busy; return EAGAIN per spec.
-		e.NestedUnlock()
+		e.NestedUnlock(endpointLockHigherid)
 		ce.Unlock()
 		ne.Close(ctx)
 		return syserr.ErrTryAgain
@@ -604,14 +595,28 @@ func (e *connectionedEndpoint) OnSetSendBufferSize(v int64) (newSz int64) {
 func (e *connectionedEndpoint) WakeupWriters() {}
 
 // SetBoundSocketFD implement HostBountEndpoint.SetBoundSocketFD.
-func (e *connectionedEndpoint) SetBoundSocketFD(bsFD *lisafs.ClientBoundSocketFD) {
+func (e *connectionedEndpoint) SetBoundSocketFD(ctx context.Context, bsFD BoundSocketFD) error {
 	e.Lock()
 	defer e.Unlock()
-	if e.boundSocketFD != nil {
-		panic(fmt.Sprintf("SetBoundSocketFD called twice\nold: %v\nnew: %v", e.boundSocketFD, bsFD))
+	if e.path != "" || e.boundSocketFD != nil {
+		bsFD.Close(ctx)
+		return syserr.ErrAlreadyBound.ToError()
 	}
 	e.boundSocketFD = bsFD
 	fdnotifier.AddFD(bsFD.NotificationFD(), e.Queue)
+	return nil
+}
+
+// SetBoundSocketFD implement HostBountEndpoint.ResetBoundSocketFD.
+func (e *connectionedEndpoint) ResetBoundSocketFD(ctx context.Context) {
+	e.Lock()
+	defer e.Unlock()
+	if e.boundSocketFD == nil {
+		return
+	}
+	fdnotifier.RemoveFD(e.boundSocketFD.NotificationFD())
+	e.boundSocketFD.Close(ctx)
+	e.boundSocketFD = nil
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.

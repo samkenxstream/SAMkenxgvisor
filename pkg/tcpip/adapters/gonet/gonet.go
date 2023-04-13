@@ -24,6 +24,7 @@ import (
 	"net"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -47,10 +48,11 @@ func (e *timeoutError) Temporary() bool { return true }
 // A TCPListener is a wrapper around a TCP tcpip.Endpoint that implements
 // net.Listener.
 type TCPListener struct {
-	stack  *stack.Stack
-	ep     tcpip.Endpoint
-	wq     *waiter.Queue
-	cancel chan struct{}
+	stack      *stack.Stack
+	ep         tcpip.Endpoint
+	wq         *waiter.Queue
+	cancelOnce sync.Once
+	cancel     chan struct{}
 }
 
 // NewTCPListener creates a new TCPListener from a listening tcpip.Endpoint.
@@ -112,7 +114,9 @@ func (l *TCPListener) Close() error {
 // Shutdown stops the HTTP server.
 func (l *TCPListener) Shutdown() {
 	l.ep.Shutdown(tcpip.ShutdownWrite | tcpip.ShutdownRead)
-	close(l.cancel) // broadcast cancellation
+	l.cancelOnce.Do(func() {
+		close(l.cancel) // broadcast cancellation
+	})
 }
 
 // Addr implements net.Listener.Addr.
@@ -450,6 +454,7 @@ func (c *TCPConn) LocalAddr() net.Addr {
 func (c *TCPConn) RemoteAddr() net.Addr {
 	a, err := c.ep.GetRemoteAddress()
 	if err != nil {
+		log.Warningf("ep.GetRemoteAddress() failed: %v", err)
 		return nil
 	}
 	return fullToTCPAddr(a)
@@ -618,6 +623,7 @@ func (c *UDPConn) newRemoteOpError(op string, remote net.Addr, err error) *net.O
 func (c *UDPConn) RemoteAddr() net.Addr {
 	a, err := c.ep.GetRemoteAddress()
 	if err != nil {
+		log.Warningf("ep.GetRemoteAddress() failed: %v", err)
 		return nil
 	}
 	return fullToUDPAddr(a)

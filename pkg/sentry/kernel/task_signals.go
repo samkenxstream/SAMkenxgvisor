@@ -186,7 +186,6 @@ func (t *Task) deliverSignal(info *linux.SignalInfo, act linux.SigAction) taskRu
 	switch sigact {
 	case SignalActionTerm, SignalActionCore:
 		// "Default action is to terminate the process." - signal(7)
-		t.Debugf("Signal %d: terminating thread group", info.Signo)
 
 		// Emit an event channel messages related to this uncaught signal.
 		ucs := &ucspb.UncaughtSignal{
@@ -202,6 +201,7 @@ func (t *Task) deliverSignal(info *linux.SignalInfo, act linux.SigAction) taskRu
 			ucs.FaultAddr = info.Addr()
 		}
 
+		t.Debugf("Signal %d, PID: %d, TID: %d, fault addr: %#x: terminating thread group", ucs.Pid, ucs.Tid, ucs.FaultAddr, info.Signo)
 		eventchannel.Emit(ucs)
 
 		t.PrepareGroupExit(linux.WaitStatusTerminationSignal(sig))
@@ -305,6 +305,10 @@ func (t *Task) SignalReturn(rt bool) (*SyscallControl, error) {
 	st := t.Stack()
 	sigset, alt, err := t.Arch().SignalRestore(st, rt, t.k.featureSet)
 	if err != nil {
+		// sigreturn syscalls never return errors.
+		t.Debugf("failed to restore from a signal frame: %v", err)
+		t.forceSignal(linux.SIGSEGV, false /* unconditional */)
+		t.SendSignal(SignalInfoPriv(linux.SIGSEGV))
 		return nil, err
 	}
 
@@ -640,13 +644,42 @@ func (t *Task) SetSavedSignalMask(mask linux.SignalSet) {
 }
 
 // SignalStack returns the task-private signal stack.
+//
+// By precondition, a full state has to be pulled.
 func (t *Task) SignalStack() linux.SignalStack {
-	t.p.PullFullState(t.MemoryManager().AddressSpace(), t.Arch())
 	alt := t.signalStack
 	if t.onSignalStack(alt) {
 		alt.Flags |= linux.SS_ONSTACK
 	}
 	return alt
+}
+
+// SigaltStack implements the sigaltstack syscall.
+func (t *Task) SigaltStack(setaddr hostarch.Addr, oldaddr hostarch.Addr) (*SyscallControl, error) {
+	if err := t.p.PullFullState(t.MemoryManager().AddressSpace(), t.Arch()); err != nil {
+		t.PrepareGroupExit(linux.WaitStatusTerminationSignal(linux.SIGILL))
+		return CtrlDoExit, linuxerr.EFAULT
+	}
+
+	alt := t.SignalStack()
+	if oldaddr != 0 {
+		if _, err := alt.CopyOut(t, oldaddr); err != nil {
+			return nil, err
+		}
+	}
+	if setaddr != 0 {
+		if _, err := alt.CopyIn(t, setaddr); err != nil {
+			return nil, err
+		}
+		// The signal stack cannot be changed if the task is currently
+		// on the stack. This is enforced at the lowest level because
+		// these semantics apply to changing the signal stack via a
+		// ucontext during a signal handler.
+		if !t.SetSignalStack(alt) {
+			return nil, linuxerr.EPERM
+		}
+	}
+	return nil, nil
 }
 
 // onSignalStack returns true if the task is executing on the given signal stack.
@@ -1014,7 +1047,10 @@ func (*runInterrupt) execute(t *Task) taskRunState {
 
 	// Are there signals pending?
 	if info := t.dequeueSignalLocked(linux.SignalSet(t.signalMask.RacyLoad())); info != nil {
-		t.p.PullFullState(t.MemoryManager().AddressSpace(), t.Arch())
+		if err := t.p.PullFullState(t.MemoryManager().AddressSpace(), t.Arch()); err != nil {
+			t.PrepareGroupExit(linux.WaitStatusTerminationSignal(linux.SIGILL))
+			return (*runExit)(nil)
+		}
 
 		if linux.SignalSetOf(linux.Signal(info.Signo))&StopSignals != 0 {
 			// Indicate that we've dequeued a stop signal before unlocking the

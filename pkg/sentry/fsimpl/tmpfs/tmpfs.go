@@ -38,6 +38,7 @@ import (
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/time"
@@ -61,8 +62,16 @@ type FilesystemType struct{}
 type filesystem struct {
 	vfsfs vfs.Filesystem
 
-	// mfp is used to allocate memory that stores regular file contents. mfp is
-	// immutable.
+	// mf is used to allocate memory that stores regular file contents. mf is
+	// immutable, except it may to changed during restore.
+	mf *pgalloc.MemoryFile `state:"nosave"`
+
+	// privateMF indicates whether mf is private to this tmpfs mount. If so,
+	// tmpfs takes ownership of mf. privateMF is immutable.
+	privateMF bool
+
+	// mfp is used to provide mf, when privateMF == false. This is required to
+	// re-provide mf on restore. mfp is immutable.
 	mfp pgalloc.MemoryFileProvider
 
 	// clock is a realtime clock used to set timestamps in file operations.
@@ -92,10 +101,8 @@ type filesystem struct {
 	// This field is immutable.
 	maxSizeInPages uint64
 
-	// pagesUsed is the pages used out of the tmpfs size.
-	// pagesUsed is protected by pagesUsedMu.
-	pagesUsedMu pagesUsedMutex `state:"nosave"`
-	pagesUsed   uint64
+	// pagesUsed is the number of pages used by this filesystem.
+	pagesUsed atomicbitops.Uint64
 }
 
 // Name implements vfs.FilesystemType.Name.
@@ -129,6 +136,10 @@ type FilesystemOpts struct {
 
 	// MaxFilenameLen is the maximum filename length allowed by the tmpfs.
 	MaxFilenameLen int
+
+	// FilestoreFD is the FD for the memory file that will be used to store file
+	// data. If this is nil, then MemoryFileProviderFromContext() is used.
+	FilestoreFD *fd.FD
 }
 
 // GetFilesystem implements vfs.FilesystemType.GetFilesystem.
@@ -137,6 +148,8 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	if mfp == nil {
 		panic("MemoryFileProviderFromContext returned nil")
 	}
+	mf := mfp.MemoryFile()
+	privateMF := false
 
 	rootFileType := uint16(linux.S_IFDIR)
 	newFSType := vfs.FilesystemType(&fstype)
@@ -147,6 +160,21 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		}
 		if tmpfsOpts.FilesystemType != nil {
 			newFSType = tmpfsOpts.FilesystemType
+		}
+		if tmpfsOpts.FilestoreFD != nil {
+			// DecommitOnDestroy because tmpfsOpts.FilestoreFD may be backed by a
+			// host filesystem based file, which needs to be decommited on destroy.
+			// DisableIMAWorkAround because sentry's seccomp filters don't allow the
+			// mmap(2) syscalls that this work around uses. User of this feature is
+			// expected to have performed the work around outside the sandbox.
+			mfOpts := pgalloc.MemoryFileOpts{DecommitOnDestroy: true, DisableIMAWorkAround: true}
+			var err error
+			mf, err = pgalloc.NewMemoryFile(tmpfsOpts.FilestoreFD.ReleaseToFile("overlay-filestore"), mfOpts)
+			if err != nil {
+				ctx.Warningf("tmpfs.FilesystemType.GetFilesystem: pgalloc.NewMemoryFile failed: %v", err)
+				return nil, nil, err
+			}
+			privateMF = true
 		}
 	}
 
@@ -197,8 +225,16 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		}
 		rootKGID = kgid
 	}
+	// In Linux, the default size limit is set to 50% of physical RAM. Such a
+	// default is not suitable in gVisor, because we don't want to reveal the
+	// host's RAM size. If Linux tmpfs is mounted with no size option, then
+	// statfs(2) returns f_blocks == f_bfree == f_bavail == 0.
+	// However, many applications treat this as having a size limit
+	// of 0. To work around these, set a very large but non-zero default size
+	// limit, chosen to ensure that BlockSize * Blocks does not overflow int64
+	// (which applications may also handle incorrectly).
+	maxSizeInPages := uint64(math.MaxInt64 / hostarch.PageSize)
 	maxSizeStr, ok := mopts["size"]
-	var maxSizeInPages uint64
 	if ok {
 		delete(mopts, "size")
 		maxSizeInBytes, err := parseSize(maxSizeStr)
@@ -208,7 +244,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		}
 		// Convert size in bytes to nearest Page Size bytes
 		// as Linux allocates memory in terms of Page size.
-		maxSizeInPages, ok = hostarch.ToPages(maxSizeInBytes)
+		maxSizeInPages, ok = hostarch.ToPagesRoundUp(maxSizeInBytes)
 		if !ok {
 			ctx.Warningf("tmpfs.FilesystemType.GetFilesystem: Pages RoundUp Overflow error: %q", ok)
 			return nil, nil, linuxerr.EINVAL
@@ -230,6 +266,8 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		memUsage = *tmpfsOpts.Usage
 	}
 	fs := filesystem{
+		mf:             mf,
+		privateMF:      privateMF,
 		mfp:            mfp,
 		clock:          clock,
 		devMinor:       devMinor,
@@ -272,6 +310,9 @@ func (fs *filesystem) Release(ctx context.Context) {
 		fs.root.releaseChildrenLocked(ctx)
 	}
 	fs.mu.Unlock()
+	if fs.privateMF {
+		fs.mf.Destroy()
+	}
 }
 
 // releaseChildrenLocked is called on the mount point by filesystem.Release() to
@@ -308,28 +349,11 @@ func (fs *filesystem) statFS() linux.Statfs {
 		NameLength:   linux.NAME_MAX,
 	}
 
-	// tmpfs supports configurable size limits.
-	// In Linux, if tmpfs is mounted with size option,
-	// we return the block sizes as set by the user.
-	if fs.maxSizeInPages > 0 {
-		// If size is set for tmpfs return set values.
-		st.Blocks = fs.maxSizeInPages
-		fs.pagesUsedMu.Lock()
-		defer fs.pagesUsedMu.Unlock()
-		st.BlocksFree = fs.maxSizeInPages - fs.pagesUsed
-		st.BlocksAvailable = fs.maxSizeInPages - fs.pagesUsed
-		return st
-	}
-	// In Linux, if tmpfs is mounted with no size option,
-	// such a tmpfs mount will return
-	// f_blocks == f_bfree == f_bavail == 0 from statfs(2).
-	// However, many applications treat this as having a size limit
-	// of 0. To work around this, claim to have a very large but non-zero size,
-	// chosen to ensure that BlockSize * Blocks does not overflow int64 (which
-	// applications may also handle incorrectly).
-	st.Blocks = math.MaxInt64 / hostarch.PageSize
-	st.BlocksFree = math.MaxInt64 / hostarch.PageSize
-	st.BlocksAvailable = math.MaxInt64 / hostarch.PageSize
+	// If size is set for tmpfs return set values.
+	st.Blocks = fs.maxSizeInPages
+	pagesUsed := fs.pagesUsed.Load()
+	st.BlocksFree = fs.maxSizeInPages - pagesUsed
+	st.BlocksAvailable = fs.maxSizeInPages - pagesUsed
 	return st
 }
 
@@ -450,12 +474,12 @@ type inode struct {
 	// Inotify watches for this inode.
 	watches vfs.Watches
 
-	impl interface{} // immutable
+	impl any // immutable
 }
 
 const maxLinks = math.MaxUint32
 
-func (i *inode) init(impl interface{}, fs *filesystem, kuid auth.KUID, kgid auth.KGID, mode linux.FileMode, parentDir *directory) {
+func (i *inode) init(impl any, fs *filesystem, kuid auth.KUID, kgid auth.KGID, mode linux.FileMode, parentDir *directory) {
 	if mode.FileType() == 0 {
 		panic("file type is required in FileMode")
 	}
@@ -531,20 +555,14 @@ func (i *inode) decRef(ctx context.Context) {
 		switch impl := i.impl.(type) {
 		case *symlink:
 			if len(impl.target) >= shortSymlinkLen {
-				if err := i.fs.updatePagesUsed(uint64(len(impl.target)), 0); err != nil {
-					panic(fmt.Sprintf("Encountered error: %v while accounting tmpfs size.", err))
-				}
+				impl.inode.fs.unaccountPages(1)
 			}
 		case *regularFile:
-			impl.inode.mu.Lock()
-			if err := i.fs.updatePagesUsed(impl.size.Load(), 0); err != nil {
-				panic(fmt.Sprintf("Encountered error: %v while accounting tmpfs size.", err))
-			}
-			impl.inode.mu.Unlock()
 			// Release memory used by regFile to store data. Since regFile is
 			// no longer usable, we don't need to grab any locks or update any
 			// metadata.
-			impl.data.DropAll(impl.memFile)
+			pagesDec := impl.data.DropAll(i.fs.mf)
+			impl.inode.fs.unaccountPages(pagesDec)
 		}
 
 	})
@@ -887,16 +905,7 @@ func (fd *fileDescription) Stat(ctx context.Context, opts vfs.StatOptions) (linu
 
 // SetStat implements vfs.FileDescriptionImpl.SetStat.
 func (fd *fileDescription) SetStat(ctx context.Context, opts vfs.SetStatOptions) error {
-	creds := auth.CredentialsFromContext(ctx)
-	d := fd.dentry()
-	if err := d.inode.setStat(ctx, creds, &opts); err != nil {
-		return err
-	}
-
-	if ev := vfs.InotifyEventFromStatMask(opts.Stat.Mask); ev != 0 {
-		d.InotifyWithParent(ctx, ev, 0, vfs.InodeEvent)
-	}
-	return nil
+	return fd.dentry().inode.setStat(ctx, auth.CredentialsFromContext(ctx), &opts)
 }
 
 // StatFS implements vfs.FileDescriptionImpl.StatFS.
@@ -916,26 +925,12 @@ func (fd *fileDescription) GetXattr(ctx context.Context, opts vfs.GetXattrOption
 
 // SetXattr implements vfs.FileDescriptionImpl.SetXattr.
 func (fd *fileDescription) SetXattr(ctx context.Context, opts vfs.SetXattrOptions) error {
-	d := fd.dentry()
-	if err := d.inode.setXattr(auth.CredentialsFromContext(ctx), &opts); err != nil {
-		return err
-	}
-
-	// Generate inotify events.
-	d.InotifyWithParent(ctx, linux.IN_ATTRIB, 0, vfs.InodeEvent)
-	return nil
+	return fd.dentry().inode.setXattr(auth.CredentialsFromContext(ctx), &opts)
 }
 
 // RemoveXattr implements vfs.FileDescriptionImpl.RemoveXattr.
 func (fd *fileDescription) RemoveXattr(ctx context.Context, name string) error {
-	d := fd.dentry()
-	if err := d.inode.removeXattr(auth.CredentialsFromContext(ctx), name); err != nil {
-		return err
-	}
-
-	// Generate inotify events.
-	d.InotifyWithParent(ctx, linux.IN_ATTRIB, 0, vfs.InodeEvent)
-	return nil
+	return fd.dentry().inode.removeXattr(auth.CredentialsFromContext(ctx), name)
 }
 
 // Sync implements vfs.FileDescriptionImpl.Sync. It does nothing because all

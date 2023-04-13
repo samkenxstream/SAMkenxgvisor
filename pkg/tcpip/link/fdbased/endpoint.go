@@ -45,7 +45,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
-	"gvisor.dev/gvisor/pkg/buffer"
+	"gvisor.dev/gvisor/pkg/bufferv2"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -56,13 +56,19 @@ import (
 // linkDispatcher reads packets from the link FD and dispatches them to the
 // NetworkDispatcher.
 type linkDispatcher interface {
-	stop()
+	Stop()
 	dispatch() (bool, tcpip.Error)
+	release()
 }
 
 // PacketDispatchMode are the various supported methods of receiving and
 // dispatching packets from the underlying FD.
 type PacketDispatchMode int
+
+// BatchSize is the number of packets to write in each syscall. It is 47
+// because when GvisorGSO is in use then a single 65KB TCP segment can get
+// split into 46 segments of 1420 bytes and a single 216 byte segment.
+const BatchSize = 47
 
 const (
 	// Readv is the default dispatch mode and is the least performant of the
@@ -129,7 +135,10 @@ type endpoint struct {
 	closed func(tcpip.Error)
 
 	inboundDispatchers []linkDispatcher
-	dispatcher         stack.NetworkDispatcher
+
+	mu sync.RWMutex
+	// +checklocks:mu
+	dispatcher stack.NetworkDispatcher
 
 	// packetDispatchMode controls the packet dispatcher used by this
 	// endpoint.
@@ -211,6 +220,14 @@ type Options struct {
 	// of struct iovec, msghdr, and mmsghdr that may be passed by each host
 	// system call.
 	MaxSyscallHeaderBytes int
+
+	// AFXDPFD is used with the experimental AF_XDP mode.
+	// TODO(b/240191988): Use multiple sockets.
+	// TODO(b/240191988): How do we handle the MTU issue?
+	AFXDPFD *int
+
+	// InterfaceIndex is the interface index of the underlying device.
+	InterfaceIndex int
 }
 
 // fanoutID is used for AF_PACKET based endpoints to enable PACKET_FANOUT
@@ -278,8 +295,8 @@ func New(opts *Options) (stack.LinkEndpoint, error) {
 		}
 	}
 
-	// Increment fanoutID to ensure that we don't re-use the same fanoutID for
-	// the next endpoint.
+	// Increment fanoutID to ensure that we don't re-use the same fanoutID
+	// for the next endpoint.
 	fid := fanoutID.Add(1)
 
 	// Create per channel dispatchers.
@@ -303,6 +320,7 @@ func New(opts *Options) (stack.LinkEndpoint, error) {
 				e.gsoMaxSize = opts.GSOMaxSize
 			}
 		}
+
 		inboundDispatcher, err := createInboundDispatcher(e, fd, isSocket, fid)
 		if err != nil {
 			return nil, fmt.Errorf("createInboundDispatcher(...) = %v", err)
@@ -368,6 +386,9 @@ func createInboundDispatcher(e *endpoint, fd int, isSocket bool, fID int32) (lin
 			if err != nil {
 				return nil, fmt.Errorf("newRecvMMsgDispatcher(%d, %+v) = %v", fd, e, err)
 			}
+		case Readv:
+		default:
+			return nil, fmt.Errorf("unknown dispatch mode %d", e.packetDispatchMode)
 		}
 	}
 	return inboundDispatcher, nil
@@ -382,12 +403,17 @@ func isSocketFD(fd int) (bool, error) {
 }
 
 // Attach launches the goroutine that reads packets from the file descriptor and
-// dispatches them via the provided dispatcher.
+// dispatches them via the provided dispatcher. If one is already attached,
+// then nothing happens.
+//
+// Attach implements stack.LinkEndpoint.Attach.
 func (e *endpoint) Attach(dispatcher stack.NetworkDispatcher) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	// nil means the NIC is being removed.
 	if dispatcher == nil && e.dispatcher != nil {
 		for _, dispatcher := range e.inboundDispatchers {
-			dispatcher.stop()
+			dispatcher.Stop()
 		}
 		e.Wait()
 		e.dispatcher = nil
@@ -410,6 +436,8 @@ func (e *endpoint) Attach(dispatcher stack.NetworkDispatcher) {
 
 // IsAttached implements stack.LinkEndpoint.IsAttached.
 func (e *endpoint) IsAttached() bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	return e.dispatcher != nil
 }
 
@@ -488,7 +516,7 @@ const (
 )
 
 // AddHeader implements stack.LinkEndpoint.AddHeader.
-func (e *endpoint) AddHeader(pkt *stack.PacketBuffer) {
+func (e *endpoint) AddHeader(pkt stack.PacketBufferPtr) {
 	if e.hdrSize > 0 {
 		// Add ethernet header if needed.
 		eth := header.Ethernet(pkt.LinkHeader().Push(header.EthernetMinimumSize))
@@ -502,7 +530,7 @@ func (e *endpoint) AddHeader(pkt *stack.PacketBuffer) {
 
 // writePacket writes outbound packets to the file descriptor. If it is not
 // currently writable, the packet is dropped.
-func (e *endpoint) writePacket(pkt *stack.PacketBuffer) tcpip.Error {
+func (e *endpoint) writePacket(pkt stack.PacketBufferPtr) tcpip.Error {
 	fdInfo := e.fds[pkt.Hash%uint32(len(e.fds))]
 	fd := fdInfo.fd
 	var vnetHdrBuf []byte
@@ -530,7 +558,7 @@ func (e *endpoint) writePacket(pkt *stack.PacketBuffer) tcpip.Error {
 		vnetHdrBuf = vnetHdr.marshal()
 	}
 
-	views := pkt.Slices()
+	views := pkt.AsSlices()
 	numIovecs := len(views)
 	if len(vnetHdrBuf) != 0 {
 		numIovecs++
@@ -552,19 +580,18 @@ func (e *endpoint) writePacket(pkt *stack.PacketBuffer) tcpip.Error {
 	return rawfile.NonBlockingWriteIovec(fd, iovecs)
 }
 
-func (e *endpoint) sendBatch(batchFDInfo fdInfo, pkts []*stack.PacketBuffer) (int, tcpip.Error) {
+func (e *endpoint) sendBatch(batchFDInfo fdInfo, pkts []stack.PacketBufferPtr) (int, tcpip.Error) {
 	// Degrade to writePacket if underlying fd is not a socket.
 	if !batchFDInfo.isSocket {
-		written := 0
-		for i := 0; i < len(pkts); i++ {
-			if err := e.writePacket(pkts[i]); err != nil {
-				if written > 0 {
-					return written, nil
-				}
-				return 0, err
+		var written int
+		var err tcpip.Error
+		for written < len(pkts) {
+			if err = e.writePacket(pkts[written]); err != nil {
+				break
 			}
+			written++
 		}
-		return written, nil
+		return written, err
 	}
 
 	// Send a batch of packets through batchFD.
@@ -601,7 +628,7 @@ func (e *endpoint) sendBatch(batchFDInfo fdInfo, pkts []*stack.PacketBuffer) (in
 				vnetHdrBuf = vnetHdr.marshal()
 			}
 
-			views := pkt.Slices()
+			views := pkt.AsSlices()
 			numIovecs := len(views)
 			if len(vnetHdrBuf) != 0 {
 				numIovecs++
@@ -670,11 +697,7 @@ func (e *endpoint) sendBatch(batchFDInfo fdInfo, pkts []*stack.PacketBuffer) (in
 //   - pkt.NetworkProtocolNumber
 func (e *endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
 	// Preallocate to avoid repeated reallocation as we append to batch.
-	// batchSz is 47 because when GvisorGSO is in use then a single 65KB TCP
-	// segment can get split into 46 segments of 1420 bytes and a single 216
-	// byte segment.
-	const batchSz = 47
-	batch := make([]*stack.PacketBuffer, 0, batchSz)
+	batch := make([]stack.PacketBufferPtr, 0, BatchSize)
 	batchFDInfo := fdInfo{fd: -1, isSocket: false}
 	sentPackets := 0
 	for _, pkt := range pkts.AsSlice() {
@@ -706,14 +729,9 @@ func (e *endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) 
 	return sentPackets, nil
 }
 
-// viewsEqual tests whether v1 and v2 refer to the same backing bytes.
-func viewsEqual(vs1, vs2 []buffer.View) bool {
-	return len(vs1) == len(vs2) && (len(vs1) == 0 || &vs1[0] == &vs2[0])
-}
-
-// InjectOutobund implements stack.InjectableEndpoint.InjectOutbound.
-func (e *endpoint) InjectOutbound(dest tcpip.Address, packet []byte) tcpip.Error {
-	return rawfile.NonBlockingWrite(e.fds[0].fd, packet)
+// InjectOutbound implements stack.InjectableEndpoint.InjectOutbound.
+func (e *endpoint) InjectOutbound(dest tcpip.Address, packet *bufferv2.View) tcpip.Error {
+	return rawfile.NonBlockingWrite(e.fds[0].fd, packet.AsSlice())
 }
 
 // dispatchLoop reads packets from the file descriptor in a loop and dispatches
@@ -725,6 +743,7 @@ func (e *endpoint) dispatchLoop(inboundDispatcher linkDispatcher) tcpip.Error {
 			if e.closed != nil {
 				e.closed(err)
 			}
+			inboundDispatcher.release()
 			return err
 		}
 	}
@@ -753,18 +772,28 @@ func (e *endpoint) ARPHardwareType() header.ARPHardwareType {
 type InjectableEndpoint struct {
 	endpoint
 
+	mu sync.RWMutex
+	// +checklocks:mu
 	dispatcher stack.NetworkDispatcher
 }
 
 // Attach saves the stack network-layer dispatcher for use later when packets
 // are injected.
 func (e *InjectableEndpoint) Attach(dispatcher stack.NetworkDispatcher) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.dispatcher = dispatcher
 }
 
-// InjectInbound injects an inbound packet.
-func (e *InjectableEndpoint) InjectInbound(protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
-	e.dispatcher.DeliverNetworkPacket(protocol, pkt)
+// InjectInbound injects an inbound packet. If the endpoint is not attached, the
+// packet is not delivered.
+func (e *InjectableEndpoint) InjectInbound(protocol tcpip.NetworkProtocolNumber, pkt stack.PacketBufferPtr) {
+	e.mu.RLock()
+	d := e.dispatcher
+	e.mu.RUnlock()
+	if d != nil {
+		d.DeliverNetworkPacket(protocol, pkt)
+	}
 }
 
 // NewInjectable creates a new fd-based InjectableEndpoint.

@@ -92,9 +92,10 @@ func ErrorHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, 
 // has been successfully mounted can other channels be created.
 func MountHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
 	var (
-		mountPointFD   *ControlFD
-		mountPointStat linux.Statx
-		mountNode      = c.server.root
+		mountPointFD     *ControlFD
+		mountPointHostFD = -1
+		mountPointStat   linux.Statx
+		mountNode        = c.server.root
 	)
 	if err := c.server.withRenameReadLock(func() (err error) {
 		// Maintain extra ref on mountNode to ensure existence during walk.
@@ -139,12 +140,15 @@ func MountHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, 
 		if mountNode.isDeleted() {
 			return unix.ENOENT
 		}
-		mountPointFD, mountPointStat, err = c.ServerImpl().Mount(c, mountNode)
+		mountPointFD, mountPointStat, mountPointHostFD, err = c.ServerImpl().Mount(c, mountNode)
 		return err
 	}); err != nil {
 		return 0, err
 	}
 
+	if mountPointHostFD >= 0 {
+		comm.DonateFD(mountPointHostFD)
+	}
 	resp := MountResp{
 		Root: Inode{
 			ControlFD: mountPointFD.id,
@@ -185,12 +189,8 @@ func ChannelHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32
 	}
 
 	// Respond to client with successful channel creation message.
-	if err := comm.DonateFD(clientDataFD); err != nil {
-		return 0, err
-	}
-	if err := comm.DonateFD(fdSock); err != nil {
-		return 0, err
-	}
+	comm.DonateFD(clientDataFD)
+	comm.DonateFD(fdSock)
 	resp := ChannelResp{
 		dataOffset: desc.Offset,
 		dataLength: uint64(desc.Length),
@@ -524,7 +524,7 @@ func OpenAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32,
 		hostOpenFD int
 	)
 	if err := fd.safelyRead(func() error {
-		if fd.node.isDeleted() || !p9.CanOpen(p9.FileMode(fd.ftype)) {
+		if fd.node.isDeleted() || fd.IsSymlink() {
 			return unix.EINVAL
 		}
 		openFD, hostOpenFD, err = fd.impl.Open(req.Flags)
@@ -534,9 +534,7 @@ func OpenAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32,
 	}
 
 	if hostOpenFD >= 0 {
-		if err := comm.DonateFD(hostOpenFD); err != nil {
-			return 0, err
-		}
+		comm.DonateFD(hostOpenFD)
 	}
 	resp := OpenAtResp{OpenFD: openFD.id}
 	respLen := uint32(resp.SizeBytes())
@@ -591,9 +589,7 @@ func OpenCreateAtHandler(c *Connection, comm Communicator, payloadLen uint32) (u
 	}
 
 	if hostOpenFD >= 0 {
-		if err := comm.DonateFD(hostOpenFD); err != nil {
-			return 0, err
-		}
+		comm.DonateFD(hostOpenFD)
 	}
 	resp := OpenCreateAtResp{
 		NewFD: openFD.id,
@@ -896,6 +892,7 @@ func LinkAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32,
 	if err != nil {
 		return 0, err
 	}
+	defer targetFD.DecRef(nil)
 	if targetFD.IsDir() {
 		// Can not create hard link to directory.
 		return 0, unix.EPERM
@@ -1068,7 +1065,8 @@ func ConnectHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32
 		return 0, err
 	}
 
-	return 0, comm.DonateFD(sock)
+	comm.DonateFD(sock)
+	return 0, nil
 }
 
 // BindAtHandler handles the BindAt RPC.
@@ -1103,16 +1101,13 @@ func BindAtHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32,
 		if dir.node.isDeleted() {
 			return unix.EINVAL
 		}
-		childFD, childStat, boundSocketFD, hostSocketFD, err = dir.impl.BindAt(name, uint32(req.SockType))
+		childFD, childStat, boundSocketFD, hostSocketFD, err = dir.impl.BindAt(name, uint32(req.SockType), req.Mode, req.UID, req.GID)
 		return err
 	}); err != nil {
 		return 0, err
 	}
 
-	if err := comm.DonateFD(hostSocketFD); err != nil {
-		return 0, err
-	}
-
+	comm.DonateFD(hostSocketFD)
 	resp := BindAtResp{
 		Child: Inode{
 			ControlFD: childFD.id,
@@ -1170,9 +1165,7 @@ func AcceptHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32,
 	}); err != nil {
 		return 0, err
 	}
-	if err := comm.DonateFD(newSock); err != nil {
-		return 0, err
-	}
+	comm.DonateFD(newSock)
 	resp := AcceptResp{
 		PeerAddr: SizedString(peerAddr),
 	}

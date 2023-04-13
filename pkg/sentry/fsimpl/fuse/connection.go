@@ -181,7 +181,7 @@ type connection struct {
 	dontMask bool
 
 	// noOpen if FUSE server doesn't support open operation.
-	// This flag only influence performance, not correctness of the program.
+	// This flag only influences performance, not correctness of the program.
 	noOpen bool
 }
 
@@ -210,11 +210,8 @@ func newFUSEConnection(_ context.Context, fuseFD *DeviceFD, opts *filesystemOpti
 	// mount another filesystem.
 
 	// Create the writeBuf for the header to be stored in.
-	hdrLen := uint32((*linux.FUSEHeaderOut)(nil).SizeBytes())
-	fuseFD.writeBuf = make([]byte, hdrLen)
 	fuseFD.completions = make(map[linux.FUSEOpID]*futureResponse)
 	fuseFD.fullQueueCh = make(chan struct{}, opts.maxActiveRequests)
-	fuseFD.writeCursor = 0
 
 	return &connection{
 		fd:                       fuseFD,
@@ -255,7 +252,7 @@ func (conn *connection) CallAsync(t *kernel.Task, r *Request) error {
 // The forget request does not have a reply,
 // as documented in include/uapi/linux/fuse.h:FUSE_FORGET.
 func (conn *connection) Call(t *kernel.Task, r *Request) (*Response, error) {
-	// Block requests sent before connection is initalized.
+	// Block requests sent before connection is initialized.
 	if !conn.Initialized() && r.hdr.Opcode != linux.FUSE_INIT {
 		if err := t.Block(conn.initializedChan); err != nil {
 			return nil, err

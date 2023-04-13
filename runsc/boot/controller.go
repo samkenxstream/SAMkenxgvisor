@@ -26,7 +26,6 @@ import (
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/control"
-	controlpb "gvisor.dev/gvisor/pkg/sentry/control/control_go_proto"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netstack"
@@ -58,6 +57,9 @@ const (
 
 	// ContMgrExecuteAsync executes a command in a container.
 	ContMgrExecuteAsync = "containerManager.ExecuteAsync"
+
+	// ContMgrPortForward starts port forwarding with the sandbox.
+	ContMgrPortForward = "containerManager.PortForward"
 
 	// ContMgrProcesses lists processes running in a container.
 	ContMgrProcesses = "containerManager.Processes"
@@ -123,27 +125,23 @@ const (
 	LifecycleResume = "Lifecycle.Resume"
 )
 
-// Filesystem related commands (see fs.go for more details).
-const (
-	FsCat = "Fs.Cat"
-)
-
 // Usage related commands (see usage.go for more details).
 const (
 	UsageCollect = "Usage.Collect"
 	UsageUsageFD = "Usage.UsageFD"
-	UsageReduce  = "Usage.Reduce"
 )
 
-// Events related commands (see events.go for more details).
+// Metrics related commands (see metrics.go).
 const (
-	EventsAttachDebugEmitter = "Events.AttachDebugEmitter"
+	MetricsGetRegistered = "Metrics.GetRegisteredMetrics"
+	MetricsExport        = "Metrics.Export"
 )
 
-// ControlSocketAddr generates an abstract unix socket name for the given ID.
-func ControlSocketAddr(id string) string {
-	return fmt.Sprintf("\x00runsc-sandbox.%s", id)
-}
+// Commands for interacting with cgroupfs within the sandbox.
+const (
+	CgroupsReadControlFiles  = "Cgroups.ReadControlFiles"
+	CgroupsWriteControlFiles = "Cgroups.WriteControlFiles"
+)
 
 // controller holds the control server, and is used for communication into the
 // sandbox.
@@ -158,54 +156,35 @@ type controller struct {
 // newController creates a new controller. The caller must call
 // controller.srv.StartServing() to start the controller.
 func newController(fd int, l *Loader) (*controller, error) {
-	ctrl := &controller{}
-	var err error
-	ctrl.srv, err = server.CreateFromFD(fd)
+	srv, err := server.CreateFromFD(fd)
 	if err != nil {
 		return nil, err
 	}
 
-	ctrl.manager = &containerManager{
-		startChan:       make(chan struct{}),
-		startResultChan: make(chan error),
-		l:               l,
+	ctrl := &controller{
+		manager: &containerManager{
+			startChan:       make(chan struct{}),
+			startResultChan: make(chan error),
+			l:               l,
+		},
+		srv: srv,
 	}
 	ctrl.srv.Register(ctrl.manager)
+	ctrl.srv.Register(&control.Cgroups{Kernel: l.k})
+	ctrl.srv.Register(&control.Lifecycle{Kernel: l.k})
+	ctrl.srv.Register(&control.Logging{})
+	ctrl.srv.Register(&control.Proc{Kernel: l.k})
+	ctrl.srv.Register(&control.State{Kernel: l.k})
+	ctrl.srv.Register(&control.Usage{Kernel: l.k})
+	ctrl.srv.Register(&control.Metrics{})
+	ctrl.srv.Register(&debug{})
 
 	if eps, ok := l.k.RootNetworkNamespace().Stack().(*netstack.Stack); ok {
-		net := &Network{
-			Stack: eps.Stack,
-		}
-		ctrl.srv.Register(net)
+		ctrl.srv.Register(&Network{Stack: eps.Stack})
 	}
-
-	if l.root.conf.Controls.Controls != nil {
-		for _, c := range l.root.conf.Controls.Controls.AllowedControls {
-			switch c {
-			case controlpb.ControlConfig_EVENTS:
-				ctrl.srv.Register(&control.Events{})
-			case controlpb.ControlConfig_FS:
-				ctrl.srv.Register(&control.Fs{Kernel: l.k})
-			case controlpb.ControlConfig_LIFECYCLE:
-				ctrl.srv.Register(&control.Lifecycle{Kernel: l.k})
-			case controlpb.ControlConfig_LOGGING:
-				ctrl.srv.Register(&control.Logging{})
-			case controlpb.ControlConfig_PROFILE:
-				if l.root.conf.ProfileEnable {
-					ctrl.srv.Register(control.NewProfile(l.k))
-				}
-			case controlpb.ControlConfig_USAGE:
-				ctrl.srv.Register(&control.Usage{Kernel: l.k})
-			case controlpb.ControlConfig_PROC:
-				ctrl.srv.Register(&control.Proc{Kernel: l.k})
-			case controlpb.ControlConfig_STATE:
-				ctrl.srv.Register(&control.State{Kernel: l.k})
-			case controlpb.ControlConfig_DEBUG:
-				ctrl.srv.Register(&debug{})
-			}
-		}
+	if l.root.conf.ProfileEnable {
+		ctrl.srv.Register(control.NewProfile(l.k))
 	}
-
 	return ctrl, nil
 }
 
@@ -286,8 +265,13 @@ type StartArgs struct {
 	// CID is the ID of the container to start.
 	CID string
 
+	// NumOverlayFilestoreFDs is the number of overlay filestore FDs donated.
+	// Optionally configured with the overlay2 flag.
+	NumOverlayFilestoreFDs int
+
 	// FilePayload contains, in order:
 	//   * stdin, stdout, and stderr (optional: if terminal is disabled).
+	//   * file descriptors to overlay-backing host files (optional: for overlay2).
 	//   * file descriptors to connect to gofer to serve the root filesystem.
 	urpc.FilePayload
 }
@@ -308,21 +292,23 @@ func (cm *containerManager) StartSubcontainer(args *StartArgs, _ *struct{}) erro
 	if args.CID == "" {
 		return errors.New("start argument missing container ID")
 	}
-	if len(args.Files) < 1 {
-		return fmt.Errorf("start arguments must contain at least one file for the container root gofer")
+	expectedFDs := 1 // At least one FD for the root filesystem.
+	expectedFDs += args.NumOverlayFilestoreFDs
+	if !args.Spec.Process.Terminal {
+		expectedFDs += 3
+	}
+	if len(args.Files) < expectedFDs {
+		return fmt.Errorf("start arguments must contain at least %d FDs, but only got %d", expectedFDs, len(args.Files))
 	}
 
 	// All validation passed, logs the spec for debugging.
-	specutils.LogSpec(args.Spec)
+	specutils.LogSpecDebug(args.Spec, args.Conf.OCISeccomp)
 
 	goferFiles := args.Files
 	var stdios []*fd.FD
 	if !args.Spec.Process.Terminal {
 		// When not using a terminal, stdios come as the first 3 files in the
 		// payload.
-		if l := len(args.Files); l < 4 {
-			return fmt.Errorf("start arguments (len: %d) must contain stdios and files for the container root gofer", l)
-		}
 		var err error
 		stdios, err = fd.NewFromFiles(goferFiles[:3])
 		if err != nil {
@@ -336,6 +322,16 @@ func (cm *containerManager) StartSubcontainer(args *StartArgs, _ *struct{}) erro
 		}
 	}()
 
+	var overlayFilestoreFDs []*fd.FD
+	for i := 0; i < args.NumOverlayFilestoreFDs; i++ {
+		overlayFilestoreFD, err := fd.NewFromFile(goferFiles[i])
+		if err != nil {
+			return fmt.Errorf("error dup'ing overlay filestore file: %w", err)
+		}
+		overlayFilestoreFDs = append(overlayFilestoreFDs, overlayFilestoreFD)
+	}
+	goferFiles = goferFiles[args.NumOverlayFilestoreFDs:]
+
 	goferFDs, err := fd.NewFromFiles(goferFiles)
 	if err != nil {
 		return fmt.Errorf("error dup'ing gofer files: %w", err)
@@ -346,7 +342,7 @@ func (cm *containerManager) StartSubcontainer(args *StartArgs, _ *struct{}) erro
 		}
 	}()
 
-	if err := cm.l.startSubcontainer(args.Spec, args.Conf, args.CID, stdios, goferFDs); err != nil {
+	if err := cm.l.startSubcontainer(args.Spec, args.Conf, args.CID, stdios, goferFDs, overlayFilestoreFDs); err != nil {
 		log.Debugf("containerManager.StartSubcontainer failed, cid: %s, args: %+v, err: %v", args.CID, args, err)
 		return err
 	}
@@ -387,6 +383,29 @@ func (cm *containerManager) Checkpoint(o *control.SaveOpts, _ *struct{}) error {
 		Watchdog: cm.l.watchdog,
 	}
 	return state.Save(o, nil)
+}
+
+// PortForwardOpts contains options for port forwarding to a port in a
+// container.
+type PortForwardOpts struct {
+	// FilePayload contains one fd for a UDS (or local port) used for port
+	// forwarding.
+	urpc.FilePayload
+
+	// ContainerID is the container for the process being executed.
+	ContainerID string
+	// Port is the port to to forward.
+	Port uint16
+}
+
+// PortForward initiates a port forward to the container.
+func (cm *containerManager) PortForward(opts *PortForwardOpts, _ *struct{}) error {
+	log.Debugf("containerManager.PortForward, cid: %s, port: %d", opts.ContainerID, opts.Port)
+	if err := cm.l.portForward(opts); err != nil {
+		log.Debugf("containerManager.PortForward failed, opts: %+v, err: %v", opts, err)
+		return err
+	}
+	return nil
 }
 
 // RestoreOpts contains options related to restoring a container's file system.
@@ -445,7 +464,7 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) error {
 
 	// Set up the restore environment.
 	ctx := k.SupervisorContext()
-	mntr := newContainerMounter(&cm.l.root, cm.l.k, cm.l.mountHints, cm.l.productName)
+	mntr := newContainerMounter(&cm.l.root, cm.l.k, cm.l.mountHints, cm.l.productName, o.SandboxID)
 	ctx, err = mntr.configureRestore(ctx)
 	if err != nil {
 		return fmt.Errorf("configuring filesystem restore: %v", err)

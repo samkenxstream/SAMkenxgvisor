@@ -288,6 +288,7 @@ func (d *dir) StateFields() []string {
 		"InodeAttrs",
 		"InodeNotSymlink",
 		"InodeDirectoryNoNewChildren",
+		"InodeWatches",
 		"OrderedChildren",
 		"implStatFS",
 		"locks",
@@ -306,11 +307,12 @@ func (d *dir) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(2, &d.InodeAttrs)
 	stateSinkObject.Save(3, &d.InodeNotSymlink)
 	stateSinkObject.Save(4, &d.InodeDirectoryNoNewChildren)
-	stateSinkObject.Save(5, &d.OrderedChildren)
-	stateSinkObject.Save(6, &d.implStatFS)
-	stateSinkObject.Save(7, &d.locks)
-	stateSinkObject.Save(8, &d.fs)
-	stateSinkObject.Save(9, &d.cgi)
+	stateSinkObject.Save(5, &d.InodeWatches)
+	stateSinkObject.Save(6, &d.OrderedChildren)
+	stateSinkObject.Save(7, &d.implStatFS)
+	stateSinkObject.Save(8, &d.locks)
+	stateSinkObject.Save(9, &d.fs)
+	stateSinkObject.Save(10, &d.cgi)
 }
 
 func (d *dir) afterLoad() {}
@@ -322,11 +324,12 @@ func (d *dir) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(2, &d.InodeAttrs)
 	stateSourceObject.Load(3, &d.InodeNotSymlink)
 	stateSourceObject.Load(4, &d.InodeDirectoryNoNewChildren)
-	stateSourceObject.Load(5, &d.OrderedChildren)
-	stateSourceObject.Load(6, &d.implStatFS)
-	stateSourceObject.Load(7, &d.locks)
-	stateSourceObject.Load(8, &d.fs)
-	stateSourceObject.Load(9, &d.cgi)
+	stateSourceObject.Load(5, &d.InodeWatches)
+	stateSourceObject.Load(6, &d.OrderedChildren)
+	stateSourceObject.Load(7, &d.implStatFS)
+	stateSourceObject.Load(8, &d.locks)
+	stateSourceObject.Load(9, &d.fs)
+	stateSourceObject.Load(10, &d.cgi)
 }
 
 func (f *controllerFile) StateTypeName() string {
@@ -336,6 +339,7 @@ func (f *controllerFile) StateTypeName() string {
 func (f *controllerFile) StateFields() []string {
 	return []string{
 		"DynamicBytesFile",
+		"allowBackgroundAccess",
 	}
 }
 
@@ -345,6 +349,7 @@ func (f *controllerFile) beforeSave() {}
 func (f *controllerFile) StateSave(stateSinkObject state.Sink) {
 	f.beforeSave()
 	stateSinkObject.Save(0, &f.DynamicBytesFile)
+	stateSinkObject.Save(1, &f.allowBackgroundAccess)
 }
 
 func (f *controllerFile) afterLoad() {}
@@ -352,6 +357,7 @@ func (f *controllerFile) afterLoad() {}
 // +checklocksignore
 func (f *controllerFile) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &f.DynamicBytesFile)
+	stateSourceObject.Load(1, &f.allowBackgroundAccess)
 }
 
 func (f *staticControllerFile) StateTypeName() string {
