@@ -47,7 +47,7 @@ require (
 	golang.org/x/time v0.0.0-20220210224613-90d013bbcef8
 	golang.org/x/tools v0.5.0
 	google.golang.org/api v0.103.0
-	google.golang.org/grpc v1.53.0-dev.0.20230123225046-4075ef07c5d5
+	google.golang.org/grpc v1.53.0
 	google.golang.org/protobuf v1.28.2-0.20230118093459-a9481185b34d
 	gopkg.in/yaml.v2 v2.4.0
 	honnef.co/go/tools v0.4.2
